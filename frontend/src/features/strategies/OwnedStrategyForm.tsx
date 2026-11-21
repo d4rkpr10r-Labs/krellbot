@@ -79,6 +79,7 @@ const VENUE_LABELS: Record<Venue, string> = {
   gate: "Gate (paper)",
   pionex: "Pionex (paper)",
   okx: "OKX (paper)",
+  kucoin: "KuCoin (paper)",
 };
 
 const STOP_KIND_LABELS: Record<StopKind, string> = {
