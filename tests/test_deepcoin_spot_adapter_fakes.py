@@ -2,8 +2,7 @@
 
 CI must never open a network socket to Deepcoin. ``DeepcoinVenue`` requires
 an explicit ``Transport``; ``None`` refuses rather than defaulting to
-``HttpTransport``. Order mutations still go through
-``release_policy.ensure_live_orders_allowed``.
+``HttpTransport``. Live order mutations and trade-only key qualification fail closed.
 """
 
 from __future__ import annotations
@@ -14,9 +13,9 @@ from urllib.parse import urlparse
 import pytest
 from fakes.fake_deepcoin import FakeDeepcoinTransport
 
+from krellbot import release_policy
 from krellbot.release_policy import PaperOnlyReleaseError
-from krellbot.venues.base import WithdrawCapableError
-from krellbot.venues.deepcoin import API_HOST, BASE_URL, DeepcoinVenue, HttpTransport, sign_deepcoin
+from krellbot.venues.deepcoin import API_HOST, BASE_URL, DeepcoinVenue, HttpTransport
 
 pytestmark = pytest.mark.usefixtures("live_capable_release")
 
@@ -71,7 +70,9 @@ def test_deepcoin_snapshot_balances_orders_and_fills() -> None:
                 "ordId": "ord-9",
                 "clOrdId": "rest-1",
                 "instId": WAVE_PAIR,
-                "side": "buy",
+                "side": "sell",
+                "ordType": "limit",
+                "px": "89550.0",
                 "sz": "0.01",
             }
         ],
@@ -79,6 +80,7 @@ def test_deepcoin_snapshot_balances_orders_and_fills() -> None:
             {
                 "tradeId": "7",
                 "ordId": "1",
+                "clOrdId": "fill-coid",
                 "instId": WAVE_PAIR,
                 "side": "buy",
                 "fillSz": "0.01",
@@ -87,105 +89,63 @@ def test_deepcoin_snapshot_balances_orders_and_fills() -> None:
             }
         ],
     )
-    truth = _venue(transport).snapshot()
+    venue = _venue(transport)
+    truth = venue.snapshot()
     assets = {b.asset: b for b in truth.balances}
     assert assets["USDT"].free == Decimal(1000)
     assert len(truth.open_orders) == 1
     assert truth.open_orders[0].coid == "rest-1"
+    assert truth.open_orders[0].stop_price is None
+    assert venue.order_by_coid("rest-1") == truth.open_orders[0]
     assert truth.recent_fills[0].side == "buy"
+    assert truth.recent_fills[0].coid == "fill-coid"
     for call in transport.calls:
         assert urlparse(call.url).hostname == API_HOST
 
 
-def test_deepcoin_place_entry_with_stop_uses_signed_posts() -> None:
+@pytest.mark.parametrize(
+    ("paper_only", "expected_error"),
+    [(True, PaperOnlyReleaseError), (False, NotImplementedError)],
+)
+def test_deepcoin_order_mutations_refuse_before_transport(monkeypatch, paper_only, expected_error) -> None:
+    monkeypatch.setattr(release_policy, "PAPER_ONLY_RELEASE", paper_only)
     transport = FakeDeepcoinTransport()
     venue = _venue(transport)
-    ref = venue.place_entry_with_stop("coid-entry", Decimal("0.01"), Decimal(90000), pair=WAVE_PAIR)
-    assert ref.pair == WAVE_PAIR
-    assert ref.side == "buy"
-    assert ref.stop_price == Decimal("90000.0")
-    posts = [c for c in transport.calls if c.method == "POST"]
-    assert len(posts) == 2
-    assert isinstance(posts[0].body, dict)
-    assert posts[0].body["ordType"] == "market"
-    assert posts[0].body["tgtCcy"] == "base_ccy"
-    assert posts[0].body["tdMode"] == "cash"
-    assert posts[0].body["clOrdId"] == "coid-entry"
-    assert posts[0].headers.get("DC-ACCESS-KEY") == "test-key"
-    assert posts[0].headers.get("DC-ACCESS-PASSPHRASE") == "test-pass"
-    assert posts[0].headers.get("DC-ACCESS-SIGN")
-    assert "DC-ACCESS-KEY" not in posts[0].headers.get("DC-ACCESS-SIGN", "")
-    assert isinstance(posts[1].body, dict)
-    assert posts[1].body["productGroup"] == "Spot"
-    assert posts[1].body["side"] == "sell"
-    assert posts[1].body["triggerPrice"] == "90000.0"
-    assert posts[1].body["tdMode"] == "cash"
-    posts_after = len(posts)
-    second = venue.place_entry_with_stop("coid-entry", Decimal("0.01"), Decimal(90000), pair=WAVE_PAIR)
-    assert second.id == ref.id
-    assert len([c for c in transport.calls if c.method == "POST"]) == posts_after
-
-
-def test_deepcoin_place_exit_cancel_stops_and_raise_stop() -> None:
-    transport = FakeDeepcoinTransport(
-        triggers=[
-            {
-                "ordId": "trig-9",
-                "instId": WAVE_PAIR,
-                "side": "sell",
-                "sz": "0.01",
-                "triggerPx": "90000",
-            }
-        ]
-    )
-    venue = _venue(transport)
-    entry = venue.place_entry_with_stop("exit-coid", Decimal("0.01"), Decimal(90000), pair=WAVE_PAIR)
-    found = venue.order_by_coid("exit-coid")
-    assert found is not None
-    assert found.id == entry.id
-    exit_ref = venue.place_exit("exit-flat", Decimal("0.01"), pair=WAVE_PAIR)
-    assert exit_ref.side == "sell"
-    venue.cancel_stops(WAVE_PAIR)
-    venue.raise_stop(WAVE_PAIR, Decimal(91000))
-    posts = [c for c in transport.calls if c.method == "POST" and isinstance(c.body, dict)]
-    assert any(body.get("triggerPrice") == "91000.0" for body in (c.body for c in posts if isinstance(c.body, dict)))
-    cancels = [c for c in transport.calls if c.method == "POST" and "/cancel-trigger-order" in c.url]
-    assert cancels
-
-
-def test_deepcoin_check_key_trade_only_and_withdraw_refused() -> None:
-    ok = _venue(FakeDeepcoinTransport()).check_key()
-    assert ok.can_trade is True
-    assert ok.can_withdraw is False
-    bad = FakeDeepcoinTransport(
-        balance={"code": "0", "data": [{"ccy": "USDT", "availBal": "1", "frozenBal": "0", "perm": "trade,withdraw"}]}
-    )
-    with pytest.raises(WithdrawCapableError):
-        _venue(bad).check_key()
-
-
-def test_deepcoin_place_entry_blocked_when_paper_only_release(monkeypatch) -> None:
-    from krellbot import release_policy
-
-    monkeypatch.setattr(release_policy, "PAPER_ONLY_RELEASE", True)
-    transport = FakeDeepcoinTransport()
-    with pytest.raises(PaperOnlyReleaseError):
-        DeepcoinVenue(
-            key_id="k",
-            api_secret="s",
-            passphrase="p",
-            transport=transport,
-            now_fn=lambda: 1,
-        ).place_entry_with_stop("x", Decimal("0.01"), Decimal(1), pair=WAVE_PAIR)
+    with pytest.raises(expected_error):
+        venue.place_entry_with_stop("entry", Decimal("0.01"), Decimal(90000), pair=WAVE_PAIR)
+    with pytest.raises(expected_error):
+        venue.place_exit("exit", Decimal("0.01"), pair=WAVE_PAIR)
+    with pytest.raises(expected_error):
+        venue.cancel_stops(WAVE_PAIR)
+    with pytest.raises(expected_error):
+        venue.raise_stop(WAVE_PAIR, Decimal(91000))
     assert transport.calls == []
 
 
-def test_deepcoin_sign_matches_documented_prehash() -> None:
-    signature = sign_deepcoin(
-        "DEEPCOIN-SYNTHETIC-SECRET",
-        "2020-12-08T09:08:57.715Z",
-        "POST",
-        "/deepcoin/trade/order",
-        '{"clOrdId":"coid","instId":"BTC-USDT","ordType":"market","side":"buy","sz":"0.01","tdMode":"cash","tgtCcy":"base_ccy"}',
-    )
-    assert signature == "TaYOdb5CEgdo5AzdnWdjnpWHRFsiK8m5nMyI1n/Gmd4="
+def test_deepcoin_cannot_qualify_trade_only_key_permissions() -> None:
+    transport = FakeDeepcoinTransport()
+    with pytest.raises(NotImplementedError, match="trade-only key permissions are not qualified"):
+        _venue(transport).check_key()
+    assert transport.calls == []
+
+
+def test_deepcoin_snapshot_rejects_account_error() -> None:
+    transport = FakeDeepcoinTransport(balance={"code": "100", "data": []})
+    with pytest.raises(RuntimeError, match="account data request failed"):
+        _venue(transport).snapshot()
+    assert len(transport.calls) == 1
+
+
+def test_deepcoin_signed_read_includes_query_in_documented_prehash() -> None:
+    transport = FakeDeepcoinTransport()
+    assert _venue(transport).order_by_coid("absent") is None
+    assert len(transport.calls) == 1
+    call = transport.calls[0]
+    assert call.method == "GET"
+    assert call.url == f"{BASE_URL}/deepcoin/trade/orders-pending?instType=SPOT"
+    assert call.headers == {
+        "DC-ACCESS-KEY": "test-key",
+        "DC-ACCESS-SIGN": "P4hLocbhYNqwu0X9+NV1xLLhI3mhMQfV2hXYrr5YH0w=",
+        "DC-ACCESS-TIMESTAMP": "2023-11-14T22:13:20.000Z",
+        "DC-ACCESS-PASSPHRASE": "test-pass",
+    }

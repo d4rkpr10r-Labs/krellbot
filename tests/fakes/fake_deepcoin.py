@@ -1,6 +1,6 @@
 """Fake Deepcoin spot transport for tests.
 
-Records every GET / POST. Never opens a network socket. Default
+Records every GET. Never opens a network socket. Default
 instruments cover the wave pair ``BTC-USDT``.
 """
 
@@ -41,7 +41,6 @@ class RecordedCall:
     method: str
     url: str
     headers: dict[str, str]
-    body: dict | list | None = None
 
 
 class FakeDeepcoinTransport:
@@ -53,13 +52,11 @@ class FakeDeepcoinTransport:
         instruments: dict | None = None,
         balance: dict | None = None,
         orders: list | None = None,
-        triggers: list | None = None,
         fills: list | None = None,
     ) -> None:
         self._instruments = instruments if instruments is not None else dict(_DEFAULT_INSTRUMENTS)
         self._balance = balance if balance is not None else dict(_DEFAULT_BALANCE)
         self._orders = list(orders) if orders is not None else []
-        self._triggers = list(triggers) if triggers is not None else []
         self._fills = list(fills) if fills is not None else []
         self.calls: list[RecordedCall] = []
 
@@ -72,19 +69,6 @@ class FakeDeepcoinTransport:
             return dict(self._balance)
         if path.endswith("/deepcoin/trade/orders-pending"):
             return {"code": "0", "data": list(self._orders)}
-        if path.endswith("/deepcoin/trade/trigger-orders-pending"):
-            return {"code": "0", "data": list(self._triggers)}
         if path.endswith("/deepcoin/trade/fills"):
             return {"code": "0", "data": list(self._fills)}
         return {"code": "0", "data": []}
-
-    def post(self, url: str, body: dict | list | None, headers: dict[str, str]) -> dict:
-        self.calls.append(RecordedCall(method="POST", url=url, headers=dict(headers), body=body))
-        path = urlparse(url).path
-        if path.endswith("/deepcoin/trade/trigger-order"):
-            return {"code": "0", "data": {"ordId": "trig-1", "sCode": "0"}}
-        if path.endswith("/deepcoin/trade/cancel-trigger-order"):
-            return {"code": "0", "data": {"sCode": "0"}}
-        if path.endswith("/deepcoin/trade/order"):
-            return {"code": "0", "data": {"ordId": "ord-1", "sCode": "0"}}
-        return {"code": "0", "data": {"sCode": "0"}}

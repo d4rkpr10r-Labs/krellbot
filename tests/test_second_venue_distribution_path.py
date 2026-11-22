@@ -2,7 +2,7 @@
 
 Pins Coinbase as the second qualified live venue beyond Kraken:
 
-* Registry claims exactly ``{kraken, coinbase}``. ``binance``, ``gate``, ``pionex``, ``okx``, ``bybit``, ``kucoin``, ``ourbit``, ``toobit``, ``xt``, and ``deepcoin`` stay paper-only.
+* Registry claims exactly ``{kraken, coinbase}``. ``binance``, ``gate``, ``pionex``, ``okx``, ``bybit``, ``kucoin``, ``ourbit``, ``toobit``, ``xt``, ``mexc``, and ``deepcoin`` stay paper-only.
 * Preflight factory already admits coinbase (aligned with the registry).
 * Paper-only release still refuses Coinbase live send before grant I/O.
 * Under the test-only live-capable fence, a Coinbase grant authorizes send.
@@ -203,7 +203,7 @@ def test_distribution_qualified_live_venues_are_kraken_and_coinbase():
     assert is_qualified_live_venue("coinbase")
     assert not is_qualified_live_venue("binance")
     assert PAPER_ONLY_VENUES == frozenset(
-        {"binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt", "deepcoin"}
+        {"binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt", "mexc", "deepcoin"}
     )
     assert is_paper_only_venue("binance")
     assert is_paper_only_venue("gate")
@@ -222,6 +222,8 @@ def test_distribution_qualified_live_venues_are_kraken_and_coinbase():
     assert not is_qualified_live_venue("toobit")
     assert is_paper_only_venue("xt")
     assert not is_qualified_live_venue("xt")
+    assert is_paper_only_venue("mexc")
+    assert not is_qualified_live_venue("mexc")
     assert is_paper_only_venue("deepcoin")
     assert not is_qualified_live_venue("deepcoin")
     assert not is_paper_only_venue("coinbase")
@@ -237,6 +239,7 @@ def test_preflight_supported_venues_match_distribution_registry():
     assert "ourbit" not in SUPPORTED_PREFLIGHT_VENUES
     assert "toobit" not in SUPPORTED_PREFLIGHT_VENUES
     assert "xt" not in SUPPORTED_PREFLIGHT_VENUES
+    assert "mexc" not in SUPPORTED_PREFLIGHT_VENUES
     assert "deepcoin" not in SUPPORTED_PREFLIGHT_VENUES
 
 
