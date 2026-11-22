@@ -28,7 +28,7 @@ Required keys: `schema_version`, `id`, `version`, `label`, `author`, `timeframe`
   nest with `{all: [...]}` or `{any: [...]}` up to depth 3.
 - `risk.max_account_pct` is an integer 1 to 100. `risk.stop` is either
   `{type: pct, pct: number}` or `{type: atr, len: int, mult: number}`.
-- `markets` is 1 to 4 items of `{venue: kraken|coinbase|binance|gate|pionex|okx|bybit, pair: ...}`.
+- `markets` is 1 to 4 items of `{venue: kraken|coinbase|binance|gate|pionex|okx|bybit|kucoin, pair: ...}`.
 
 ### Markets venue allow-list
 
@@ -45,6 +45,7 @@ enum). Do not admit a new id in the schema without updating this section.
 | `pionex`   | Pionex spot       | Pack `BASE-QUOTE`; venue `BASE_QUOTE` | `BTC-USDT` |
 | `okx`      | OKX spot          | `BASE-QUOTE` instId           | `BTC-USDT` |
 | `bybit`    | Bybit spot        | Concatenated `BASEQUOTE` symbol | `BTCUSDT` |
+| `kucoin`   | KuCoin spot       | Pack and venue `BASE-QUOTE` | `BTC-USDT` |
 
 `binance` is the first Binance-class spot venue id. Pack pairs for Binance use
 the exchange symbol spelling (e.g. `BTCUSDT`), not `BTC-USDT` or `BTC/USDT`.
@@ -68,8 +69,8 @@ paper+preflight path relies on:
 - `check_key() -> KeyPerms`
 
 Adapters live under `src/krellbot/venues/` (`kraken.py`, `coinbase.py`,
-`binance.py`, `gate.py`, `pionex.py`, `okx.py`, `bybit.py`). Qualified live venues for the distribution product path are
-`kraken` and `coinbase` (see `docs/live.md`). `binance`, `gate`, `pionex`, `okx`, and `bybit` stay paper-only.
+`binance.py`, `gate.py`, `pionex.py`, `okx.py`, `bybit.py`, `kucoin.py`). Qualified live venues for the distribution product path are
+`kraken` and `coinbase` (see `docs/live.md`). `binance`, `gate`, `pionex`, `okx`, `bybit`, and `kucoin` stay paper-only.
 Qualified live remains owner-gated behind `PAPER_ONLY_RELEASE`; agents keep
 that flag True.
 
