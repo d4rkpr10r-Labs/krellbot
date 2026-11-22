@@ -9,7 +9,7 @@ Krellbot is an open-source local crypto workstation: a Python engine plus a loca
 - Tasks marked `[owner]` are for the human. Skip them.
 - Work on the lowest-numbered unchecked task that has no open PR and does not depend on an unmerged task. Skip [owner] tasks. Do not start a new task while three agent PRs are awaiting the owner.
 - To propose a new milestone file, open a PR that adds it and request the owner's review. Never enable auto-merge on a PR that adds or edits milestone tasks, other than ticking the checkbox of the task that PR completes.
-- After CI is green, enable auto-merge (squash) only on PRs that touch no risk path, nothing under .github/, and not AGENTS.md.
+- After CI is green, enable squash auto-merge through GitHub's merge queue for eligible PRs. Follow all required GitHub checks and reviews. The owner merges changes to `AGENTS.md` or files under `.github/`.
 
 ## Done
 
@@ -20,7 +20,7 @@ Krellbot is an open-source local crypto workstation: a Python engine plus a loca
 
 ## Risk paths
 
-A PR that touches any of these gets the `risk-path` label and is never merged by an agent. The owner merges it.
+Label PRs that touch any of these paths `risk-path`. When the owner reviews the changes with Codex, the PR is eligible for the usual CI-gated squash auto-merge. This supersedes milestone notes that reserve merges for the owner solely because the PR touches a risk path.
 
 - `src/krellbot/run/`, `src/krellbot/venues/`, `src/krellbot/execution/`, `src/krellbot/storage/outbox.py`
 - `src/krellbot/application/live_gate.py`, `src/krellbot/application/live_preflight.py`
