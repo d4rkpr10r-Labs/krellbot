@@ -81,6 +81,8 @@ PAPER_WAVE_KUCOIN_BTC_USDT = "BTC-USDT"
 PAPER_WAVE_OURBIT_BTC_USDT = "BTCUSDT"
 # Wave Toobit BTC/USDT symbol. Public exchangeInfo uses this concatenated spelling.
 PAPER_WAVE_TOOBIT_BTC_USDT = "BTCUSDT"
+# Wave XT BTC/USDT pack pair. The public symbol is ``btc_usdt``.
+PAPER_WAVE_XT_BTC_USDT = "BTCUSDT"
 
 SCHEMA_VERSION = "1"
 DEFAULT_TTL_SECONDS = 24 * 60 * 60  # 24h
@@ -115,6 +117,7 @@ BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
 KUCOIN_SYMBOLS_URL = "https://api.kucoin.com/api/v2/symbols"
 OURBIT_EXCHANGE_INFO_URL = "https://api.ourbit.com/api/v3/exchangeInfo"
 TOOBIT_EXCHANGE_INFO_URL = "https://api.toobit.com/api/v1/exchangeInfo"
+XT_SYMBOLS_URL = "https://sapi.xt.com/v4/public/symbol"
 
 SNAPSHOT_FILENAME = "instrument-rules.json"
 
@@ -205,6 +208,7 @@ class InstrumentRulesV1:
             "kucoin",
             "ourbit",
             "toobit",
+            "xt",
         ):
             raise ValueError(f"instrument: unsupported venue {self.venue!r}")
 
@@ -277,6 +281,8 @@ class InstrumentMetadataClient:
             return self._fetch_ourbit(canonical_pair)
         if venue == "toobit":
             return self._fetch_toobit(canonical_pair)
+        if venue == "xt":
+            return self._fetch_xt(canonical_pair)
         raise InstrumentMetadataError(
             METADATA_UNAVAILABLE,
             venue,
@@ -1224,6 +1230,111 @@ class InstrumentMetadataClient:
             usable_until=usable_until,
         )
 
+    # ---- internal: XT ---------------------------------------------------
+
+    def _fetch_xt(self, canonical_pair: str) -> InstrumentRulesV1:
+        symbol = "btc_usdt" if canonical_pair == PAPER_WAVE_XT_BTC_USDT else canonical_pair
+        query = urllib.parse.urlencode({"symbol": symbol})
+        url = f"{XT_SYMBOLS_URL}?{query}"
+        payload = self._transport.get(url, {}) or {}
+        if not isinstance(payload, dict):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "xt",
+                canonical_pair,
+                "instrument: xt public symbol body is not a JSON object",
+            )
+        if payload.get("rc") not in (None, 0, "0"):
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "xt",
+                canonical_pair,
+                "instrument: xt public symbol refused the request",
+            )
+        body = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+        row = _find_xt_symbol(body if isinstance(body, dict) else {}, symbol)
+        if row is None:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "xt",
+                canonical_pair,
+                "instrument: xt public symbol response did not contain the requested symbol",
+            )
+        state = str(row.get("state") or "").upper()
+        if state not in {"ONLINE", "TRADING"} or row.get("tradingEnabled") is False:
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "xt",
+                canonical_pair,
+                "instrument: xt symbol is not enabled for spot",
+            )
+        venue_symbol = str(row.get("symbol") or "")
+        if venue_symbol != symbol:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "xt",
+                canonical_pair,
+                "instrument: xt public symbol returned a different symbol than requested",
+            )
+        try:
+            quantity_precision = int(row["quantityPrecision"])
+            price_precision = int(row["pricePrecision"])
+            min_notional = _xt_quote_min(row)
+            min_quantity = _decimals_to_increment(quantity_precision)
+            quantity_increment = min_quantity
+            price_increment = _decimals_to_increment(price_precision)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "xt",
+                canonical_pair,
+                "instrument: xt public symbol payload missing required fields",
+            ) from exc
+        if (
+            Decimal(min_quantity) <= 0
+            or Decimal(min_notional) <= 0
+            or Decimal(quantity_increment) <= 0
+            or Decimal(price_increment) <= 0
+        ):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "xt",
+                canonical_pair,
+                "instrument: xt minima and increments must be positive",
+            )
+        base_asset = str(row.get("baseCurrency") or "").upper()
+        quote_asset = str(row.get("quoteCurrency") or "").upper()
+        if not base_asset or not quote_asset:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "xt",
+                canonical_pair,
+                "instrument: xt public symbol missing base or quote",
+            )
+        retrieved_at = _unix_to_iso(self._clock())
+        usable_until = _unix_to_iso(self._clock() + self._ttl_seconds)
+        payload_bytes = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        return InstrumentRulesV1(
+            schema_version=SCHEMA_VERSION,
+            venue="xt",
+            canonical_pair=canonical_pair,
+            venue_symbol=venue_symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            min_quantity=min_quantity,
+            min_notional=min_notional,
+            quantity_increment=quantity_increment,
+            price_increment=price_increment,
+            source={
+                "endpoint": XT_SYMBOLS_URL,
+                "retrieved_at": retrieved_at,
+                "source_version": payload_sha256[:16],
+                "payload_sha256": payload_sha256,
+            },
+            usable_until=usable_until,
+        )
+
 
 # ---- snapshot ----------------------------------------------------------
 
@@ -1550,6 +1661,26 @@ def _toobit_filter(row: dict, name: str) -> dict:
         if isinstance(item, dict) and item.get("filterType") == name:
             return item
     return {}
+
+
+def _find_xt_symbol(payload: dict, symbol: str) -> dict | None:
+    """Return the public symbol row whose ``symbol`` is ``symbol``."""
+    symbols = payload.get("symbols")
+    if isinstance(symbols, list):
+        for item in symbols:
+            if isinstance(item, dict) and str(item.get("symbol") or "") == symbol:
+                return item
+    return None
+
+
+def _xt_quote_min(row: dict) -> str:
+    """Quote minimum from the QUOTE_QTY filter."""
+    filters = row.get("filters")
+    if isinstance(filters, list):
+        for item in filters:
+            if isinstance(item, dict) and item.get("filter") == "QUOTE_QTY":
+                return _required_decimal_string(item, "min")
+    raise KeyError("min")
 
 
 def _find_kraken_row(result: dict, canonical_pair: str) -> tuple[dict | None, str | None]:
