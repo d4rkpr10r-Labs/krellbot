@@ -68,6 +68,11 @@ OURBIT_TAKER_BPS = 0
 # not an Innovation Zone pair. Pinned at 0 bps. The separate API-user rate
 # is not applied.
 TOOBIT_TAKER_BPS = 0
+
+# XT's public btc_usdt symbol publishes takerFeeRate 0.002 (0.20%).
+# The help-center special-mechanism table (updated 2025-12-29) lists the
+# same taker rate. Pinned at 20 bps. Futures fees are not used.
+XT_TAKER_BPS = 20
 SLIPPAGE_BPS = 5
 
 
@@ -94,17 +99,19 @@ def _fee_bps_for(venue: str) -> int:
         return OURBIT_TAKER_BPS
     if venue == "toobit":
         return TOOBIT_TAKER_BPS
+    if venue == "xt":
+        return XT_TAKER_BPS
     return COINBASE_TAKER_BPS
 
 
 def _seed_quote_asset(venue: str) -> str:
     """Quote asset used when seeding paper starting cash for a venue.
 
-    Binance, Bybit, Ourbit, and Toobit wave paper markets are USDT-quoted (``BTCUSDT``).
+    Binance, Bybit, Ourbit, Toobit, and XT wave paper markets are USDT-quoted (``BTCUSDT``).
     Gate, Pionex, OKX, and KuCoin wave paper markets are USDT-quoted (``BTC-USDT``).
     Kraken and Coinbase wave paper markets seed ``USD``.
     """
-    if venue in {"binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit"}:
+    if venue in {"binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt"}:
         return "USDT"
     return "USD"
 

@@ -21,7 +21,7 @@ _PACK_FORMAT = _REPO_ROOT / "docs" / "pack-format.md"
 
 # Documented allow-list for pack markets (must match docs/pack-format.md).
 DOCUMENTED_PACK_MARKET_VENUES = frozenset(
-    {"kraken", "coinbase", "binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit"}
+    {"kraken", "coinbase", "binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt"}
 )
 
 _MINIMAL_PACK = {
