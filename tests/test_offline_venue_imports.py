@@ -30,6 +30,7 @@ REMOTE_MODULES = {
     "krellbot.venues.xt",
     "krellbot.venues.mexc",
     "krellbot.venues.deepcoin",
+    "krellbot.venues.btcc",
     "krellbot.venues.lbank",
     "krellbot.venues.bitget",
 }
@@ -37,6 +38,7 @@ PUBLIC_NAMES = [
     "Balance",
     "BinanceVenue",
     "BitgetVenue",
+    "BtccVenue",
     "BybitVenue",
     "CoinbaseVenue",
     "DeepcoinVenue",
@@ -172,6 +174,7 @@ def test_offline_import_does_not_load_remote_adapters(tmp_path, source, expected
         ("xt", "XtVenue"),
         ("mexc", "MexcVenue"),
         ("deepcoin", "DeepcoinVenue"),
+        ("btcc", "BtccVenue"),
         ("lbank", "LbankVenue"),
         ("bitget", "BitgetVenue"),
     ],
@@ -218,6 +221,7 @@ def test_import_star_preserves_public_names_and_class_identity(tmp_path):
         from krellbot.venues.xt import XtVenue
         from krellbot.venues.mexc import MexcVenue
         from krellbot.venues.deepcoin import DeepcoinVenue
+        from krellbot.venues.btcc import BtccVenue
         from krellbot.venues.lbank import LbankVenue
         from krellbot.venues.bitget import BitgetVenue
         assert namespace['KrakenVenue'] is KrakenVenue
@@ -228,6 +232,8 @@ def test_import_star_preserves_public_names_and_class_identity(tmp_path):
         assert namespace['KucoinVenue'] is KucoinVenue
         assert namespace['XtVenue'] is XtVenue
         assert namespace['LbankVenue'] is LbankVenue
+        assert namespace['BtccVenue'] is BtccVenue
+        assert vars(venues)['BtccVenue'] is BtccVenue
         assert vars(venues)['KrakenVenue'] is KrakenVenue
         assert vars(venues)['CoinbaseVenue'] is CoinbaseVenue
         assert vars(venues)['BinanceVenue'] is BinanceVenue
@@ -305,6 +311,7 @@ def test_all_is_preserved_without_resolving_lazy_names(tmp_path):
         "XtVenue",
         "MexcVenue",
         "DeepcoinVenue",
+        "BtccVenue",
         "LbankVenue",
         "BitgetVenue",
     ],
@@ -328,6 +335,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
             'krellbot.venues.xt',
             'krellbot.venues.mexc',
             'krellbot.venues.deepcoin',
+            'krellbot.venues.btcc',
             'krellbot.venues.lbank',
             'krellbot.venues.bitget',
         }}
@@ -350,6 +358,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
         assert 'XtVenue' not in vars(venues)
         assert 'MexcVenue' not in vars(venues)
         assert 'DeepcoinVenue' not in vars(venues)
+        assert 'BtccVenue' not in vars(venues)
         assert 'LbankVenue' not in vars(venues)
         assert 'BitgetVenue' not in vars(venues)
         resolved_name = {resolved_name!r}
@@ -379,6 +388,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
         "XtVenue": {"krellbot.venues.xt"},
         "MexcVenue": {"krellbot.venues.mexc"},
         "DeepcoinVenue": {"krellbot.venues.deepcoin"},
+        "BtccVenue": {"krellbot.venues.btcc"},
         "LbankVenue": {"krellbot.venues.lbank"},
         "BitgetVenue": {"krellbot.venues.bitget"},
     }
@@ -401,6 +411,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
         ("xt", "XtVenue"),
         ("mexc", "MexcVenue"),
         ("deepcoin", "DeepcoinVenue"),
+        ("btcc", "BtccVenue"),
         ("lbank", "LbankVenue"),
         ("bitget", "BitgetVenue"),
     ],

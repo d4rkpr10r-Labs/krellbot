@@ -34,6 +34,7 @@ VENUES = {
     "deepcoin",
     "lbank",
     "bitget",
+    "btcc",
 }
 
 
