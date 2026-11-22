@@ -18,7 +18,7 @@ from pathlib import Path
 
 from krellbot import paths, sanitize
 
-VENUES = {"kraken", "coinbase", "binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt"}
+VENUES = {"kraken", "coinbase", "binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt", "mexc"}
 
 
 def _is_windows() -> bool:
