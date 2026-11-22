@@ -90,6 +90,12 @@ Explicitly out of scope for these phases: hosting operator keys; more
 than two qualified live venues (P4 ships Kraken + Coinbase; Binance stays
 paper); paid ads for signals; personalized advice; CLI user features.
 
+## Spot venue expansion proposal
+
+[M27](milestones/M27.md) proposes the next exchange-breadth wave and evidence
+for qualifying a third live venue. The P0–P4 delivery gates and the paper-only
+release policy continue to apply.
+
 ## Preserved engineering requirements
 
 - One shared application/domain implementation for GUI and CLI plumbing;

@@ -29,6 +29,12 @@ krellbot tick --venue kraken \
     --offline-candles tests/fixtures/candles/kraken_SUIUSD_1h_sample.csv
 ```
 
+The scheduler can fetch public candles for Kraken, Coinbase, and Binance
+spot. Binance uses the credential-free public klines endpoint and fetches
+instrument rules separately. Order simulation remains local. For paper
+venues without a scheduled candle reader, the pinned CSV path is the
+verified end-to-end tick path.
+
 The tick engine:
 
 1. Acquires `<home>/run/<venue>.lock`. If another tick is already running,
