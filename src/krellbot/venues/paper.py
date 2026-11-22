@@ -78,6 +78,11 @@ XT_TAKER_BPS = 20
 # The official fee page lists the same standard spot taker. Pinned at 5 bps.
 # The MX deduction is not applied. Futures fees are not used.
 MEXC_TAKER_BPS = 5
+
+# Deepcoin's public spot schedule lists a 0.10% taker. The 2025-11-26
+# fee notice keeps BTC/USDT at 0.10%. Pinned at 10 bps. Futures fees
+# are not used.
+DEEPCOIN_TAKER_BPS = 10
 SLIPPAGE_BPS = 5
 
 
@@ -108,6 +113,8 @@ def _fee_bps_for(venue: str) -> int:
         return XT_TAKER_BPS
     if venue == "mexc":
         return MEXC_TAKER_BPS
+    if venue == "deepcoin":
+        return DEEPCOIN_TAKER_BPS
     return COINBASE_TAKER_BPS
 
 
@@ -115,10 +122,10 @@ def _seed_quote_asset(venue: str) -> str:
     """Quote asset used when seeding paper starting cash for a venue.
 
     Binance, Bybit, Ourbit, Toobit, XT, and MEXC wave paper markets are USDT-quoted (``BTCUSDT``).
-    Gate, Pionex, OKX, and KuCoin wave paper markets are USDT-quoted (``BTC-USDT``).
+    Gate, Pionex, OKX, KuCoin, and Deepcoin wave paper markets are USDT-quoted (``BTC-USDT``).
     Kraken and Coinbase wave paper markets seed ``USD``.
     """
-    if venue in {"binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt", "mexc"}:
+    if venue in {"binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt", "mexc", "deepcoin"}:
         return "USDT"
     return "USD"
 

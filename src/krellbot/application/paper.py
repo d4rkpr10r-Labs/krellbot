@@ -227,6 +227,7 @@ _PAPER_TAKER_BPS = {
     "toobit": 0,
     "xt": 20,
     "mexc": 5,
+    "deepcoin": 10,
 }
 
 
