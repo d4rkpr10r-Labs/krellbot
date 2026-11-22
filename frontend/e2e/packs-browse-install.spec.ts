@@ -1,5 +1,5 @@
 /**
- * M5.2 Packs browse + one-click install (KRELL-SIGNAL-20261010).
+ * Signed and community Packs browse + one-click install (KRELL-SIGNAL-20261010).
  *
  * Playwright route fakes for catalogue / install / library / community
  * index — no real signed envelopes, network catalogue or community-index
@@ -35,7 +35,17 @@ const CATALOGUE = {
   ],
 };
 
-async function stubPackApis(page: import("@playwright/test").Page): Promise<void> {
+const COMMUNITY_PACK = {
+  id: "trend-follow",
+  label: "Trend follow",
+  author: "community-example",
+  url: "https://raw.githubusercontent.com/d4rk-pri0r/krellbot-community-packs/main/packs/trend-follow.json",
+};
+
+async function stubPackApis(
+  page: import("@playwright/test").Page,
+  communityPacks: ReadonlyArray<typeof COMMUNITY_PACK> = [],
+): Promise<void> {
   let library: Array<Record<string, unknown>> = [];
 
   await page.route("**/api/v1/catalogue", async (route) => {
@@ -62,7 +72,7 @@ async function stubPackApis(page: import("@playwright/test").Page): Promise<void
       body: JSON.stringify({
         schema_version: "1",
         index_url: "https://raw.githubusercontent.com/d4rk-pri0r/krellbot-community-packs/main/index.json",
-        packs: [],
+        packs: communityPacks,
       }),
     });
   });
@@ -155,6 +165,45 @@ test("packs browse: first-class Packs nav shows signed catalogue rows", async ({
   );
   await expect(page.getByTestId("pack-catalogue-tier-paid-triple-stack")).toHaveText(
     "paid",
+  );
+  journey.assertGuards();
+});
+
+test("community install keeps provenance and uses the session-protected community route", async ({
+  journey,
+}) => {
+  const page = journey.page;
+  await stubPackApis(page, [COMMUNITY_PACK]);
+  await page.route("**/api/v1/community/install", async (route) => {
+    await route.fulfill({
+      json: {
+        schema_version: "1",
+        ok: true,
+        pack: { ...COMMUNITY_PACK, version: "1.0.0" },
+        path: "packs/community/trend-follow.json",
+      },
+    });
+  });
+  await page.goto(journey.workstation.baseURL);
+  await journey.waitForSessionReady(page);
+  await clickNav(page, "Packs");
+
+  const row = page.getByTestId("community-index-row-trend-follow");
+  await expect(row).toHaveAttribute("data-pack-source", "community");
+  await expect(row).toContainText(/unverified/i);
+  await expect(row).toContainText(COMMUNITY_PACK.author);
+  await expect(page.getByTestId("pack-catalogue-id-free-dual-ma")).toBeVisible();
+
+  const installRequest = page.waitForRequest(
+    (request) => new URL(request.url()).pathname === "/api/v1/community/install",
+  );
+  await row.getByRole("button", { name: "Install" }).click();
+  const request = await installRequest;
+  expect(request.method()).toBe("POST");
+  expect(request.postDataJSON()).toEqual({ pack_id: COMMUNITY_PACK.id });
+  expect((await request.allHeaders())["x-krellbot-csrf"]).toBeTruthy();
+  await expect(row.getByRole("status")).toHaveText(
+    "Installed · trend-follow · 1.0.0 · author community-example · packs/community/trend-follow.json",
   );
   journey.assertGuards();
 });
