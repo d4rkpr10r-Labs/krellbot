@@ -95,6 +95,10 @@ LBANK_TAKER_BPS = 10
 # symbols payload publishes takerFeeRate 0.002; that field is not the
 # VIP 0 schedule rate and is not used. Futures fees are not used.
 BITGET_TAKER_BPS = 10
+# Crypto.com Exchange lists Level 1 spot taker at 0.500% without a CRO
+# balance. Pinned at 50 bps. The CRO-balance discount is not applied.
+# Derivatives fees are not used.
+CRYPTOCOM_TAKER_BPS = 50
 SLIPPAGE_BPS = 5
 
 
@@ -131,6 +135,8 @@ def _fee_bps_for(venue: str) -> int:
         return LBANK_TAKER_BPS
     if venue == "bitget":
         return BITGET_TAKER_BPS
+    if venue == "cryptocom":
+        return CRYPTOCOM_TAKER_BPS
     return COINBASE_TAKER_BPS
 
 
@@ -138,7 +144,7 @@ def _seed_quote_asset(venue: str) -> str:
     """Quote asset used when seeding paper starting cash for a venue.
 
     Binance, Bybit, Ourbit, Toobit, XT, MEXC, and Bitget wave paper markets are USDT-quoted (``BTCUSDT``).
-    Gate, Pionex, OKX, KuCoin, Deepcoin, and LBank wave paper markets are USDT-quoted (``BTC-USDT``).
+    Gate, Pionex, OKX, KuCoin, Deepcoin, LBank, and Crypto.com wave paper markets are USDT-quoted (``BTC-USDT``).
     Kraken and Coinbase wave paper markets seed ``USD``.
     """
     if venue in {
@@ -155,6 +161,7 @@ def _seed_quote_asset(venue: str) -> str:
         "deepcoin",
         "lbank",
         "bitget",
+        "cryptocom",
     }:
         return "USDT"
     return "USD"
