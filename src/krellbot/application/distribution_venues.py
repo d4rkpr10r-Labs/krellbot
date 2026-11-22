@@ -35,6 +35,7 @@ PAPER_ONLY_VENUES: Final[frozenset[str]] = frozenset(
         "deepcoin",
         "lbank",
         "bitget",
+        "htx",
     }
 )
 
