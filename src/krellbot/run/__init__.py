@@ -1040,7 +1040,7 @@ def _fee_bps_for_venue(venue: str) -> int:
         return 20
     if venue == "mexc":
         return 5
-    if venue == "deepcoin":
+    if venue in {"deepcoin", "lbank"}:
         return 10
     return 0
 

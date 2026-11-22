@@ -83,6 +83,11 @@ MEXC_TAKER_BPS = 5
 # fee notice keeps BTC/USDT at 0.10%. Pinned at 10 bps. Futures fees
 # are not used.
 DEEPCOIN_TAKER_BPS = 10
+
+# LBank's support article on spot fee vouchers states that BTC/USDT's
+# original maker and taker rate is 0.10%. Pinned at 10 bps. Futures
+# fees are not used.
+LBANK_TAKER_BPS = 10
 SLIPPAGE_BPS = 5
 
 
@@ -115,6 +120,8 @@ def _fee_bps_for(venue: str) -> int:
         return MEXC_TAKER_BPS
     if venue == "deepcoin":
         return DEEPCOIN_TAKER_BPS
+    if venue == "lbank":
+        return LBANK_TAKER_BPS
     return COINBASE_TAKER_BPS
 
 
@@ -122,10 +129,23 @@ def _seed_quote_asset(venue: str) -> str:
     """Quote asset used when seeding paper starting cash for a venue.
 
     Binance, Bybit, Ourbit, Toobit, XT, and MEXC wave paper markets are USDT-quoted (``BTCUSDT``).
-    Gate, Pionex, OKX, KuCoin, and Deepcoin wave paper markets are USDT-quoted (``BTC-USDT``).
+    Gate, Pionex, OKX, KuCoin, Deepcoin, and LBank wave paper markets are USDT-quoted (``BTC-USDT``).
     Kraken and Coinbase wave paper markets seed ``USD``.
     """
-    if venue in {"binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt", "mexc", "deepcoin"}:
+    if venue in {
+        "binance",
+        "gate",
+        "pionex",
+        "okx",
+        "bybit",
+        "kucoin",
+        "ourbit",
+        "toobit",
+        "xt",
+        "mexc",
+        "deepcoin",
+        "lbank",
+    }:
         return "USDT"
     return "USD"
 

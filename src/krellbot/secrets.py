@@ -32,6 +32,7 @@ VENUES = {
     "xt",
     "mexc",
     "deepcoin",
+    "lbank",
 }
 
 

@@ -228,6 +228,7 @@ _PAPER_TAKER_BPS = {
     "xt": 20,
     "mexc": 5,
     "deepcoin": 10,
+    "lbank": 10,
 }
 
 

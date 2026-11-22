@@ -182,6 +182,8 @@ export function LivePreflight(): JSX.Element {
           use paper arm for mexc / BTCUSDT; do not claim qualified MEXC live.
           Deepcoin is paper-only —
           use paper arm for deepcoin / BTC-USDT; do not claim qualified Deepcoin live.
+          LBank is paper-only —
+          use paper arm for lbank / BTC-USDT; do not claim qualified LBank live.
         </p>
         <label
           className="kbot-feature__live-preflight-root__field"

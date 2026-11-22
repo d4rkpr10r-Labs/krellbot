@@ -1,4 +1,4 @@
-"""Venue adapters: base protocol plus Kraken, Coinbase, Binance, Gate, Pionex, OKX, Bybit, KuCoin, Ourbit, Toobit, XT, MEXC, and Deepcoin spot.
+"""Venue adapters: base protocol plus Kraken, Coinbase, Binance, Gate, Pionex, OKX, Bybit, KuCoin, Ourbit, Toobit, XT, MEXC, Deepcoin, and LBank spot.
 
 `Venue` lives in `krellbot.venues.base`. Every adapter accepts Decimal for
 size/price, and `qty`/`stop` are quantized to the venue's lot/price decimals
@@ -30,6 +30,7 @@ __all__ = [
     "KeyPerms",
     "KrakenVenue",
     "KucoinVenue",
+    "LbankVenue",
     "MexcVenue",
     "OkxVenue",
     "OpenOrder",
@@ -87,6 +88,11 @@ def __getattr__(name: str) -> object:
 
         globals()[name] = KucoinVenue
         return KucoinVenue
+    if name == "LbankVenue":
+        from .lbank import LbankVenue
+
+        globals()[name] = LbankVenue
+        return LbankVenue
     if name == "MexcVenue":
         from .mexc import MexcVenue
 
