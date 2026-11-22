@@ -78,6 +78,12 @@ XT_TAKER_BPS = 20
 # The official fee page lists the same standard spot taker. Pinned at 5 bps.
 # The MX deduction is not applied. Futures fees are not used.
 MEXC_TAKER_BPS = 5
+# Bitget's fee schedule lists VIP 0 spot maker and taker at 0.10%.
+# The 2026-08-20 trading-fees FAQ states the same standard spot taker.
+# Pinned at 10 bps. The BGB payment discount is not applied. The public
+# symbols payload publishes takerFeeRate 0.002; that field is not the
+# VIP 0 schedule rate and is not used. Futures fees are not used.
+BITGET_TAKER_BPS = 10
 SLIPPAGE_BPS = 5
 
 
@@ -108,17 +114,19 @@ def _fee_bps_for(venue: str) -> int:
         return XT_TAKER_BPS
     if venue == "mexc":
         return MEXC_TAKER_BPS
+    if venue == "bitget":
+        return BITGET_TAKER_BPS
     return COINBASE_TAKER_BPS
 
 
 def _seed_quote_asset(venue: str) -> str:
     """Quote asset used when seeding paper starting cash for a venue.
 
-    Binance, Bybit, Ourbit, Toobit, XT, and MEXC wave paper markets are USDT-quoted (``BTCUSDT``).
+    Binance, Bybit, Ourbit, Toobit, XT, MEXC, and Bitget wave paper markets are USDT-quoted (``BTCUSDT``).
     Gate, Pionex, OKX, and KuCoin wave paper markets are USDT-quoted (``BTC-USDT``).
     Kraken and Coinbase wave paper markets seed ``USD``.
     """
-    if venue in {"binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt", "mexc"}:
+    if venue in {"binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt", "mexc", "bitget"}:
         return "USDT"
     return "USD"
 

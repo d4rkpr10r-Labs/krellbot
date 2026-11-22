@@ -85,6 +85,8 @@ PAPER_WAVE_TOOBIT_BTC_USDT = "BTCUSDT"
 PAPER_WAVE_XT_BTC_USDT = "BTCUSDT"
 # Wave MEXC BTC/USDT symbol. Public exchangeInfo uses this concatenated spelling.
 PAPER_WAVE_MEXC_BTC_USDT = "BTCUSDT"
+# Wave Bitget BTC/USDT symbol. Public symbols use this concatenated spelling.
+PAPER_WAVE_BITGET_BTC_USDT = "BTCUSDT"
 
 SCHEMA_VERSION = "1"
 DEFAULT_TTL_SECONDS = 24 * 60 * 60  # 24h
@@ -121,6 +123,7 @@ OURBIT_EXCHANGE_INFO_URL = "https://api.ourbit.com/api/v3/exchangeInfo"
 TOOBIT_EXCHANGE_INFO_URL = "https://api.toobit.com/api/v1/exchangeInfo"
 XT_SYMBOLS_URL = "https://sapi.xt.com/v4/public/symbol"
 MEXC_EXCHANGE_INFO_URL = "https://api.mexc.com/api/v3/exchangeInfo"
+BITGET_SYMBOLS_URL = "https://api.bitget.com/api/v2/spot/public/symbols"
 
 SNAPSHOT_FILENAME = "instrument-rules.json"
 
@@ -213,6 +216,7 @@ class InstrumentRulesV1:
             "toobit",
             "xt",
             "mexc",
+            "bitget",
         ):
             raise ValueError(f"instrument: unsupported venue {self.venue!r}")
 
@@ -289,6 +293,8 @@ class InstrumentMetadataClient:
             return self._fetch_xt(canonical_pair)
         if venue == "mexc":
             return self._fetch_mexc(canonical_pair)
+        if venue == "bitget":
+            return self._fetch_bitget(canonical_pair)
         raise InstrumentMetadataError(
             METADATA_UNAVAILABLE,
             venue,
@@ -1438,6 +1444,112 @@ class InstrumentMetadataClient:
             usable_until=usable_until,
         )
 
+    # ---- internal: Bitget ----------------------------------------------
+
+    def _fetch_bitget(self, canonical_pair: str) -> InstrumentRulesV1:
+        query = urllib.parse.urlencode({"symbol": canonical_pair})
+        url = f"{BITGET_SYMBOLS_URL}?{query}"
+        payload = self._transport.get(url, {}) or {}
+        if not isinstance(payload, dict):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "bitget",
+                canonical_pair,
+                "instrument: bitget symbols body is not a JSON object",
+            )
+        if str(payload.get("code") or "") not in {"", "00000"}:
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "bitget",
+                canonical_pair,
+                "instrument: bitget symbols refused the request",
+            )
+        row = _find_bitget_symbol(payload, canonical_pair)
+        if row is None:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "bitget",
+                canonical_pair,
+                "instrument: bitget symbols response did not contain the requested symbol",
+            )
+        if str(row.get("status") or "").lower() != "online":
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "bitget",
+                canonical_pair,
+                "instrument: bitget symbol is not online",
+            )
+        venue_symbol = str(row.get("symbol") or "")
+        if venue_symbol != canonical_pair:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "bitget",
+                canonical_pair,
+                "instrument: bitget symbols returned a different symbol than requested",
+            )
+        try:
+            quantity_precision = int(str(row["quantityPrecision"]))
+            price_precision = int(str(row["pricePrecision"]))
+            min_trade = Decimal(str(row.get("minTradeAmount") or "0"))
+            min_quantity = _decimals_to_increment(quantity_precision)
+            if min_trade > 0:
+                min_quantity = format(min_trade, "f")
+            quantity_increment = _decimals_to_increment(quantity_precision)
+            price_increment = _decimals_to_increment(price_precision)
+            min_notional_raw = Decimal(str(row.get("minTradeUSDT") or "0"))
+            min_notional = format(min_notional_raw, "f") if min_notional_raw > 0 else "1"
+        except (KeyError, TypeError, ValueError) as exc:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "bitget",
+                canonical_pair,
+                "instrument: bitget symbols payload missing required fields",
+            ) from exc
+        if (
+            Decimal(min_quantity) <= 0
+            or Decimal(min_notional) <= 0
+            or Decimal(quantity_increment) <= 0
+            or Decimal(price_increment) <= 0
+        ):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "bitget",
+                canonical_pair,
+                "instrument: bitget minima and increments must be positive",
+            )
+        base_asset = str(row.get("baseCoin") or "")
+        quote_asset = str(row.get("quoteCoin") or "")
+        if not base_asset or not quote_asset:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "bitget",
+                canonical_pair,
+                "instrument: bitget symbols missing base or quote",
+            )
+        retrieved_at = _unix_to_iso(self._clock())
+        usable_until = _unix_to_iso(self._clock() + self._ttl_seconds)
+        payload_bytes = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        return InstrumentRulesV1(
+            schema_version=SCHEMA_VERSION,
+            venue="bitget",
+            canonical_pair=canonical_pair,
+            venue_symbol=venue_symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            min_quantity=min_quantity,
+            min_notional=min_notional,
+            quantity_increment=quantity_increment,
+            price_increment=price_increment,
+            source={
+                "endpoint": BITGET_SYMBOLS_URL,
+                "retrieved_at": retrieved_at,
+                "source_version": payload_sha256[:16],
+                "payload_sha256": payload_sha256,
+            },
+            usable_until=usable_until,
+        )
+
 
 # ---- snapshot ----------------------------------------------------------
 
@@ -1802,6 +1914,18 @@ def _find_mexc_symbol(payload: dict, canonical_pair: str) -> dict | None:
         return data
     if str(payload.get("symbol") or "") == canonical_pair:
         return payload
+    return None
+
+
+def _find_bitget_symbol(payload: dict, canonical_pair: str) -> dict | None:
+    """Return the public symbols row whose ``symbol`` is ``canonical_pair``."""
+    data = payload.get("data")
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and str(item.get("symbol") or "") == canonical_pair:
+                return item
+    if isinstance(data, dict) and str(data.get("symbol") or "") == canonical_pair:
+        return data
     return None
 
 
