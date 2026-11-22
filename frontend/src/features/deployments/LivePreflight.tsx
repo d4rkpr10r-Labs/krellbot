@@ -180,6 +180,10 @@ export function LivePreflight(): JSX.Element {
           use paper arm for xt / BTCUSDT; do not claim qualified XT live.
           MEXC is paper-only —
           use paper arm for mexc / BTCUSDT; do not claim qualified MEXC live.
+          Deepcoin is paper-only —
+          use paper arm for deepcoin / BTC-USDT; do not claim qualified Deepcoin live.
+          LBank is paper-only —
+          use paper arm for lbank / BTC-USDT; do not claim qualified LBank live.
           Bitget is paper-only —
           use paper arm for bitget / BTCUSDT; do not claim qualified Bitget live.
         </p>

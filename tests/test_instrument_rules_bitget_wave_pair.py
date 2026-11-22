@@ -16,6 +16,7 @@ import pytest
 
 from krellbot.data.instruments import (
     BITGET_SYMBOLS_URL,
+    METADATA_INVALID,
     METADATA_SYMBOL_MISMATCH,
     PAPER_WAVE_BITGET_BTC_USDT,
     SNAPSHOT_FILENAME,
@@ -96,3 +97,25 @@ def test_bitget_symbols_missing_symbol_is_metadata_symbol_mismatch() -> None:
     with pytest.raises(InstrumentMetadataError) as exc:
         client.fetch_rules("bitget", PAPER_WAVE_BITGET_BTC_USDT)
     assert exc.value.code == METADATA_SYMBOL_MISMATCH
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("minTradeAmount", "not-decimal"),
+        ("minTradeAmount", "NaN"),
+        ("minTradeAmount", "-1"),
+        ("minTradeUSDT", "Infinity"),
+        ("minTradeUSDT", "0"),
+        ("minTradeUSDT", None),
+        ("quantityPrecision", "-1"),
+        ("pricePrecision", "1000000000"),
+    ],
+)
+def test_bitget_symbols_refuse_unusable_minima_or_precision(field, value) -> None:
+    row = {**BITGET_BTC_USDT_SYMBOLS["data"][0], field: value}
+    transport = _BitgetSymbolsTransport(payload={**BITGET_BTC_USDT_SYMBOLS, "data": [row]})
+    client = InstrumentMetadataClient(transport=transport)
+    with pytest.raises(InstrumentMetadataError) as exc:
+        client.fetch_rules("bitget", PAPER_WAVE_BITGET_BTC_USDT)
+    assert exc.value.code == METADATA_INVALID

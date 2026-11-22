@@ -2,8 +2,7 @@
 
 CI must never open a network socket to Bitget. ``BitgetVenue`` requires an
 explicit ``Transport``; ``None`` refuses rather than defaulting to
-``HttpTransport``. Order mutations still go through
-``release_policy.ensure_live_orders_allowed``.
+``HttpTransport``. Order mutations fail closed under either release setting.
 """
 
 from __future__ import annotations
@@ -14,9 +13,10 @@ from urllib.parse import urlparse
 import pytest
 from fakes.fake_bitget import FakeBitgetTransport
 
+from krellbot import release_policy
 from krellbot.release_policy import PaperOnlyReleaseError
 from krellbot.venues.base import WithdrawCapableError
-from krellbot.venues.bitget import API_HOST, BASE_URL, BitgetVenue, HttpTransport, canonical_json, sign_bitget
+from krellbot.venues.bitget import API_HOST, BASE_URL, BitgetVenue, HttpTransport, sign_bitget
 
 WAVE_PAIR = "BTCUSDT"
 NOW = 1_700_000_000_000
@@ -67,67 +67,38 @@ def test_bitget_rules_btcusdt_from_public_symbols() -> None:
     assert "symbol=BTCUSDT" in transport.gets[0]
 
 
-@pytest.mark.usefixtures("live_capable_release")
 def test_bitget_signature_matches_documented_prehash() -> None:
-    """ACCESS-SIGN is base64 HMAC-SHA256 of timestamp + METHOD + path + body."""
-    body = {
-        "clientOid": "coid",
-        "orderType": "market",
-        "side": "buy",
-        "size": "10",
-        "symbol": "BTCUSDT",
-    }
-    encoded = canonical_json(body)
-    signature = sign_bitget(SECRET, str(NOW), "POST", "/api/v2/spot/trade/place-order", encoded)
-    assert signature == "lLC/YeU0tXKCWm5Mtxq1DwBXZCesSjlpv/PQbiqrVwc="
+    request_path = "/api/v2/spot/trade/unfilled-orders?symbol=BTCUSDT&tpslType=tpsl"
+    signature = sign_bitget(SECRET, str(NOW), "GET", request_path)
+    assert signature == "+GhOS4MJZFuVI5000NYxk2W79lbIcQInVCfkHbT0JpM="
     transport = FakeBitgetTransport()
-    _venue(transport).place_entry_with_stop("coid", Decimal("0.0001"), Decimal(90000), pair=WAVE_PAIR)
-    _path, posted, headers = transport.posts[0]
-    assert headers["ACCESS-KEY"] == "test-key"
-    assert headers["ACCESS-PASSPHRASE"] == "bitget-passphrase"
-    assert headers["ACCESS-TIMESTAMP"] == str(NOW)
-    assert headers["ACCESS-SIGN"] == sign_bitget(
-        SECRET,
-        str(NOW),
-        "POST",
-        "/api/v2/spot/trade/place-order",
-        canonical_json(posted or {}),
-    )
+    assert _venue(transport).order_by_coid("absent") is None
+    assert transport.gets[1] == f"{BASE_URL}{request_path}"
+    assert transport.request_headers[1] == {
+        "ACCESS-KEY": "test-key",
+        "ACCESS-PASSPHRASE": "bitget-passphrase",
+        "ACCESS-TIMESTAMP": str(NOW),
+        "ACCESS-SIGN": signature,
+        "locale": "en-US",
+    }
 
 
-@pytest.mark.usefixtures("live_capable_release")
-def test_bitget_place_entry_sends_quote_buy_and_trigger_stop() -> None:
+@pytest.mark.parametrize(
+    ("paper_only", "expected_error"), [(True, PaperOnlyReleaseError), (False, NotImplementedError)]
+)
+def test_bitget_order_mutations_refuse_before_transport(monkeypatch, paper_only, expected_error) -> None:
+    monkeypatch.setattr(release_policy, "PAPER_ONLY_RELEASE", paper_only)
     transport = FakeBitgetTransport()
     venue = _venue(transport)
-    ref = venue.place_entry_with_stop("coid", Decimal("0.0001"), Decimal(90000), pair=WAVE_PAIR)
-    assert ref.coid == "coid"
-    assert ref.qty == Decimal("0.0001")
-    assert ref.stop_price == Decimal("90000.00")
-    assert len(transport.posts) == 2
-    buy = transport.posts[0][1]
-    stop = transport.posts[1][1]
-    assert buy == {
-        "clientOid": "coid",
-        "orderType": "market",
-        "side": "buy",
-        "size": "10.00000000",
-        "symbol": "BTCUSDT",
-    }
-    assert stop["tpslType"] == "tpsl"
-    assert stop["side"] == "sell"
-    assert stop["triggerPrice"] == "90000.00"
-    assert stop["size"] == "0.000100"
-    assert stop["clientOid"] == "coid-stop"
-    again = venue.place_entry_with_stop("coid", Decimal("0.0001"), Decimal(90000), pair=WAVE_PAIR)
-    assert again.coid == "coid"
-    assert len(transport.posts) == 2
-
-
-def test_bitget_place_entry_refuses_while_paper_only() -> None:
-    transport = FakeBitgetTransport()
-    with pytest.raises(PaperOnlyReleaseError):
-        _venue(transport).place_entry_with_stop("coid", Decimal("0.0001"), Decimal(90000), pair=WAVE_PAIR)
-    assert transport.posts == []
+    with pytest.raises(expected_error):
+        venue.place_entry_with_stop("entry", Decimal("0.01"), Decimal(90000), pair=WAVE_PAIR)
+    with pytest.raises(expected_error):
+        venue.place_exit("exit", Decimal("0.01"), pair=WAVE_PAIR)
+    with pytest.raises(expected_error):
+        venue.cancel_stops(WAVE_PAIR)
+    with pytest.raises(expected_error):
+        venue.raise_stop(WAVE_PAIR, Decimal(91000))
+    assert transport.gets == []
 
 
 def test_bitget_snapshot_reads_assets_orders_and_fills() -> None:
@@ -137,12 +108,28 @@ def test_bitget_snapshot_reads_assets_orders_and_fills() -> None:
             "data": [
                 {
                     "orderId": "s1",
-                    "clientOid": "coid-stop",
-                    "symbol": "BTCUSDT",
+                    "clientOid": "ordinary-limit-stop",
+                    "symbol": "btcusdt",
+                    "orderType": "limit",
+                    "tpslType": "normal",
                     "side": "sell",
                     "size": "0.0001",
                     "status": "live",
-                    "triggerPrice": "90000",
+                }
+            ],
+        },
+        conditional_orders={
+            "code": "00000",
+            "data": [
+                {
+                    "orderId": "s2",
+                    "symbol": "btcusdt",
+                    "orderType": "market",
+                    "tpslType": "tpsl",
+                    "side": "sell",
+                    "size": "0.0001",
+                    "status": "live",
+                    "triggerPrice": "104000",
                 }
             ],
         },
@@ -161,17 +148,25 @@ def test_bitget_snapshot_reads_assets_orders_and_fills() -> None:
             ],
         },
     )
-    truth = _venue(transport).snapshot()
+    venue = _venue(transport)
+    truth = venue.snapshot()
     assets = {item.asset: item.free for item in truth.balances}
     assert assets["USDT"] == Decimal(1000)
     assert assets["BTC"] == Decimal("0.01")
-    assert truth.open_orders[0].coid == "coid-stop"
+    assert len(truth.open_orders) == 2
+    assert truth.open_orders[0].coid == "ordinary-limit-stop"
+    assert truth.open_orders[0].pair == WAVE_PAIR
+    assert truth.open_orders[0].stop_price is None
+    assert truth.open_orders[1].id == "s2"
+    assert truth.open_orders[1].stop_price is None
+    assert venue.order_by_coid("ordinary-limit-stop") == truth.open_orders[0]
+    assert venue.order_by_coid("") is None
     assert truth.recent_fills[0].id == "f1"
     assert truth.recent_fills[0].side == "buy"
 
 
 def test_bitget_check_key_refuses_withdraw_authority() -> None:
-    transport = FakeBitgetTransport(info={"code": "00000", "data": {"authorities": ["trade", "withdraw"]}})
+    transport = FakeBitgetTransport(info={"code": "00000", "data": {"authorities": ["stow", "wwow"]}})
     with pytest.raises(WithdrawCapableError):
         _venue(transport).check_key()
 
@@ -182,26 +177,27 @@ def test_bitget_check_key_accepts_trade_without_withdraw() -> None:
     assert perms.can_withdraw is False
 
 
-@pytest.mark.usefixtures("live_capable_release")
-def test_bitget_raise_stop_replaces_the_trigger() -> None:
-    transport = FakeBitgetTransport(
-        orders={
-            "code": "00000",
-            "data": [
-                {
-                    "orderId": "s1",
-                    "clientOid": "coid-stop",
-                    "symbol": "BTCUSDT",
-                    "side": "sell",
-                    "size": "0.0001",
-                    "status": "live",
-                    "triggerPrice": "90000",
-                }
-            ],
-        }
-    )
-    _venue(transport).raise_stop(WAVE_PAIR, Decimal(91000))
-    assert transport.posts[0][1]["tpslType"] == "tpsl"
-    assert transport.posts[0][1]["orderId"] == "s1"
-    assert transport.posts[1][1]["triggerPrice"] == "91000.00"
-    assert transport.posts[1][1]["clientOid"] == "coid-stop-raised"
+def test_bitget_check_key_does_not_accept_readonly_as_spot_trade() -> None:
+    transport = FakeBitgetTransport(info={"code": "00000", "data": {"authorities": ["stor"]}})
+    assert _venue(transport).check_key().can_trade is False
+
+
+@pytest.mark.parametrize("extra_permission", ["wtow", "unknown", 0])
+def test_bitget_check_key_refuses_broad_or_unknown_permissions(extra_permission) -> None:
+    transport = FakeBitgetTransport(info={"code": "00000", "data": {"authorities": ["stow", extra_permission]}})
+    with pytest.raises(TypeError):
+        _venue(transport).check_key()
+
+
+def test_bitget_snapshot_does_not_use_rejected_account_read() -> None:
+    transport = FakeBitgetTransport(assets={"code": "40006", "msg": "test-key", "data": []})
+    with pytest.raises(RuntimeError, match="^bitget request refused$"):
+        _venue(transport).snapshot()
+    assert len(transport.gets) == 1
+
+
+def test_bitget_rules_refuse_nonfinite_minimum() -> None:
+    transport = FakeBitgetTransport()
+    transport.symbol = {**transport.symbol, "data": [{**transport.symbol["data"][0], "minTradeUSDT": "NaN"}]}
+    with pytest.raises(ValueError, match="bitget symbol minimum is invalid"):
+        _venue(transport).rules(WAVE_PAIR)

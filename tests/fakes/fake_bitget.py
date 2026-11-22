@@ -1,6 +1,6 @@
 """Fake Bitget spot transport for tests.
 
-Records every GET / POST. Never opens a network socket. Default payloads
+Records every GET. Never opens a network socket. Default payloads
 cover the wave symbol ``BTCUSDT``.
 """
 
@@ -32,8 +32,6 @@ _DEFAULT_SYMBOL = _ok(
     ]
 )
 
-_DEFAULT_TICKER = _ok([{"symbol": "BTCUSDT", "askPr": "100000", "bidPr": "99990"}])
-
 _DEFAULT_ASSETS = _ok(
     [
         {"coin": "USDT", "available": "1000", "frozen": "0", "locked": "0"},
@@ -41,7 +39,7 @@ _DEFAULT_ASSETS = _ok(
     ]
 )
 
-_DEFAULT_INFO = _ok({"userId": "1", "authorities": ["readonly", "trade"]})
+_DEFAULT_INFO = _ok({"userId": "1", "authorities": ["stor", "stow"]})
 
 
 @dataclass
@@ -49,22 +47,20 @@ class FakeBitgetTransport:
     """Scripted Bitget responses keyed by path substring."""
 
     symbol: dict = field(default_factory=lambda: dict(_DEFAULT_SYMBOL))
-    ticker: dict = field(default_factory=lambda: dict(_DEFAULT_TICKER))
     assets: dict = field(default_factory=lambda: dict(_DEFAULT_ASSETS))
     info: dict = field(default_factory=lambda: dict(_DEFAULT_INFO))
     orders: dict = field(default_factory=lambda: _ok([]))
     fills: dict = field(default_factory=lambda: _ok([]))
-    place: dict = field(default_factory=lambda: _ok({"orderId": "9001", "clientOid": "coid"}))
+    conditional_orders: dict = field(default_factory=lambda: _ok([]))
     gets: list[str] = field(default_factory=list)
-    posts: list[tuple[str, dict | None, dict]] = field(default_factory=list)
+    request_headers: list[dict[str, str]] = field(default_factory=list)
 
     def get(self, url: str, headers: dict[str, str]) -> dict:
         self.gets.append(url)
+        self.request_headers.append(dict(headers))
         path = urlparse(url).path
         if path.endswith("/public/symbols"):
             return self.symbol
-        if path.endswith("/market/tickers"):
-            return self.ticker
         if path.endswith("/account/assets"):
             return self.assets
         if path.endswith("/account/info"):
@@ -74,10 +70,6 @@ class FakeBitgetTransport:
         if path.endswith("/trade/unfilled-orders"):
             query = parse_qs(urlparse(url).query)
             if "tpsl" in query.get("tpslType", []):
-                return self.orders
-            return _ok([])
-        return _ok({})
-
-    def post(self, url: str, body: dict | None, headers: dict[str, str]) -> dict:
-        self.posts.append((url, body, dict(headers)))
-        return self.place
+                return self.conditional_orders
+            return self.orders
+        raise AssertionError(f"unexpected Bitget GET {path}")

@@ -49,7 +49,7 @@ import urllib.parse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from krellbot import paths as kb_paths
@@ -85,6 +85,10 @@ PAPER_WAVE_TOOBIT_BTC_USDT = "BTCUSDT"
 PAPER_WAVE_XT_BTC_USDT = "BTCUSDT"
 # Wave MEXC BTC/USDT symbol. Public exchangeInfo uses this concatenated spelling.
 PAPER_WAVE_MEXC_BTC_USDT = "BTCUSDT"
+# Wave Deepcoin BTC/USDT instId. Public instruments use this hyphenated spelling.
+PAPER_WAVE_DEEPCOIN_BTC_USDT = "BTC-USDT"
+# Wave LBank BTC/USDT pack pair. The public symbol is ``btc_usdt``.
+PAPER_WAVE_LBANK_BTC_USDT = "BTC-USDT"
 # Wave Bitget BTC/USDT symbol. Public symbols use this concatenated spelling.
 PAPER_WAVE_BITGET_BTC_USDT = "BTCUSDT"
 
@@ -123,6 +127,10 @@ OURBIT_EXCHANGE_INFO_URL = "https://api.ourbit.com/api/v3/exchangeInfo"
 TOOBIT_EXCHANGE_INFO_URL = "https://api.toobit.com/api/v1/exchangeInfo"
 XT_SYMBOLS_URL = "https://sapi.xt.com/v4/public/symbol"
 MEXC_EXCHANGE_INFO_URL = "https://api.mexc.com/api/v3/exchangeInfo"
+DEEPCOIN_INSTRUMENTS_URL = "https://api.deepcoin.com/deepcoin/market/instruments"
+# Deepcoin public instruments omit a quote minimum. Paper pins 1 quote unit.
+DEEPCOIN_PAPER_MIN_NOTIONAL = "1"
+LBANK_ACCURACY_URL = "https://api.lbank.info/v2/accuracy.do"
 BITGET_SYMBOLS_URL = "https://api.bitget.com/api/v2/spot/public/symbols"
 
 SNAPSHOT_FILENAME = "instrument-rules.json"
@@ -216,6 +224,8 @@ class InstrumentRulesV1:
             "toobit",
             "xt",
             "mexc",
+            "deepcoin",
+            "lbank",
             "bitget",
         ):
             raise ValueError(f"instrument: unsupported venue {self.venue!r}")
@@ -293,6 +303,10 @@ class InstrumentMetadataClient:
             return self._fetch_xt(canonical_pair)
         if venue == "mexc":
             return self._fetch_mexc(canonical_pair)
+        if venue == "deepcoin":
+            return self._fetch_deepcoin(canonical_pair)
+        if venue == "lbank":
+            return self._fetch_lbank(canonical_pair)
         if venue == "bitget":
             return self._fetch_bitget(canonical_pair)
         raise InstrumentMetadataError(
@@ -1444,6 +1458,199 @@ class InstrumentMetadataClient:
             usable_until=usable_until,
         )
 
+    # ---- internal: Deepcoin --------------------------------------------
+
+    def _fetch_deepcoin(self, canonical_pair: str) -> InstrumentRulesV1:
+        query = urllib.parse.urlencode({"instType": "SPOT", "instId": canonical_pair})
+        url = f"{DEEPCOIN_INSTRUMENTS_URL}?{query}"
+        payload = self._transport.get(url, {}) or {}
+        if not isinstance(payload, dict):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin instruments body is not a JSON object",
+            )
+        if str(payload.get("code") or "") not in {"", "0"}:
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin instruments refused the request",
+            )
+        row = _find_deepcoin_instrument(payload, canonical_pair)
+        if row is None:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin instruments response did not contain the requested instId",
+            )
+        venue_symbol = str(row.get("instId") or "")
+        if venue_symbol != canonical_pair:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin instruments returned a different instId than requested",
+            )
+        if str(row.get("state") or "").lower() != "live":
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin symbol is not live",
+            )
+        try:
+            min_quantity = _required_decimal_string(row, "minSz")
+            quantity_increment = _required_decimal_string(row, "lotSz")
+            price_increment = _required_decimal_string(row, "tickSz")
+        except (KeyError, ValueError) as exc:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin instruments payload missing required fields",
+            ) from exc
+        if Decimal(min_quantity) <= 0 or Decimal(quantity_increment) <= 0 or Decimal(price_increment) <= 0:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin minima and increments must be positive",
+            )
+        base_asset = str(row.get("baseCcy") or "")
+        quote_asset = str(row.get("quoteCcy") or "")
+        if not base_asset or not quote_asset:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin instruments missing base or quote",
+            )
+        retrieved_at = _unix_to_iso(self._clock())
+        usable_until = _unix_to_iso(self._clock() + self._ttl_seconds)
+        payload_bytes = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        return InstrumentRulesV1(
+            schema_version=SCHEMA_VERSION,
+            venue="deepcoin",
+            canonical_pair=canonical_pair,
+            venue_symbol=venue_symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            min_quantity=min_quantity,
+            min_notional=DEEPCOIN_PAPER_MIN_NOTIONAL,
+            quantity_increment=quantity_increment,
+            price_increment=price_increment,
+            source={
+                "endpoint": DEEPCOIN_INSTRUMENTS_URL,
+                "retrieved_at": retrieved_at,
+                "source_version": payload_sha256[:16],
+                "payload_sha256": payload_sha256,
+            },
+            usable_until=usable_until,
+        )
+
+    # ---- internal: LBank -----------------------------------------------
+
+    def _fetch_lbank(self, canonical_pair: str) -> InstrumentRulesV1:
+        symbol = canonical_pair.replace("-", "_").lower()
+        query = urllib.parse.urlencode({"symbol": symbol})
+        url = f"{LBANK_ACCURACY_URL}?{query}"
+        payload = self._transport.get(url, {}) or {}
+        if not isinstance(payload, dict):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "lbank",
+                canonical_pair,
+                "instrument: lbank accuracy body is not a JSON object",
+            )
+        result = payload.get("result")
+        code = payload.get("error_code")
+        if result not in (True, "true", "True") or code not in (None, 0, "0"):
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "lbank",
+                canonical_pair,
+                "instrument: lbank accuracy refused the request",
+            )
+        row = _find_lbank_symbol(payload, symbol)
+        if row is None:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "lbank",
+                canonical_pair,
+                "instrument: lbank accuracy response did not contain the requested symbol",
+            )
+        venue_symbol = str(row.get("symbol") or "")
+        if venue_symbol != symbol:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "lbank",
+                canonical_pair,
+                "instrument: lbank accuracy returned a different symbol than requested",
+            )
+        try:
+            min_quantity = str(row["minTranQua"])
+            min_notional = str(row["minOrderAmount"])
+            quantity_decimals = int(str(row["quantityAccuracy"]))
+            price_decimals = int(str(row["priceAccuracy"]))
+            quantity_increment = _decimals_to_increment(quantity_decimals)
+            price_increment = _decimals_to_increment(price_decimals)
+            Decimal(min_quantity)
+            Decimal(min_notional)
+        except (KeyError, ValueError, ArithmeticError) as exc:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "lbank",
+                canonical_pair,
+                "instrument: lbank accuracy payload missing required fields",
+            ) from exc
+        if (
+            Decimal(min_quantity) <= 0
+            or Decimal(min_notional) <= 0
+            or Decimal(quantity_increment) <= 0
+            or Decimal(price_increment) <= 0
+        ):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "lbank",
+                canonical_pair,
+                "instrument: lbank minima and increments must be positive",
+            )
+        if "_" not in symbol:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "lbank",
+                canonical_pair,
+                "instrument: lbank symbol is missing a quote",
+            )
+        base_asset, quote_asset = (part.upper() for part in symbol.split("_", 1))
+        retrieved_at = _unix_to_iso(self._clock())
+        usable_until = _unix_to_iso(self._clock() + self._ttl_seconds)
+        payload_bytes = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        return InstrumentRulesV1(
+            schema_version=SCHEMA_VERSION,
+            venue="lbank",
+            canonical_pair=canonical_pair,
+            venue_symbol=venue_symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            min_quantity=min_quantity,
+            min_notional=min_notional,
+            quantity_increment=quantity_increment,
+            price_increment=price_increment,
+            source={
+                "endpoint": LBANK_ACCURACY_URL,
+                "retrieved_at": retrieved_at,
+                "source_version": payload_sha256[:16],
+                "payload_sha256": payload_sha256,
+            },
+            usable_until=usable_until,
+        )
+
     # ---- internal: Bitget ----------------------------------------------
 
     def _fetch_bitget(self, canonical_pair: str) -> InstrumentRulesV1:
@@ -1457,7 +1664,7 @@ class InstrumentMetadataClient:
                 canonical_pair,
                 "instrument: bitget symbols body is not a JSON object",
             )
-        if str(payload.get("code") or "") not in {"", "00000"}:
+        if payload.get("code") != "00000":
             raise InstrumentMetadataError(
                 METADATA_UNAVAILABLE,
                 "bitget",
@@ -1490,33 +1697,22 @@ class InstrumentMetadataClient:
         try:
             quantity_precision = int(str(row["quantityPrecision"]))
             price_precision = int(str(row["pricePrecision"]))
-            min_trade = Decimal(str(row.get("minTradeAmount") or "0"))
-            min_quantity = _decimals_to_increment(quantity_precision)
-            if min_trade > 0:
-                min_quantity = format(min_trade, "f")
+            if not 0 <= quantity_precision <= 28 or not 0 <= price_precision <= 28:
+                raise ValueError("bitget precision is out of range")
+            min_trade = Decimal(str(row.get("minTradeAmount", "0")))
+            min_notional = Decimal(str(row["minTradeUSDT"]))
+            if not min_trade.is_finite() or not min_notional.is_finite() or min_trade < 0 or min_notional <= 0:
+                raise ValueError("bitget minimum is invalid")
             quantity_increment = _decimals_to_increment(quantity_precision)
             price_increment = _decimals_to_increment(price_precision)
-            min_notional_raw = Decimal(str(row.get("minTradeUSDT") or "0"))
-            min_notional = format(min_notional_raw, "f") if min_notional_raw > 0 else "1"
-        except (KeyError, TypeError, ValueError) as exc:
+            min_quantity = max(Decimal(quantity_increment), min_trade)
+        except (InvalidOperation, KeyError, TypeError, ValueError) as exc:
             raise InstrumentMetadataError(
                 METADATA_INVALID,
                 "bitget",
                 canonical_pair,
-                "instrument: bitget symbols payload missing required fields",
+                "instrument: bitget symbols payload contains invalid or missing rules",
             ) from exc
-        if (
-            Decimal(min_quantity) <= 0
-            or Decimal(min_notional) <= 0
-            or Decimal(quantity_increment) <= 0
-            or Decimal(price_increment) <= 0
-        ):
-            raise InstrumentMetadataError(
-                METADATA_INVALID,
-                "bitget",
-                canonical_pair,
-                "instrument: bitget minima and increments must be positive",
-            )
         base_asset = str(row.get("baseCoin") or "")
         quote_asset = str(row.get("quoteCoin") or "")
         if not base_asset or not quote_asset:
@@ -1537,8 +1733,8 @@ class InstrumentMetadataClient:
             venue_symbol=venue_symbol,
             base_asset=base_asset,
             quote_asset=quote_asset,
-            min_quantity=min_quantity,
-            min_notional=min_notional,
+            min_quantity=str(min_quantity),
+            min_notional=str(min_notional),
             quantity_increment=quantity_increment,
             price_increment=price_increment,
             source={
@@ -1914,6 +2110,28 @@ def _find_mexc_symbol(payload: dict, canonical_pair: str) -> dict | None:
         return data
     if str(payload.get("symbol") or "") == canonical_pair:
         return payload
+    return None
+
+
+def _find_deepcoin_instrument(payload: dict, canonical_pair: str) -> dict | None:
+    """Return the instruments row whose ``instId`` is ``canonical_pair``."""
+    data = payload.get("data")
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and str(item.get("instId") or "") == canonical_pair:
+                return item
+    if str(payload.get("instId") or "") == canonical_pair:
+        return payload
+    return None
+
+
+def _find_lbank_symbol(payload: dict, symbol: str) -> dict | None:
+    """Return the accuracy row whose ``symbol`` is ``symbol``."""
+    data = payload.get("data")
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and str(item.get("symbol") or "") == symbol:
+                return item
     return None
 
 

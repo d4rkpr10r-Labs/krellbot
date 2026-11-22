@@ -31,6 +31,8 @@ VENUES = {
     "toobit",
     "xt",
     "mexc",
+    "deepcoin",
+    "lbank",
     "bitget",
 }
 

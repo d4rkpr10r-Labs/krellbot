@@ -85,6 +85,8 @@ const VENUE_LABELS: Record<Venue, string> = {
   toobit: "Toobit (paper)",
   xt: "XT (paper)",
   mexc: "MEXC (paper)",
+  deepcoin: "Deepcoin (paper)",
+  lbank: "LBank (paper)",
   bitget: "Bitget (paper)",
 };
 
