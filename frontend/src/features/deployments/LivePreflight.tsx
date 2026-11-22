@@ -171,6 +171,8 @@ export function LivePreflight(): JSX.Element {
           use paper arm for okx / BTC-USDT; do not claim qualified OKX live.
           Bybit is paper-only —
           use paper arm for bybit / BTCUSDT; do not claim qualified Bybit live.
+          KuCoin is paper-only —
+          use paper arm for kucoin / BTC-USDT; do not claim qualified KuCoin live.
         </p>
         <label
           className="kbot-feature__live-preflight-root__field"

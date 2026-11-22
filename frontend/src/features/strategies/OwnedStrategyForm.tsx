@@ -80,6 +80,7 @@ const VENUE_LABELS: Record<Venue, string> = {
   pionex: "Pionex (paper)",
   okx: "OKX (paper)",
   bybit: "Bybit (paper)",
+  kucoin: "KuCoin (paper)",
 };
 
 const STOP_KIND_LABELS: Record<StopKind, string> = {
