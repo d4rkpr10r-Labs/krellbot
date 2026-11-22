@@ -78,6 +78,7 @@ const VENUE_LABELS: Record<Venue, string> = {
   binance: "Binance (paper)",
   gate: "Gate (paper)",
   pionex: "Pionex (paper)",
+  okx: "OKX (paper)",
   bybit: "Bybit (paper)",
 };
 

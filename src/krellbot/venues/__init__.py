@@ -1,4 +1,4 @@
-"""Venue adapters: base protocol plus Kraken, Coinbase, Binance, Gate, Pionex, and Bybit spot.
+"""Venue adapters: base protocol plus Kraken, Coinbase, Binance, Gate, Pionex, OKX, and Bybit spot.
 
 `Venue` lives in `krellbot.venues.base`. Every adapter accepts Decimal for
 size/price, and `qty`/`stop` are quantized to the venue's lot/price decimals
@@ -28,6 +28,7 @@ __all__ = [
     "GateVenue",
     "KeyPerms",
     "KrakenVenue",
+    "OkxVenue",
     "OpenOrder",
     "OrderRef",
     "PairRules",
@@ -75,4 +76,9 @@ def __getattr__(name: str) -> object:
 
         globals()[name] = KrakenVenue
         return KrakenVenue
+    if name == "OkxVenue":
+        from .okx import OkxVenue
+
+        globals()[name] = OkxVenue
+        return OkxVenue
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
