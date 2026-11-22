@@ -21,7 +21,21 @@ QUALIFIED_LIVE_VENUES: Final[frozenset[str]] = frozenset({"kraken", "coinbase"})
 
 # Paper-capable breadth that must not be advertised as qualified live.
 PAPER_ONLY_VENUES: Final[frozenset[str]] = frozenset(
-    {"binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt", "mexc", "deepcoin", "lbank"}
+    {
+        "binance",
+        "gate",
+        "pionex",
+        "okx",
+        "bybit",
+        "kucoin",
+        "ourbit",
+        "toobit",
+        "xt",
+        "mexc",
+        "deepcoin",
+        "lbank",
+        "bitget",
+    }
 )
 
 SECOND_DISTRIBUTION_VENUE: Final[str] = "coinbase"

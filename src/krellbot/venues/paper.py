@@ -88,6 +88,13 @@ DEEPCOIN_TAKER_BPS = 10
 # original maker and taker rate is 0.10%. Pinned at 10 bps. Futures
 # fees are not used.
 LBANK_TAKER_BPS = 10
+
+# Bitget's fee schedule lists VIP 0 spot maker and taker at 0.10%.
+# The 2026-08-20 trading-fees FAQ states the same standard spot taker.
+# Pinned at 10 bps. The BGB payment discount is not applied. The public
+# symbols payload publishes takerFeeRate 0.002; that field is not the
+# VIP 0 schedule rate and is not used. Futures fees are not used.
+BITGET_TAKER_BPS = 10
 SLIPPAGE_BPS = 5
 
 
@@ -122,13 +129,15 @@ def _fee_bps_for(venue: str) -> int:
         return DEEPCOIN_TAKER_BPS
     if venue == "lbank":
         return LBANK_TAKER_BPS
+    if venue == "bitget":
+        return BITGET_TAKER_BPS
     return COINBASE_TAKER_BPS
 
 
 def _seed_quote_asset(venue: str) -> str:
     """Quote asset used when seeding paper starting cash for a venue.
 
-    Binance, Bybit, Ourbit, Toobit, XT, and MEXC wave paper markets are USDT-quoted (``BTCUSDT``).
+    Binance, Bybit, Ourbit, Toobit, XT, MEXC, and Bitget wave paper markets are USDT-quoted (``BTCUSDT``).
     Gate, Pionex, OKX, KuCoin, Deepcoin, and LBank wave paper markets are USDT-quoted (``BTC-USDT``).
     Kraken and Coinbase wave paper markets seed ``USD``.
     """
@@ -145,6 +154,7 @@ def _seed_quote_asset(venue: str) -> str:
         "mexc",
         "deepcoin",
         "lbank",
+        "bitget",
     }:
         return "USDT"
     return "USD"

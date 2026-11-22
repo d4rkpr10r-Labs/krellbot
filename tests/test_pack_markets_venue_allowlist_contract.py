@@ -36,6 +36,7 @@ DOCUMENTED_PACK_MARKET_VENUES = frozenset(
         "mexc",
         "deepcoin",
         "lbank",
+        "bitget",
     }
 )
 

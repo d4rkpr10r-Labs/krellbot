@@ -49,7 +49,7 @@ import urllib.parse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from krellbot import paths as kb_paths
@@ -89,6 +89,8 @@ PAPER_WAVE_MEXC_BTC_USDT = "BTCUSDT"
 PAPER_WAVE_DEEPCOIN_BTC_USDT = "BTC-USDT"
 # Wave LBank BTC/USDT pack pair. The public symbol is ``btc_usdt``.
 PAPER_WAVE_LBANK_BTC_USDT = "BTC-USDT"
+# Wave Bitget BTC/USDT symbol. Public symbols use this concatenated spelling.
+PAPER_WAVE_BITGET_BTC_USDT = "BTCUSDT"
 
 SCHEMA_VERSION = "1"
 DEFAULT_TTL_SECONDS = 24 * 60 * 60  # 24h
@@ -129,6 +131,7 @@ DEEPCOIN_INSTRUMENTS_URL = "https://api.deepcoin.com/deepcoin/market/instruments
 # Deepcoin public instruments omit a quote minimum. Paper pins 1 quote unit.
 DEEPCOIN_PAPER_MIN_NOTIONAL = "1"
 LBANK_ACCURACY_URL = "https://api.lbank.info/v2/accuracy.do"
+BITGET_SYMBOLS_URL = "https://api.bitget.com/api/v2/spot/public/symbols"
 
 SNAPSHOT_FILENAME = "instrument-rules.json"
 
@@ -223,6 +226,7 @@ class InstrumentRulesV1:
             "mexc",
             "deepcoin",
             "lbank",
+            "bitget",
         ):
             raise ValueError(f"instrument: unsupported venue {self.venue!r}")
 
@@ -303,6 +307,8 @@ class InstrumentMetadataClient:
             return self._fetch_deepcoin(canonical_pair)
         if venue == "lbank":
             return self._fetch_lbank(canonical_pair)
+        if venue == "bitget":
+            return self._fetch_bitget(canonical_pair)
         raise InstrumentMetadataError(
             METADATA_UNAVAILABLE,
             venue,
@@ -1645,6 +1651,101 @@ class InstrumentMetadataClient:
             usable_until=usable_until,
         )
 
+    # ---- internal: Bitget ----------------------------------------------
+
+    def _fetch_bitget(self, canonical_pair: str) -> InstrumentRulesV1:
+        query = urllib.parse.urlencode({"symbol": canonical_pair})
+        url = f"{BITGET_SYMBOLS_URL}?{query}"
+        payload = self._transport.get(url, {}) or {}
+        if not isinstance(payload, dict):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "bitget",
+                canonical_pair,
+                "instrument: bitget symbols body is not a JSON object",
+            )
+        if payload.get("code") != "00000":
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "bitget",
+                canonical_pair,
+                "instrument: bitget symbols refused the request",
+            )
+        row = _find_bitget_symbol(payload, canonical_pair)
+        if row is None:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "bitget",
+                canonical_pair,
+                "instrument: bitget symbols response did not contain the requested symbol",
+            )
+        if str(row.get("status") or "").lower() != "online":
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "bitget",
+                canonical_pair,
+                "instrument: bitget symbol is not online",
+            )
+        venue_symbol = str(row.get("symbol") or "")
+        if venue_symbol != canonical_pair:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "bitget",
+                canonical_pair,
+                "instrument: bitget symbols returned a different symbol than requested",
+            )
+        try:
+            quantity_precision = int(str(row["quantityPrecision"]))
+            price_precision = int(str(row["pricePrecision"]))
+            if not 0 <= quantity_precision <= 28 or not 0 <= price_precision <= 28:
+                raise ValueError("bitget precision is out of range")
+            min_trade = Decimal(str(row.get("minTradeAmount", "0")))
+            min_notional = Decimal(str(row["minTradeUSDT"]))
+            if not min_trade.is_finite() or not min_notional.is_finite() or min_trade < 0 or min_notional <= 0:
+                raise ValueError("bitget minimum is invalid")
+            quantity_increment = _decimals_to_increment(quantity_precision)
+            price_increment = _decimals_to_increment(price_precision)
+            min_quantity = max(Decimal(quantity_increment), min_trade)
+        except (InvalidOperation, KeyError, TypeError, ValueError) as exc:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "bitget",
+                canonical_pair,
+                "instrument: bitget symbols payload contains invalid or missing rules",
+            ) from exc
+        base_asset = str(row.get("baseCoin") or "")
+        quote_asset = str(row.get("quoteCoin") or "")
+        if not base_asset or not quote_asset:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "bitget",
+                canonical_pair,
+                "instrument: bitget symbols missing base or quote",
+            )
+        retrieved_at = _unix_to_iso(self._clock())
+        usable_until = _unix_to_iso(self._clock() + self._ttl_seconds)
+        payload_bytes = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        return InstrumentRulesV1(
+            schema_version=SCHEMA_VERSION,
+            venue="bitget",
+            canonical_pair=canonical_pair,
+            venue_symbol=venue_symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            min_quantity=str(min_quantity),
+            min_notional=str(min_notional),
+            quantity_increment=quantity_increment,
+            price_increment=price_increment,
+            source={
+                "endpoint": BITGET_SYMBOLS_URL,
+                "retrieved_at": retrieved_at,
+                "source_version": payload_sha256[:16],
+                "payload_sha256": payload_sha256,
+            },
+            usable_until=usable_until,
+        )
+
 
 # ---- snapshot ----------------------------------------------------------
 
@@ -2031,6 +2132,18 @@ def _find_lbank_symbol(payload: dict, symbol: str) -> dict | None:
         for item in data:
             if isinstance(item, dict) and str(item.get("symbol") or "") == symbol:
                 return item
+    return None
+
+
+def _find_bitget_symbol(payload: dict, canonical_pair: str) -> dict | None:
+    """Return the public symbols row whose ``symbol`` is ``canonical_pair``."""
+    data = payload.get("data")
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and str(item.get("symbol") or "") == canonical_pair:
+                return item
+    if isinstance(data, dict) and str(data.get("symbol") or "") == canonical_pair:
+        return data
     return None
 
 

@@ -31,10 +31,12 @@ REMOTE_MODULES = {
     "krellbot.venues.mexc",
     "krellbot.venues.deepcoin",
     "krellbot.venues.lbank",
+    "krellbot.venues.bitget",
 }
 PUBLIC_NAMES = [
     "Balance",
     "BinanceVenue",
+    "BitgetVenue",
     "BybitVenue",
     "CoinbaseVenue",
     "DeepcoinVenue",
@@ -171,6 +173,7 @@ def test_offline_import_does_not_load_remote_adapters(tmp_path, source, expected
         ("mexc", "MexcVenue"),
         ("deepcoin", "DeepcoinVenue"),
         ("lbank", "LbankVenue"),
+        ("bitget", "BitgetVenue"),
     ],
 )
 @pytest.mark.parametrize("direct_first", [False, True], ids=["reexport-first", "direct-first"])
@@ -216,6 +219,7 @@ def test_import_star_preserves_public_names_and_class_identity(tmp_path):
         from krellbot.venues.mexc import MexcVenue
         from krellbot.venues.deepcoin import DeepcoinVenue
         from krellbot.venues.lbank import LbankVenue
+        from krellbot.venues.bitget import BitgetVenue
         assert namespace['KrakenVenue'] is KrakenVenue
         assert namespace['CoinbaseVenue'] is CoinbaseVenue
         assert namespace['BinanceVenue'] is BinanceVenue
@@ -244,6 +248,8 @@ def test_import_star_preserves_public_names_and_class_identity(tmp_path):
         assert namespace['DeepcoinVenue'] is DeepcoinVenue
         assert vars(venues)['DeepcoinVenue'] is DeepcoinVenue
         assert vars(venues)['LbankVenue'] is LbankVenue
+        assert namespace['BitgetVenue'] is BitgetVenue
+        assert vars(venues)['BitgetVenue'] is BitgetVenue
         for name in venues.__all__:
             assert namespace[name] is getattr(venues, name)
         """,
@@ -300,6 +306,7 @@ def test_all_is_preserved_without_resolving_lazy_names(tmp_path):
         "MexcVenue",
         "DeepcoinVenue",
         "LbankVenue",
+        "BitgetVenue",
     ],
 )
 def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, resolved_name):
@@ -322,6 +329,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
             'krellbot.venues.mexc',
             'krellbot.venues.deepcoin',
             'krellbot.venues.lbank',
+            'krellbot.venues.bitget',
         }}
         assert remote_modules.isdisjoint(sys.modules)
         names = dir(venues)
@@ -343,6 +351,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
         assert 'MexcVenue' not in vars(venues)
         assert 'DeepcoinVenue' not in vars(venues)
         assert 'LbankVenue' not in vars(venues)
+        assert 'BitgetVenue' not in vars(venues)
         resolved_name = {resolved_name!r}
         if resolved_name is not None:
             resolved = getattr(venues, resolved_name)
@@ -371,6 +380,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
         "MexcVenue": {"krellbot.venues.mexc"},
         "DeepcoinVenue": {"krellbot.venues.deepcoin"},
         "LbankVenue": {"krellbot.venues.lbank"},
+        "BitgetVenue": {"krellbot.venues.bitget"},
     }
     assert set(observed["modules"]) & REMOTE_MODULES == expected_remote[resolved_name]
 
@@ -392,6 +402,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
         ("mexc", "MexcVenue"),
         ("deepcoin", "DeepcoinVenue"),
         ("lbank", "LbankVenue"),
+        ("bitget", "BitgetVenue"),
     ],
 )
 def test_adapter_import_errors_propagate_without_caching_a_placeholder(tmp_path, module, name):
