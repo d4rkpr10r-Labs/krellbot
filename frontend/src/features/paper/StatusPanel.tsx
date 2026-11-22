@@ -12,6 +12,7 @@ import type {
 import { PaperStatusCsvExport } from "./PaperStatusCsvExport";
 import { PaperPnlPositionChart } from "./PaperPnlPositionChart";
 import { RehearsalPanel } from "./RehearsalPanel";
+import { TradingViewAlertPreview } from "./TradingViewAlertPreview";
 import type { RehearsalClient } from "./rehearsalClient";
 import { summarizePaperCommandRefusal } from "./paperCommandRefusalSummary";
 import "./StatusPanel.position.css";
@@ -1433,6 +1434,16 @@ export function StatusPanel({
           data-testid="paper-rehearsal-disclosure"
         >
           <RehearsalPanel client={rehearsalClient} />
+        </DisclosureSection>
+        <DisclosureSection
+          title="TradingView alert"
+          summary="Validate an alert without placing an order"
+          badge="Advanced"
+          badgeTone="advanced"
+          defaultOpen={false}
+          storageKey="krellbot.disclosure.paper.tradingview"
+        >
+          <TradingViewAlertPreview />
         </DisclosureSection>
       </div>
     </section>

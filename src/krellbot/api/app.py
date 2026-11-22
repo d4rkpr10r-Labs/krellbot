@@ -2837,6 +2837,34 @@ def create_app(
         )
         return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
 
+    @app.post("/api/v1/paper/tradingview/preview")
+    async def tradingview_paper_preview(request: Request) -> Response:
+        """Validate an alert supplied by the local operator without executing it."""
+        from krellbot.application.tradingview import MAX_ALERT_BYTES, preview_alert
+
+        denied = _gate_state_change(request, _state(request.app))
+        if denied is not None:
+            return denied
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > MAX_ALERT_BYTES:
+                return JSONResponse(
+                    {"schema_version": SCHEMA_VERSION, "ok": False, "code": "alert_too_large"},
+                    status_code=413,
+                )
+            body.extend(chunk)
+        try:
+            alert = preview_alert(bytes(body))
+        except ValueError as exc:
+            return JSONResponse(
+                {"schema_version": SCHEMA_VERSION, "ok": False, "code": "invalid_alert", "message": str(exc)},
+                status_code=400,
+            )
+        return JSONResponse(
+            {"schema_version": SCHEMA_VERSION, "ok": True, "code": "alert_previewed", "alert": alert},
+            headers={"Cache-Control": "no-store"},
+        )
+
     @app.get("/api/v1/paper/status")
     async def paper_status(request: Request) -> Response:
         """Return the closed-shape paper status projection (NS10b).
