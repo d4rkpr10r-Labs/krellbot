@@ -810,7 +810,6 @@ class InstrumentMetadataClient:
             usable_until=usable_until,
         )
 
-
     # ---- internal: Bybit -----------------------------------------------
 
     def _fetch_bybit(self, canonical_pair: str) -> InstrumentRulesV1:
