@@ -77,6 +77,8 @@ PAPER_WAVE_OKX_BTC_USDT = "BTC-USDT"
 PAPER_WAVE_BYBIT_BTC_USDT = "BTCUSDT"
 # Wave KuCoin BTC/USDT pack pair. The venue symbol is the same spelling.
 PAPER_WAVE_KUCOIN_BTC_USDT = "BTC-USDT"
+# Wave Toobit BTC/USDT symbol. Public exchangeInfo uses this concatenated spelling.
+PAPER_WAVE_TOOBIT_BTC_USDT = "BTCUSDT"
 
 SCHEMA_VERSION = "1"
 DEFAULT_TTL_SECONDS = 24 * 60 * 60  # 24h
@@ -109,6 +111,7 @@ OKX_INSTRUMENTS_URL = "https://www.okx.com/api/v5/public/instruments"
 OKX_PAPER_MIN_NOTIONAL = "1"
 BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
 KUCOIN_SYMBOLS_URL = "https://api.kucoin.com/api/v2/symbols"
+TOOBIT_EXCHANGE_INFO_URL = "https://api.toobit.com/api/v1/exchangeInfo"
 
 SNAPSHOT_FILENAME = "instrument-rules.json"
 
@@ -188,7 +191,7 @@ class InstrumentRulesV1:
             raise ValueError("instrument: canonical_pair must be a non-empty string")
         if not isinstance(self.venue_symbol, str) or not self.venue_symbol:
             raise ValueError("instrument: venue_symbol must be a non-empty string")
-        if self.venue not in ("kraken", "coinbase", "binance", "gate", "pionex", "okx", "bybit", "kucoin"):
+        if self.venue not in ("kraken", "coinbase", "binance", "gate", "pionex", "okx", "bybit", "kucoin", "toobit"):
             raise ValueError(f"instrument: unsupported venue {self.venue!r}")
 
 
@@ -256,6 +259,8 @@ class InstrumentMetadataClient:
             return self._fetch_bybit(canonical_pair)
         if venue == "kucoin":
             return self._fetch_kucoin(canonical_pair)
+        if venue == "toobit":
+            return self._fetch_toobit(canonical_pair)
         raise InstrumentMetadataError(
             METADATA_UNAVAILABLE,
             venue,
@@ -1010,6 +1015,102 @@ class InstrumentMetadataClient:
             usable_until=usable_until,
         )
 
+    # ---- internal: Toobit ----------------------------------------------
+
+    def _fetch_toobit(self, canonical_pair: str) -> InstrumentRulesV1:
+        url = TOOBIT_EXCHANGE_INFO_URL
+        payload = self._transport.get(url, {}) or {}
+        if not isinstance(payload, dict):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "toobit",
+                canonical_pair,
+                "instrument: toobit exchangeInfo body is not a JSON object",
+            )
+        row = _find_toobit_symbol(payload, canonical_pair)
+        if row is None:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "toobit",
+                canonical_pair,
+                "instrument: toobit exchangeInfo response did not contain the requested symbol",
+            )
+        venue_symbol = str(row.get("symbol") or "")
+        if venue_symbol != canonical_pair:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "toobit",
+                canonical_pair,
+                "instrument: toobit exchangeInfo returned a different symbol than requested",
+            )
+        status = str(row.get("status") or "TRADING").upper()
+        if status not in {"TRADING", "ENABLED"}:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "toobit",
+                canonical_pair,
+                "instrument: toobit symbol is not trading",
+            )
+        lot = _toobit_filter(row, "LOT_SIZE")
+        price = _toobit_filter(row, "PRICE_FILTER")
+        notional = _toobit_filter(row, "MIN_NOTIONAL")
+        try:
+            min_quantity = _required_decimal_string(lot, "minQty")
+            quantity_increment = _required_decimal_string(lot, "stepSize")
+            price_increment = _required_decimal_string(price, "tickSize")
+            min_notional = _required_decimal_string(notional, "minNotional")
+        except (KeyError, ValueError) as exc:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "toobit",
+                canonical_pair,
+                "instrument: toobit exchangeInfo payload missing required fields",
+            ) from exc
+        if (
+            Decimal(min_quantity) <= 0
+            or Decimal(min_notional) <= 0
+            or Decimal(quantity_increment) <= 0
+            or Decimal(price_increment) <= 0
+        ):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "toobit",
+                canonical_pair,
+                "instrument: toobit minima and increments must be positive",
+            )
+        base_asset = str(row.get("baseAsset") or "")
+        quote_asset = str(row.get("quoteAsset") or "")
+        if not base_asset or not quote_asset:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "toobit",
+                canonical_pair,
+                "instrument: toobit exchangeInfo missing base or quote asset",
+            )
+        retrieved_at = _unix_to_iso(self._clock())
+        usable_until = _unix_to_iso(self._clock() + self._ttl_seconds)
+        payload_bytes = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        return InstrumentRulesV1(
+            schema_version=SCHEMA_VERSION,
+            venue="toobit",
+            canonical_pair=canonical_pair,
+            venue_symbol=venue_symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            min_quantity=min_quantity,
+            min_notional=min_notional,
+            quantity_increment=quantity_increment,
+            price_increment=price_increment,
+            source={
+                "endpoint": TOOBIT_EXCHANGE_INFO_URL,
+                "retrieved_at": retrieved_at,
+                "source_version": payload_sha256[:16],
+                "payload_sha256": payload_sha256,
+            },
+            usable_until=usable_until,
+        )
+
 
 # ---- snapshot ----------------------------------------------------------
 
@@ -1296,6 +1397,27 @@ def _find_bybit_instrument(payload: dict, canonical_pair: str) -> dict | None:
     if str(payload.get("symbol") or "") == canonical_pair:
         return payload
     return None
+
+
+def _find_toobit_symbol(payload: dict, canonical_pair: str) -> dict | None:
+    """Return the exchangeInfo row whose ``symbol`` is ``canonical_pair``."""
+    symbols = payload.get("symbols")
+    if isinstance(symbols, list):
+        for item in symbols:
+            if isinstance(item, dict) and str(item.get("symbol") or "") == canonical_pair:
+                return item
+    return None
+
+
+def _toobit_filter(row: dict, name: str) -> dict:
+    """Return the exchangeInfo filter object for ``name``, or an empty dict."""
+    filters = row.get("filters")
+    if not isinstance(filters, list):
+        return {}
+    for item in filters:
+        if isinstance(item, dict) and item.get("filterType") == name:
+            return item
+    return {}
 
 
 def _find_kraken_row(result: dict, canonical_pair: str) -> tuple[dict | None, str | None]:
