@@ -2,23 +2,20 @@
 
 CI must never open a network socket to Mexc. ``MexcVenue`` requires an
 explicit ``Transport``; ``None`` refuses rather than defaulting to
-``HttpTransport``. Order mutations still go through
-``release_policy.ensure_live_orders_allowed``.
+``HttpTransport``. Order mutations refuse even when the release allows
+live trading.
 """
 
 from __future__ import annotations
 
 from decimal import Decimal
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from fakes.fake_mexc import FakeMexcTransport
 
 from krellbot.release_policy import PaperOnlyReleaseError
-from krellbot.venues.base import WithdrawCapableError
-from krellbot.venues.mexc import API_HOST, BASE_URL, HttpTransport, MexcVenue, sign_mexc
-
-pytestmark = pytest.mark.usefixtures("live_capable_release")
+from krellbot.venues.mexc import API_HOST, BASE_URL, HttpTransport, MexcVenue
 
 WAVE_PAIR = "BTCUSDT"
 
@@ -64,14 +61,23 @@ def test_mexc_snapshot_balances_orders_and_fills() -> None:
     transport = FakeMexcTransport(
         orders=[
             {
-                "orderId": "stop-9",
+                "orderId": "limit-9",
                 "clientOrderId": "stop-1-stop",
                 "symbol": WAVE_PAIR,
                 "side": "SELL",
                 "origQty": "0.01",
                 "price": "89550.00",
                 "type": "LIMIT",
-            }
+            },
+            {
+                "orderId": "stop-9",
+                "clientOrderId": "actual-conditional-stop",
+                "symbol": WAVE_PAIR,
+                "side": "SELL",
+                "origQty": "0.01",
+                "type": "STOP_MARKET_ORDER",
+                "stopPrice": "90500.00",
+            },
         ],
         fills=[
             {
@@ -89,125 +95,50 @@ def test_mexc_snapshot_balances_orders_and_fills() -> None:
     truth = _venue(transport).snapshot()
     assets = {b.asset: b for b in truth.balances}
     assert assets["USDT"].free == Decimal(1000)
-    assert len(truth.open_orders) == 1
-    assert truth.open_orders[0].stop_price == Decimal("89550.00")
+    assert len(truth.open_orders) == 2
+    assert truth.open_orders[0].stop_price is None
+    assert truth.open_orders[1].stop_price == Decimal("90500.00")
+    trades_call = next(call for call in transport.calls if "/api/v3/myTrades" in call.url)
+    assert parse_qs(urlparse(trades_call.url).query)["symbol"] == [WAVE_PAIR]
     assert truth.recent_fills[0].side == "buy"
     for call in transport.calls:
         assert urlparse(call.url).hostname == API_HOST
 
 
-def test_mexc_place_entry_with_stop_uses_quote_buy_and_limit_sell() -> None:
-    transport = FakeMexcTransport()
-    venue = _venue(transport)
-    ref = venue.place_entry_with_stop("coid-entry", Decimal("0.01"), Decimal(90000), pair=WAVE_PAIR)
-    assert ref.pair == WAVE_PAIR
-    assert ref.side == "buy"
-    assert ref.stop_price == Decimal("90000.00")
-    posts = [c for c in transport.calls if c.method == "POST"]
-    assert len(posts) == 2
-    assert isinstance(posts[0].body, dict)
-    assert posts[0].body["type"] == "MARKET"
-    assert posts[0].body["side"] == "BUY"
-    assert posts[0].body["quoteOrderQty"] == "1000.00"
-    assert "quantity" not in posts[0].body
-    assert posts[0].body["newClientOrderId"] == "coid-entry"
-    assert posts[0].headers.get("X-MEXC-APIKEY") == "MEXC-SYNTHETIC-KEY"
-    assert isinstance(posts[1].body, dict)
-    assert posts[1].body["type"] == "LIMIT"
-    assert posts[1].body["side"] == "SELL"
-    assert posts[1].body["price"] == "89550.00"
-    assert posts[1].body["newClientOrderId"] == "coid-entry-stop"
-    signed = {k: v for k, v in posts[0].body.items() if k != "signature"}
-    assert posts[0].body["signature"] == sign_mexc("MEXC-SYNTHETIC-SECRET", urlencode(signed))
-    posts_after = len(posts)
-    second = venue.place_entry_with_stop("coid-entry", Decimal("0.01"), Decimal(90000), pair=WAVE_PAIR)
-    assert second.id == ref.id
-    assert len([c for c in transport.calls if c.method == "POST"]) == posts_after
-
-
-def test_mexc_place_exit_cancel_stops_and_raise_stop() -> None:
-    transport = FakeMexcTransport(
-        orders=[
-            {
-                "orderId": "stop-9",
-                "clientOrderId": "exit-coid-stop",
-                "symbol": WAVE_PAIR,
-                "side": "SELL",
-                "origQty": "0.01",
-                "price": "89550.00",
-                "type": "LIMIT",
-            }
-        ]
-    )
-    venue = _venue(transport)
-    entry = venue.place_entry_with_stop("exit-coid", Decimal("0.01"), Decimal(90000), pair=WAVE_PAIR)
-    found = venue.order_by_coid("exit-coid")
-    assert found is not None
-    assert found.id == entry.id
-    exit_ref = venue.place_exit("exit-flat", Decimal("0.01"), pair=WAVE_PAIR)
-    assert exit_ref.side == "sell"
-    venue.cancel_stops(WAVE_PAIR)
-    venue.raise_stop(WAVE_PAIR, Decimal(91000))
-    posts = [c for c in transport.calls if c.method == "POST" and isinstance(c.body, dict)]
-    assert any(body.get("price") == "90545.00" for body in (c.body for c in posts if isinstance(c.body, dict)))
-    assert any(str(body.get("newClientOrderId") or "").endswith("-raised") for body in (c.body for c in posts))
-    deletes = [c for c in transport.calls if c.method == "DELETE"]
-    assert deletes
-    assert all("/api/v3/order" in c.url for c in deletes)
-
-
-def test_mexc_check_key_trade_only_and_withdraw_refused() -> None:
-    ok = _venue(FakeMexcTransport()).check_key()
-    assert ok.can_trade is True
-    assert ok.can_withdraw is False
-    bad = FakeMexcTransport(
-        account={
-            "canTrade": True,
-            "canWithdraw": True,
-            "permissions": ["SPOT"],
-            "balances": [],
-        }
-    )
-    with pytest.raises(WithdrawCapableError):
-        _venue(bad).check_key()
-    flagged = FakeMexcTransport(
-        account={
-            "canTrade": True,
-            "canWithdraw": False,
-            "permissions": ["SPOT", "SPOT_WITHDRAW_WRITE"],
-            "balances": [],
-        }
-    )
-    with pytest.raises(WithdrawCapableError):
-        _venue(flagged).check_key()
-
-
-def test_mexc_place_entry_blocked_when_paper_only_release(monkeypatch) -> None:
+@pytest.mark.parametrize("paper_only", [True, False])
+def test_mexc_order_mutations_refuse_before_transport(monkeypatch, paper_only: bool) -> None:
     from krellbot import release_policy
 
-    monkeypatch.setattr(release_policy, "PAPER_ONLY_RELEASE", True)
+    monkeypatch.setattr(release_policy, "PAPER_ONLY_RELEASE", paper_only)
     transport = FakeMexcTransport()
-    with pytest.raises(PaperOnlyReleaseError):
-        MexcVenue(
-            key_id="MEXC-SYNTHETIC-KEY",
-            api_secret="MEXC-SYNTHETIC-SECRET",
-            transport=transport,
-            now_fn=lambda: 1,
-        ).place_entry_with_stop("x", Decimal("0.01"), Decimal(1), pair=WAVE_PAIR)
+    venue = _venue(transport)
+    denied = PaperOnlyReleaseError if paper_only else NotImplementedError
+    with pytest.raises(denied):
+        venue.place_entry_with_stop("coid-entry", Decimal("0.01"), Decimal(90000), pair=WAVE_PAIR)
+    with pytest.raises(denied):
+        venue.place_exit("coid-exit", Decimal("0.01"), pair=WAVE_PAIR)
+    with pytest.raises(denied):
+        venue.cancel_stops(WAVE_PAIR)
+    with pytest.raises(denied):
+        venue.raise_stop(WAVE_PAIR, Decimal(91000))
     assert transport.calls == []
 
 
-def test_mexc_sign_matches_independent_total_params_digest() -> None:
-    """HMAC-SHA256 of the documented totalParams string, lowercase hex.
+def test_mexc_account_information_does_not_verify_trade_only_keys() -> None:
+    transport = FakeMexcTransport()
+    with pytest.raises(NotImplementedError, match="trade-only key permissions are not qualified"):
+        _venue(transport).check_key()
+    assert transport.calls == []
 
-    The digest was computed with the standard library outside this function
-    for secret ``MEXC-SYNTHETIC-SECRET`` and
-    ``symbol=BTCUSDT&side=BUY&type=MARKET&quoteOrderQty=100&recvWindow=5000&timestamp=1680885532722``.
-    """
-    signature = sign_mexc(
-        "MEXC-SYNTHETIC-SECRET",
-        "symbol=BTCUSDT&side=BUY&type=MARKET&quoteOrderQty=100&recvWindow=5000&timestamp=1680885532722",
+
+def test_mexc_signed_get_matches_independent_total_params_digest() -> None:
+    """Pin the signed pending-order GET request to a separately computed digest."""
+    transport = FakeMexcTransport()
+    assert _venue(transport).order_by_coid("coid-absent") is None
+    (call,) = transport.calls
+    assert (
+        call.url
+        == BASE_URL
+        + "/api/v3/openOrders?symbol=BTCUSDT&timestamp=1680885532722&recvWindow=5000&signature=ffac1645e96aece024b93e481085f56c1958289bb097e27c5538c09895d66d85"
     )
-    assert signature == "601d808a9aeee251554bd4872f13d98cc9ae2bbc66a3e64c929166d2486d1be9"
-    query = parse_qs("symbol=BTCUSDT&side=BUY&type=MARKET&quoteOrderQty=100&recvWindow=5000&timestamp=1680885532722")
-    assert query["symbol"] == ["BTCUSDT"]
+    assert call.headers["X-MEXC-APIKEY"] == "MEXC-SYNTHETIC-KEY"
