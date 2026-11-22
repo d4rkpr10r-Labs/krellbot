@@ -83,6 +83,8 @@ PAPER_WAVE_OURBIT_BTC_USDT = "BTCUSDT"
 PAPER_WAVE_TOOBIT_BTC_USDT = "BTCUSDT"
 # Wave XT BTC/USDT pack pair. The public symbol is ``btc_usdt``.
 PAPER_WAVE_XT_BTC_USDT = "BTCUSDT"
+# Wave Deepcoin BTC/USDT instId. Public instruments use this hyphenated spelling.
+PAPER_WAVE_DEEPCOIN_BTC_USDT = "BTC-USDT"
 
 SCHEMA_VERSION = "1"
 DEFAULT_TTL_SECONDS = 24 * 60 * 60  # 24h
@@ -118,6 +120,9 @@ KUCOIN_SYMBOLS_URL = "https://api.kucoin.com/api/v2/symbols"
 OURBIT_EXCHANGE_INFO_URL = "https://api.ourbit.com/api/v3/exchangeInfo"
 TOOBIT_EXCHANGE_INFO_URL = "https://api.toobit.com/api/v1/exchangeInfo"
 XT_SYMBOLS_URL = "https://sapi.xt.com/v4/public/symbol"
+DEEPCOIN_INSTRUMENTS_URL = "https://api.deepcoin.com/deepcoin/market/instruments"
+# Deepcoin public instruments omit a quote minimum. Paper pins 1 quote unit.
+DEEPCOIN_PAPER_MIN_NOTIONAL = "1"
 
 SNAPSHOT_FILENAME = "instrument-rules.json"
 
@@ -209,6 +214,7 @@ class InstrumentRulesV1:
             "ourbit",
             "toobit",
             "xt",
+            "deepcoin",
         ):
             raise ValueError(f"instrument: unsupported venue {self.venue!r}")
 
@@ -283,6 +289,8 @@ class InstrumentMetadataClient:
             return self._fetch_toobit(canonical_pair)
         if venue == "xt":
             return self._fetch_xt(canonical_pair)
+        if venue == "deepcoin":
+            return self._fetch_deepcoin(canonical_pair)
         raise InstrumentMetadataError(
             METADATA_UNAVAILABLE,
             venue,
@@ -1335,6 +1343,100 @@ class InstrumentMetadataClient:
             usable_until=usable_until,
         )
 
+    # ---- internal: Deepcoin --------------------------------------------
+
+    def _fetch_deepcoin(self, canonical_pair: str) -> InstrumentRulesV1:
+        query = urllib.parse.urlencode({"instType": "SPOT", "instId": canonical_pair})
+        url = f"{DEEPCOIN_INSTRUMENTS_URL}?{query}"
+        payload = self._transport.get(url, {}) or {}
+        if not isinstance(payload, dict):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin instruments body is not a JSON object",
+            )
+        if str(payload.get("code") or "") not in {"", "0"}:
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin instruments refused the request",
+            )
+        row = _find_deepcoin_instrument(payload, canonical_pair)
+        if row is None:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin instruments response did not contain the requested instId",
+            )
+        venue_symbol = str(row.get("instId") or "")
+        if venue_symbol != canonical_pair:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin instruments returned a different instId than requested",
+            )
+        if str(row.get("state") or "").lower() != "live":
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin symbol is not live",
+            )
+        try:
+            min_quantity = _required_decimal_string(row, "minSz")
+            quantity_increment = _required_decimal_string(row, "lotSz")
+            price_increment = _required_decimal_string(row, "tickSz")
+        except (KeyError, ValueError) as exc:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin instruments payload missing required fields",
+            ) from exc
+        if Decimal(min_quantity) <= 0 or Decimal(quantity_increment) <= 0 or Decimal(price_increment) <= 0:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin minima and increments must be positive",
+            )
+        base_asset = str(row.get("baseCcy") or "")
+        quote_asset = str(row.get("quoteCcy") or "")
+        if not base_asset or not quote_asset:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "deepcoin",
+                canonical_pair,
+                "instrument: deepcoin instruments missing base or quote",
+            )
+        retrieved_at = _unix_to_iso(self._clock())
+        usable_until = _unix_to_iso(self._clock() + self._ttl_seconds)
+        payload_bytes = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        return InstrumentRulesV1(
+            schema_version=SCHEMA_VERSION,
+            venue="deepcoin",
+            canonical_pair=canonical_pair,
+            venue_symbol=venue_symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            min_quantity=min_quantity,
+            min_notional=DEEPCOIN_PAPER_MIN_NOTIONAL,
+            quantity_increment=quantity_increment,
+            price_increment=price_increment,
+            source={
+                "endpoint": DEEPCOIN_INSTRUMENTS_URL,
+                "retrieved_at": retrieved_at,
+                "source_version": payload_sha256[:16],
+                "payload_sha256": payload_sha256,
+            },
+            usable_until=usable_until,
+        )
+
 
 # ---- snapshot ----------------------------------------------------------
 
@@ -1681,6 +1783,18 @@ def _xt_quote_min(row: dict) -> str:
             if isinstance(item, dict) and item.get("filter") == "QUOTE_QTY":
                 return _required_decimal_string(item, "min")
     raise KeyError("min")
+
+
+def _find_deepcoin_instrument(payload: dict, canonical_pair: str) -> dict | None:
+    """Return the instruments row whose ``instId`` is ``canonical_pair``."""
+    data = payload.get("data")
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and str(item.get("instId") or "") == canonical_pair:
+                return item
+    if str(payload.get("instId") or "") == canonical_pair:
+        return payload
+    return None
 
 
 def _find_kraken_row(result: dict, canonical_pair: str) -> tuple[dict | None, str | None]:

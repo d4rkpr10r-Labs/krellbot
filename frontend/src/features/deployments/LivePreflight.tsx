@@ -178,6 +178,8 @@ export function LivePreflight(): JSX.Element {
           use paper arm for toobit / BTCUSDT; do not claim qualified Toobit live.
           XT is paper-only —
           use paper arm for xt / BTCUSDT; do not claim qualified XT live.
+          Deepcoin is paper-only —
+          use paper arm for deepcoin / BTC-USDT; do not claim qualified Deepcoin live.
         </p>
         <label
           className="kbot-feature__live-preflight-root__field"
