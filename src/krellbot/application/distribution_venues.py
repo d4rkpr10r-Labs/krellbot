@@ -20,7 +20,9 @@ from typing import Final
 QUALIFIED_LIVE_VENUES: Final[frozenset[str]] = frozenset({"kraken", "coinbase"})
 
 # Paper-capable breadth that must not be advertised as qualified live.
-PAPER_ONLY_VENUES: Final[frozenset[str]] = frozenset({"binance", "gate", "pionex", "okx", "bybit", "kucoin", "toobit"})
+PAPER_ONLY_VENUES: Final[frozenset[str]] = frozenset(
+    {"binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit"}
+)
 
 SECOND_DISTRIBUTION_VENUE: Final[str] = "coinbase"
 SECOND_DISTRIBUTION_WAVE_PAIR: Final[str] = "BTC-USD"

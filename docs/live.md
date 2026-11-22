@@ -34,7 +34,7 @@ gates and paper-only rail:
 | `coinbase` | `BTC-USD`          | Second distribution venue (Coinbase Advanced) |
 
 `binance` is paper-only breadth (M14). The same applies to `gate`, `pionex`,
-`okx`, `bybit`, `kucoin`, and `toobit`.
+`okx`, `bybit`, `kucoin`, `ourbit`, and `toobit`.
 Live preflight and Ops live authorization offer only the two qualified ids.
 Store a trade-only key with `krellbot keys add <venue> --file <key-file>`
 (or the workstation Keys panel) for the venue you grant.

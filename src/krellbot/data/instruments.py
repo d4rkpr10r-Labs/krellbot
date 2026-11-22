@@ -77,6 +77,8 @@ PAPER_WAVE_OKX_BTC_USDT = "BTC-USDT"
 PAPER_WAVE_BYBIT_BTC_USDT = "BTCUSDT"
 # Wave KuCoin BTC/USDT pack pair. The venue symbol is the same spelling.
 PAPER_WAVE_KUCOIN_BTC_USDT = "BTC-USDT"
+# Wave Ourbit BTC/USDT symbol. Public exchangeInfo uses this concatenated spelling.
+PAPER_WAVE_OURBIT_BTC_USDT = "BTCUSDT"
 # Wave Toobit BTC/USDT symbol. Public exchangeInfo uses this concatenated spelling.
 PAPER_WAVE_TOOBIT_BTC_USDT = "BTCUSDT"
 
@@ -111,6 +113,7 @@ OKX_INSTRUMENTS_URL = "https://www.okx.com/api/v5/public/instruments"
 OKX_PAPER_MIN_NOTIONAL = "1"
 BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
 KUCOIN_SYMBOLS_URL = "https://api.kucoin.com/api/v2/symbols"
+OURBIT_EXCHANGE_INFO_URL = "https://api.ourbit.com/api/v3/exchangeInfo"
 TOOBIT_EXCHANGE_INFO_URL = "https://api.toobit.com/api/v1/exchangeInfo"
 
 SNAPSHOT_FILENAME = "instrument-rules.json"
@@ -191,7 +194,18 @@ class InstrumentRulesV1:
             raise ValueError("instrument: canonical_pair must be a non-empty string")
         if not isinstance(self.venue_symbol, str) or not self.venue_symbol:
             raise ValueError("instrument: venue_symbol must be a non-empty string")
-        if self.venue not in ("kraken", "coinbase", "binance", "gate", "pionex", "okx", "bybit", "kucoin", "toobit"):
+        if self.venue not in (
+            "kraken",
+            "coinbase",
+            "binance",
+            "gate",
+            "pionex",
+            "okx",
+            "bybit",
+            "kucoin",
+            "ourbit",
+            "toobit",
+        ):
             raise ValueError(f"instrument: unsupported venue {self.venue!r}")
 
 
@@ -259,6 +273,8 @@ class InstrumentMetadataClient:
             return self._fetch_bybit(canonical_pair)
         if venue == "kucoin":
             return self._fetch_kucoin(canonical_pair)
+        if venue == "ourbit":
+            return self._fetch_ourbit(canonical_pair)
         if venue == "toobit":
             return self._fetch_toobit(canonical_pair)
         raise InstrumentMetadataError(
@@ -1015,6 +1031,103 @@ class InstrumentMetadataClient:
             usable_until=usable_until,
         )
 
+    # ---- internal: Ourbit ----------------------------------------------
+
+    def _fetch_ourbit(self, canonical_pair: str) -> InstrumentRulesV1:
+        query = urllib.parse.urlencode({"symbol": canonical_pair})
+        url = f"{OURBIT_EXCHANGE_INFO_URL}?{query}"
+        payload = self._transport.get(url, {}) or {}
+        if not isinstance(payload, dict):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "ourbit",
+                canonical_pair,
+                "instrument: ourbit exchangeInfo body is not a JSON object",
+            )
+        row = _find_ourbit_symbol(payload, canonical_pair)
+        if row is None:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "ourbit",
+                canonical_pair,
+                "instrument: ourbit exchangeInfo response did not contain the requested symbol",
+            )
+        status = str(row.get("status") or "ENABLED").upper()
+        if status not in {"ENABLED", "TRADING", "1"} or row.get("isSpotTradingAllowed") is False:
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "ourbit",
+                canonical_pair,
+                "instrument: ourbit symbol is not enabled for spot",
+            )
+        venue_symbol = str(row.get("symbol") or "")
+        if venue_symbol != canonical_pair:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "ourbit",
+                canonical_pair,
+                "instrument: ourbit exchangeInfo returned a different symbol than requested",
+            )
+        precision = row.get("quoteAssetPrecision")
+        if precision is None:
+            precision = row.get("quotePrecision")
+        try:
+            min_quantity = _required_decimal_string(row, "baseSizePrecision")
+            min_notional = _required_decimal_string(row, "quoteAmountPrecision")
+            quantity_increment = min_quantity
+            price_increment = _decimals_to_increment(int(precision))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "ourbit",
+                canonical_pair,
+                "instrument: ourbit exchangeInfo payload missing required fields",
+            ) from exc
+        if (
+            Decimal(min_quantity) <= 0
+            or Decimal(min_notional) <= 0
+            or Decimal(quantity_increment) <= 0
+            or Decimal(price_increment) <= 0
+        ):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "ourbit",
+                canonical_pair,
+                "instrument: ourbit minima and increments must be positive",
+            )
+        base_asset = str(row.get("baseAsset") or "")
+        quote_asset = str(row.get("quoteAsset") or "")
+        if not base_asset or not quote_asset:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "ourbit",
+                canonical_pair,
+                "instrument: ourbit exchangeInfo missing base or quote asset",
+            )
+        retrieved_at = _unix_to_iso(self._clock())
+        usable_until = _unix_to_iso(self._clock() + self._ttl_seconds)
+        payload_bytes = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        return InstrumentRulesV1(
+            schema_version=SCHEMA_VERSION,
+            venue="ourbit",
+            canonical_pair=canonical_pair,
+            venue_symbol=venue_symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            min_quantity=min_quantity,
+            min_notional=min_notional,
+            quantity_increment=quantity_increment,
+            price_increment=price_increment,
+            source={
+                "endpoint": OURBIT_EXCHANGE_INFO_URL,
+                "retrieved_at": retrieved_at,
+                "source_version": payload_sha256[:16],
+                "payload_sha256": payload_sha256,
+            },
+            usable_until=usable_until,
+        )
+
     # ---- internal: Toobit ----------------------------------------------
 
     def _fetch_toobit(self, canonical_pair: str) -> InstrumentRulesV1:
@@ -1394,6 +1507,25 @@ def _find_bybit_instrument(payload: dict, canonical_pair: str) -> dict | None:
         if len(matches) == 1:
             return matches[0]
         return None
+    if str(payload.get("symbol") or "") == canonical_pair:
+        return payload
+    return None
+
+
+def _find_ourbit_symbol(payload: dict, canonical_pair: str) -> dict | None:
+    """Return the exchangeInfo row whose ``symbol`` is ``canonical_pair``."""
+    symbols = payload.get("symbols")
+    if isinstance(symbols, list):
+        for item in symbols:
+            if isinstance(item, dict) and str(item.get("symbol") or "") == canonical_pair:
+                return item
+    data = payload.get("data")
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and str(item.get("symbol") or "") == canonical_pair:
+                return item
+    if isinstance(data, dict) and str(data.get("symbol") or "") == canonical_pair:
+        return data
     if str(payload.get("symbol") or "") == canonical_pair:
         return payload
     return None

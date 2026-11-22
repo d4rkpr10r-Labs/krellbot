@@ -25,6 +25,7 @@ REMOTE_MODULES = {
     "krellbot.venues.okx",
     "krellbot.venues.bybit",
     "krellbot.venues.kucoin",
+    "krellbot.venues.ourbit",
     "krellbot.venues.toobit",
 }
 PUBLIC_NAMES = [
@@ -40,6 +41,7 @@ PUBLIC_NAMES = [
     "OkxVenue",
     "OpenOrder",
     "OrderRef",
+    "OurbitVenue",
     "PairRules",
     "PionexVenue",
     "ToobitVenue",
@@ -155,6 +157,7 @@ def test_offline_import_does_not_load_remote_adapters(tmp_path, source, expected
         ("okx", "OkxVenue"),
         ("bybit", "BybitVenue"),
         ("kucoin", "KucoinVenue"),
+        ("ourbit", "OurbitVenue"),
         ("toobit", "ToobitVenue"),
     ],
 )
@@ -195,6 +198,7 @@ def test_import_star_preserves_public_names_and_class_identity(tmp_path):
         from krellbot.venues.okx import OkxVenue
         from krellbot.venues.bybit import BybitVenue
         from krellbot.venues.kucoin import KucoinVenue
+        from krellbot.venues.ourbit import OurbitVenue
         from krellbot.venues.toobit import ToobitVenue
         assert namespace['KrakenVenue'] is KrakenVenue
         assert namespace['CoinbaseVenue'] is CoinbaseVenue
@@ -212,6 +216,8 @@ def test_import_star_preserves_public_names_and_class_identity(tmp_path):
         assert namespace['BybitVenue'] is BybitVenue
         assert vars(venues)['BybitVenue'] is BybitVenue
         assert vars(venues)['KucoinVenue'] is KucoinVenue
+        assert namespace['OurbitVenue'] is OurbitVenue
+        assert vars(venues)['OurbitVenue'] is OurbitVenue
         assert namespace['ToobitVenue'] is ToobitVenue
         assert vars(venues)['ToobitVenue'] is ToobitVenue
         for name in venues.__all__:
@@ -264,6 +270,7 @@ def test_all_is_preserved_without_resolving_lazy_names(tmp_path):
         "OkxVenue",
         "BybitVenue",
         "KucoinVenue",
+        "OurbitVenue",
         "ToobitVenue",
     ],
 )
@@ -281,6 +288,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
             'krellbot.venues.okx',
             'krellbot.venues.bybit',
             'krellbot.venues.kucoin',
+            'krellbot.venues.ourbit',
             'krellbot.venues.toobit',
         }}
         assert remote_modules.isdisjoint(sys.modules)
@@ -297,6 +305,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
         assert 'OkxVenue' not in vars(venues)
         assert 'BybitVenue' not in vars(venues)
         assert 'KucoinVenue' not in vars(venues)
+        assert 'OurbitVenue' not in vars(venues)
         assert 'ToobitVenue' not in vars(venues)
         resolved_name = {resolved_name!r}
         if resolved_name is not None:
@@ -320,6 +329,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
         "OkxVenue": {"krellbot.venues.okx"},
         "BybitVenue": {"krellbot.venues.bybit"},
         "KucoinVenue": {"krellbot.venues.kucoin"},
+        "OurbitVenue": {"krellbot.venues.ourbit"},
         "ToobitVenue": {"krellbot.venues.toobit"},
     }
     assert set(observed["modules"]) & REMOTE_MODULES == expected_remote[resolved_name]
@@ -336,6 +346,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
         ("okx", "OkxVenue"),
         ("bybit", "BybitVenue"),
         ("kucoin", "KucoinVenue"),
+        ("ourbit", "OurbitVenue"),
         ("toobit", "ToobitVenue"),
     ],
 )

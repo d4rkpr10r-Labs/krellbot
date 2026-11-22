@@ -58,6 +58,11 @@ BYBIT_TAKER_BPS = 10
 # (VIP Fee Structure, updated 2026-05-07). BTC/USDT is Class A. Pinned at 10 bps.
 # The KCS discount is not applied.
 KUCOIN_TAKER_BPS = 10
+# Ourbit's published spot fee notice (2024-09-03, "Zero Trading Fees on All
+# Spot Pairs") sets the spot taker to 0%. Pinned at 0 bps. Futures fees are
+# not used.
+OURBIT_TAKER_BPS = 0
+
 # Toobit's published spot schedule (2026-06-26) lists a 0% spot taker at
 # every VIP level and says spot trading remains commission-free. BTCUSDT is
 # not an Innovation Zone pair. Pinned at 0 bps. The separate API-user rate
@@ -85,6 +90,8 @@ def _fee_bps_for(venue: str) -> int:
         return BYBIT_TAKER_BPS
     if venue == "kucoin":
         return KUCOIN_TAKER_BPS
+    if venue == "ourbit":
+        return OURBIT_TAKER_BPS
     if venue == "toobit":
         return TOOBIT_TAKER_BPS
     return COINBASE_TAKER_BPS
@@ -93,11 +100,11 @@ def _fee_bps_for(venue: str) -> int:
 def _seed_quote_asset(venue: str) -> str:
     """Quote asset used when seeding paper starting cash for a venue.
 
-    Binance, Bybit, and Toobit wave paper markets are USDT-quoted (``BTCUSDT``).
+    Binance, Bybit, Ourbit, and Toobit wave paper markets are USDT-quoted (``BTCUSDT``).
     Gate, Pionex, OKX, and KuCoin wave paper markets are USDT-quoted (``BTC-USDT``).
     Kraken and Coinbase wave paper markets seed ``USD``.
     """
-    if venue in {"binance", "gate", "pionex", "okx", "bybit", "kucoin", "toobit"}:
+    if venue in {"binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit"}:
         return "USDT"
     return "USD"
 

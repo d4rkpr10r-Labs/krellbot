@@ -172,7 +172,8 @@ export function LivePreflight(): JSX.Element {
           Bybit is paper-only —
           use paper arm for bybit / BTCUSDT; do not claim qualified Bybit live.
           KuCoin is paper-only —
-          use paper arm for kucoin / BTC-USDT; do not claim qualified KuCoin live.
+          use paper arm for kucoin / BTC-USDT; do not claim qualified KuCoin live. Ourbit is
+          paper-only — use paper arm for ourbit / BTCUSDT; do not claim qualified Ourbit live.
           Toobit is paper-only —
           use paper arm for toobit / BTCUSDT; do not claim qualified Toobit live.
         </p>
