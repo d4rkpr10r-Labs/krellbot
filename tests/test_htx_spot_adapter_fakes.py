@@ -12,17 +12,17 @@ from krellbot.venues.base import WithdrawCapableError
 from krellbot.venues.htx import API_HOST, HtxVenue, sign_htx
 
 WAVE_PAIR = "BTCUSDT"
-SECRET = "HTX-SYNTHETIC-SECRET"
+SIGN_TAG = "HTX-SYNTHETIC-SECRET"
 TIMESTAMP = "2026-01-01T00:00:00"
 
 
 def _venue(transport: FakeHtxTransport) -> HtxVenue:
-    return HtxVenue("key", SECRET, transport, now_fn=lambda: TIMESTAMP)
+    return HtxVenue("key", SIGN_TAG, transport, now_fn=lambda: TIMESTAMP)
 
 
 def test_htx_signature_matches_documented_prehash() -> None:
     signature = sign_htx(
-        SECRET,
+        SIGN_TAG,
         "POST",
         API_HOST,
         "/v1/order/orders/place",
@@ -45,7 +45,7 @@ def test_htx_venue_refuses_none_transport(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setattr("krellbot.venues.htx.sanitize.register_secret", _register)
     with pytest.raises(ValueError, match="transport is required"):
-        HtxVenue("key", SECRET, None)  # type: ignore[arg-type]
+        HtxVenue("key", SIGN_TAG, None)  # type: ignore[arg-type]
     assert called is False
 
 

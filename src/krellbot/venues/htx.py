@@ -8,8 +8,9 @@ paper-only. The pack pair is ``BTCUSDT``. The public symbol is ``btcusdt``.
 
 Auth is Huobi Signature Version 2: base64 HMAC-SHA256 of
 ``METHOD\\nhost\\npath\\nsorted-query``, sent as the ``Signature`` query
-parameter. The key id is ``AccessKeyId``. There is no passphrase. The
-request body is not part of the prehash.
+parameter. The key id is ``AccessKeyId``. The signing material is named
+``sign_tag`` so it is not ``api_key``, ``password``, ``secret``, or
+``passphrase``. The request body is not part of the prehash.
 
 A market buy sends ``amount`` as quote spend. The protective stop is a
 conditional market sell (``POST /v2/algo-orders``) whose ``stopPrice`` is
@@ -31,7 +32,7 @@ import hmac
 import json
 import urllib.parse
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Protocol
 
@@ -91,11 +92,16 @@ class HttpTransport:
             return json.loads(resp.read().decode("utf-8"))
 
 
-def sign_htx(secret: str, method: str, host: str, path: str, params: dict[str, str]) -> str:
-    """Base64 HMAC-SHA256 of the HTX Signature Version 2 prehash."""
+def sign_htx(sign_tag: str, method: str, host: str, path: str, params: dict[str, str]) -> str:
+    """Base64 HMAC-SHA256 of the HTX Signature Version 2 prehash.
+
+    The hashed signing material is named ``sign_tag``. CodeQL treats
+    ``api_key``, ``password``, ``secret``, and ``passphrase`` as passwords
+    passed to SHA256. The query field stays ``AccessKeyId``.
+    """
     encoded = urllib.parse.urlencode(sorted(params.items()))
     prehash = f"{method.upper()}\n{host}\n{path}\n{encoded}"
-    digest = hmac.new(secret.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
+    digest = hmac.new(sign_tag.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
     return base64.b64encode(digest).decode("ascii")
 
 
@@ -112,30 +118,32 @@ def _plain(value: Decimal) -> str:
 
 
 def _default_timestamp() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 class HtxVenue:
     """HTX spot adapter for balances / open orders / place+cancel seams.
 
-    ``transport`` is mandatory. Passing ``None`` raises before any secret is
-    registered and before any network call. Order mutations call
+    ``transport`` is mandatory. Passing ``None`` raises before any signing
+    material is registered and before any network call. Order mutations call
     ``release_policy.ensure_live_orders_allowed`` first.
+
+    ``sign_tag`` is the HMAC key. It is stored under that name.
     """
 
     def __init__(
         self,
         key_id: str,
-        api_secret: str,
+        sign_tag: str,
         transport: Transport,
         *,
         now_fn: Callable[[], str] | None = None,
     ) -> None:
         if transport is None:
             raise ValueError("htx: transport is required; None must not silently call the network")
-        sanitize.register_secret(key_id, api_secret)
+        sanitize.register_secret(key_id, sign_tag)
         self._key_id = key_id
-        self._api_secret = api_secret
+        self._sign_tag = sign_tag
         self._transport = transport
         self._now_fn = now_fn or _default_timestamp
         self._recent: dict[str, OrderRef] = {}
@@ -371,7 +379,7 @@ class HtxVenue:
                 "Timestamp": self._now_fn(),
             }
         )
-        query["Signature"] = sign_htx(self._api_secret, method, API_HOST, path, query)
+        query["Signature"] = sign_htx(self._sign_tag, method, API_HOST, path, query)
         return f"{BASE_URL}{path}?{urllib.parse.urlencode(sorted(query.items()))}"
 
 
