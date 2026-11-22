@@ -52,6 +52,8 @@ GATE_TAKER_BPS = 20
 # Pionex's published regular spot taker is 0.05%. Pinned at 5 bps.
 PIONEX_TAKER_BPS = 5
 OKX_TAKER_BPS = 10
+# Bybit publishes a 0.10% non-VIP spot taker. Pinned like Binance.
+BYBIT_TAKER_BPS = 10
 # KuCoin's published VIP 0 Class A spot taker is 0.10%
 # (VIP Fee Structure, updated 2026-05-07). BTC/USDT is Class A. Pinned at 10 bps.
 # The KCS discount is not applied.
@@ -74,6 +76,8 @@ def _fee_bps_for(venue: str) -> int:
         return PIONEX_TAKER_BPS
     if venue == "okx":
         return OKX_TAKER_BPS
+    if venue == "bybit":
+        return BYBIT_TAKER_BPS
     if venue == "kucoin":
         return KUCOIN_TAKER_BPS
     return COINBASE_TAKER_BPS
@@ -82,11 +86,11 @@ def _fee_bps_for(venue: str) -> int:
 def _seed_quote_asset(venue: str) -> str:
     """Quote asset used when seeding paper starting cash for a venue.
 
-    Binance wave paper markets are USDT-quoted (``BTCUSDT``). Gate, Pionex,
-    OKX, and KuCoin wave paper markets are USDT-quoted (``BTC-USDT``).
+    Binance and Bybit wave paper markets are USDT-quoted (``BTCUSDT``).
+    Gate, Pionex, OKX, and KuCoin wave paper markets are USDT-quoted (``BTC-USDT``).
     Kraken and Coinbase wave paper markets seed ``USD``.
     """
-    if venue in {"binance", "gate", "pionex", "okx", "kucoin"}:
+    if venue in {"binance", "gate", "pionex", "okx", "bybit", "kucoin"}:
         return "USDT"
     return "USD"
 

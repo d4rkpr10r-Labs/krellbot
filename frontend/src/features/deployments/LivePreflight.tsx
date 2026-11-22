@@ -168,7 +168,10 @@ export function LivePreflight(): JSX.Element {
           live. Gate is paper-only — use paper arm for gate / BTC-USDT; do not
           claim qualified Gate live. Pionex is paper-only — use paper arm for
           pionex / BTC-USDT; do not claim qualified Pionex live. OKX is paper-only —
-          use paper arm for okx / BTC-USDT; do not claim qualified OKX live. KuCoin is paper-only —
+          use paper arm for okx / BTC-USDT; do not claim qualified OKX live.
+          Bybit is paper-only —
+          use paper arm for bybit / BTCUSDT; do not claim qualified Bybit live.
+          KuCoin is paper-only —
           use paper arm for kucoin / BTC-USDT; do not claim qualified KuCoin live.
         </p>
         <label
