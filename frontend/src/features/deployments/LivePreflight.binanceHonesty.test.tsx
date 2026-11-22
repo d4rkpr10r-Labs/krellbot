@@ -26,6 +26,7 @@ describe("LivePreflight Binance honesty", () => {
     expect(values).not.toContain("ourbit");
     expect(values).not.toContain("toobit");
     expect(values).not.toContain("xt");
+    expect(values).not.toContain("lbank");
     const note = screen.getByTestId("live-preflight-paper-only-venues");
     expect(note.textContent).toMatch(/paper-only/i);
     expect(note.textContent).toMatch(/do not claim qualified Binance live/i);

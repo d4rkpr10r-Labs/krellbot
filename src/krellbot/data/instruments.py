@@ -83,6 +83,8 @@ PAPER_WAVE_OURBIT_BTC_USDT = "BTCUSDT"
 PAPER_WAVE_TOOBIT_BTC_USDT = "BTCUSDT"
 # Wave XT BTC/USDT pack pair. The public symbol is ``btc_usdt``.
 PAPER_WAVE_XT_BTC_USDT = "BTCUSDT"
+# Wave LBank BTC/USDT pack pair. The public symbol is ``btc_usdt``.
+PAPER_WAVE_LBANK_BTC_USDT = "BTC-USDT"
 
 SCHEMA_VERSION = "1"
 DEFAULT_TTL_SECONDS = 24 * 60 * 60  # 24h
@@ -118,6 +120,7 @@ KUCOIN_SYMBOLS_URL = "https://api.kucoin.com/api/v2/symbols"
 OURBIT_EXCHANGE_INFO_URL = "https://api.ourbit.com/api/v3/exchangeInfo"
 TOOBIT_EXCHANGE_INFO_URL = "https://api.toobit.com/api/v1/exchangeInfo"
 XT_SYMBOLS_URL = "https://sapi.xt.com/v4/public/symbol"
+LBANK_ACCURACY_URL = "https://api.lbank.info/v2/accuracy.do"
 
 SNAPSHOT_FILENAME = "instrument-rules.json"
 
@@ -209,6 +212,7 @@ class InstrumentRulesV1:
             "ourbit",
             "toobit",
             "xt",
+            "lbank",
         ):
             raise ValueError(f"instrument: unsupported venue {self.venue!r}")
 
@@ -283,6 +287,8 @@ class InstrumentMetadataClient:
             return self._fetch_toobit(canonical_pair)
         if venue == "xt":
             return self._fetch_xt(canonical_pair)
+        if venue == "lbank":
+            return self._fetch_lbank(canonical_pair)
         raise InstrumentMetadataError(
             METADATA_UNAVAILABLE,
             venue,
@@ -1335,6 +1341,105 @@ class InstrumentMetadataClient:
             usable_until=usable_until,
         )
 
+    # ---- internal: LBank -----------------------------------------------
+
+    def _fetch_lbank(self, canonical_pair: str) -> InstrumentRulesV1:
+        symbol = canonical_pair.replace("-", "_").lower()
+        query = urllib.parse.urlencode({"symbol": symbol})
+        url = f"{LBANK_ACCURACY_URL}?{query}"
+        payload = self._transport.get(url, {}) or {}
+        if not isinstance(payload, dict):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "lbank",
+                canonical_pair,
+                "instrument: lbank accuracy body is not a JSON object",
+            )
+        result = payload.get("result")
+        code = payload.get("error_code")
+        if result not in (True, "true", "True") or code not in (None, 0, "0"):
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "lbank",
+                canonical_pair,
+                "instrument: lbank accuracy refused the request",
+            )
+        row = _find_lbank_symbol(payload, symbol)
+        if row is None:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "lbank",
+                canonical_pair,
+                "instrument: lbank accuracy response did not contain the requested symbol",
+            )
+        venue_symbol = str(row.get("symbol") or "")
+        if venue_symbol != symbol:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "lbank",
+                canonical_pair,
+                "instrument: lbank accuracy returned a different symbol than requested",
+            )
+        try:
+            min_quantity = str(row["minTranQua"])
+            min_notional = str(row["minOrderAmount"])
+            quantity_decimals = int(str(row["quantityAccuracy"]))
+            price_decimals = int(str(row["priceAccuracy"]))
+            quantity_increment = _decimals_to_increment(quantity_decimals)
+            price_increment = _decimals_to_increment(price_decimals)
+            Decimal(min_quantity)
+            Decimal(min_notional)
+        except (KeyError, ValueError, ArithmeticError) as exc:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "lbank",
+                canonical_pair,
+                "instrument: lbank accuracy payload missing required fields",
+            ) from exc
+        if (
+            Decimal(min_quantity) <= 0
+            or Decimal(min_notional) <= 0
+            or Decimal(quantity_increment) <= 0
+            or Decimal(price_increment) <= 0
+        ):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "lbank",
+                canonical_pair,
+                "instrument: lbank minima and increments must be positive",
+            )
+        if "_" not in symbol:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "lbank",
+                canonical_pair,
+                "instrument: lbank symbol is missing a quote",
+            )
+        base_asset, quote_asset = (part.upper() for part in symbol.split("_", 1))
+        retrieved_at = _unix_to_iso(self._clock())
+        usable_until = _unix_to_iso(self._clock() + self._ttl_seconds)
+        payload_bytes = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        return InstrumentRulesV1(
+            schema_version=SCHEMA_VERSION,
+            venue="lbank",
+            canonical_pair=canonical_pair,
+            venue_symbol=venue_symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            min_quantity=min_quantity,
+            min_notional=min_notional,
+            quantity_increment=quantity_increment,
+            price_increment=price_increment,
+            source={
+                "endpoint": LBANK_ACCURACY_URL,
+                "retrieved_at": retrieved_at,
+                "source_version": payload_sha256[:16],
+                "payload_sha256": payload_sha256,
+            },
+            usable_until=usable_until,
+        )
+
 
 # ---- snapshot ----------------------------------------------------------
 
@@ -1681,6 +1786,16 @@ def _xt_quote_min(row: dict) -> str:
             if isinstance(item, dict) and item.get("filter") == "QUOTE_QTY":
                 return _required_decimal_string(item, "min")
     raise KeyError("min")
+
+
+def _find_lbank_symbol(payload: dict, symbol: str) -> dict | None:
+    """Return the accuracy row whose ``symbol`` is ``symbol``."""
+    data = payload.get("data")
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and str(item.get("symbol") or "") == symbol:
+                return item
+    return None
 
 
 def _find_kraken_row(result: dict, canonical_pair: str) -> tuple[dict | None, str | None]:

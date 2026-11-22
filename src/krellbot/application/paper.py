@@ -226,6 +226,7 @@ _PAPER_TAKER_BPS = {
     "ourbit": 0,
     "toobit": 0,
     "xt": 20,
+    "lbank": 10,
 }
 
 

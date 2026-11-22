@@ -12,7 +12,7 @@ import {
 
 describe("owned strategy binance paper venue", () => {
   it("lists binance among paper venues and accepts BTCUSDT packs", () => {
-    expect(VENUES).toEqual(["kraken", "coinbase", "binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt"]);
+    expect(VENUES).toEqual(["kraken", "coinbase", "binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt", "lbank"]);
     expect((VENUES as readonly string[]).includes("binance")).toBe(true);
     expect(BINANCE_PAPER_WAVE_PAIR).toBe("BTCUSDT");
 
