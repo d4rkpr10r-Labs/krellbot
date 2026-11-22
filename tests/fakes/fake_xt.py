@@ -1,6 +1,6 @@
 """Fake XT spot transport for tests.
 
-Records every GET / POST / DELETE. Never opens a network socket. Default
+Records every GET. Never opens a network socket. Default
 public symbol covers pack pair ``BTCUSDT`` as wire symbol ``btc_usdt``.
 """
 
@@ -27,8 +27,6 @@ _DEFAULT_INFO = {
     ]
 }
 
-_DEFAULT_BOOK = [{"s": "btc_usdt", "ap": "100000", "aq": "1", "bp": "99990", "bq": "1"}]
-
 _DEFAULT_BALANCES = {
     "permissions": ["SPOT"],
     "assets": [
@@ -49,7 +47,6 @@ class RecordedCall:
     method: str
     url: str
     headers: dict[str, str]
-    body: dict | None = None
 
 
 @dataclass
@@ -60,16 +57,12 @@ class FakeXtTransport:
     orders: list = field(default_factory=list)
     fills: list = field(default_factory=list)
     info: dict = field(default_factory=lambda: dict(_DEFAULT_INFO))
-    book: list = field(default_factory=lambda: list(_DEFAULT_BOOK))
     calls: list[RecordedCall] = field(default_factory=list)
-    _orders_placed: int = 0
 
     def get(self, url: str, headers: dict[str, str]) -> dict:
         self.calls.append(RecordedCall("GET", url, dict(headers)))
         if "/v4/public/symbol" in url:
             return _ok(self.info)
-        if "/v4/public/ticker/book" in url:
-            return _ok(self.book)
         if "/v4/balances" in url:
             return _ok(self.balances)
         if "/v4/open-order" in url:
@@ -77,15 +70,3 @@ class FakeXtTransport:
         if "/v4/trade" in url:
             return _ok(self.fills)
         return _ok({})
-
-    def post(self, url: str, body: dict | None, headers: dict[str, str]) -> dict:
-        self.calls.append(RecordedCall("POST", url, dict(headers), body))
-        self._orders_placed += 1
-        client = ""
-        if isinstance(body, dict):
-            client = str(body.get("clientOrderId") or "")
-        return _ok({"orderId": f"ord-{self._orders_placed}", "clientOrderId": client})
-
-    def delete(self, url: str, headers: dict[str, str]) -> dict:
-        self.calls.append(RecordedCall("DELETE", url, dict(headers)))
-        return _ok({"orderId": "cancelled"})

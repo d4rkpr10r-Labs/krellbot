@@ -1,7 +1,6 @@
 """XT spot venue adapter (paper).
 
-Public docs: https://doc.xt.com and the XT4 spot client at
-https://github.com/kelvinxue/pyxt. This is not an OctoBot tentacle.
+Public spot order schema: https://doc.xt.com/docs/spot/Order/SubmitOrder.
 
 The pack pair is ``BTCUSDT``. The public symbol is ``btc_usdt``. Orders,
 books, and instrument lookups use the public spelling.
@@ -9,16 +8,14 @@ books, and instrument lookups use the public spelling.
 Auth headers are ``xt-validate-algorithms``, ``xt-validate-appkey``,
 ``xt-validate-recvwindow``, ``xt-validate-timestamp``, and
 ``xt-validate-signature``. The signed string is the four validation headers
-sorted by name, then ``#METHOD#PATH`` plus the sorted query and the compact
-JSON body when those parts are present. The digest is lowercase hex
+sorted by name, then ``#METHOD#PATH`` plus the sorted query when present.
+The digest is lowercase hex
 HMAC-SHA256. The appkey value is inside that string. The constructor field
 that holds it is ``key_id``.
 
-The public ``btc_usdt`` symbol lists order types LIMIT and MARKET. There is
-no placeable stop, so a protective stop is a GTC limit sell at
-``stop * (1 - 0.005)`` whose ``clientOrderId`` ends in ``-stop``. A market
-buy sends ``quoteQty``. A market sell sends base ``quantity``. Market orders
-use ``timeInForce=IOC``.
+The documented spot order API exposes plain LIMIT and MARKET orders. Order
+mutation is disabled until a conditional spot order API is qualified. Paper
+runs use the simulated PaperVenue and its protective stops.
 
 Tests inject a fake ``Transport`` and a deterministic ``now_fn``. The
 constructor requires ``transport``.
@@ -32,8 +29,8 @@ import json
 import time
 import urllib.parse
 from collections.abc import Callable
-from decimal import ROUND_DOWN, Decimal
-from typing import Any, Protocol
+from decimal import Decimal
+from typing import Any, NoReturn, Protocol
 
 from krellbot import release_policy, sanitize
 from krellbot.venues.base import (
@@ -49,29 +46,19 @@ from krellbot.venues.base import (
 
 API_HOST = "sapi.xt.com"
 BASE_URL = f"https://{API_HOST}"
-STOP_BUFFER = Decimal("0.005")
 RECV_WINDOW = "5000"
 PACK_PAIR = "BTCUSDT"
 WIRE_SYMBOL = "btc_usdt"
 
 
 class Transport(Protocol):
-    """Anything with get/post/delete returning parsed JSON."""
+    """Read-only transport with explicit request headers."""
 
     def get(self, url: str, headers: dict[str, str]) -> dict: ...
 
-    def post(self, url: str, body: dict | None, headers: dict[str, str]) -> dict: ...
-
-    def delete(self, url: str, headers: dict[str, str]) -> dict: ...
-
 
 class HttpTransport:
-    """Real urllib transport. Tests must not call this directly.
-
-    ``urllib`` and ``krellbot.tls`` stay inside the methods so importing this
-    module does not load the TLS stack. POST bodies are compact JSON with
-    sorted keys, the same bytes ``sign_xt`` covers.
-    """
+    """Real urllib GET transport. Tests must inject a fake."""
 
     def get(self, url: str, headers: dict[str, str]) -> dict:
         import urllib.request
@@ -82,34 +69,6 @@ class HttpTransport:
         with urlopen(req, timeout=20) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def post(self, url: str, body: dict | None, headers: dict[str, str]) -> dict:
-        import urllib.request
-
-        from krellbot.tls import urlopen
-
-        data = None
-        hdrs = dict(headers)
-        if body is not None:
-            data = compact_json(body).encode("utf-8")
-            hdrs = {**hdrs, "content-type": "application/json"}
-        req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
-        with urlopen(req, timeout=20) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-
-    def delete(self, url: str, headers: dict[str, str]) -> dict:
-        import urllib.request
-
-        from krellbot.tls import urlopen
-
-        req = urllib.request.Request(url, headers=headers, method="DELETE")
-        with urlopen(req, timeout=20) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-
-
-def compact_json(body: dict) -> str:
-    """Compact JSON with sorted keys. This is the signed POST body."""
-    return json.dumps(body, separators=(",", ":"), sort_keys=True)
-
 
 def sign_xt(
     secret: str,
@@ -119,7 +78,6 @@ def sign_xt(
     method: str,
     path: str,
     query: str = "",
-    body: str = "",
     recv_window: str = RECV_WINDOW,
 ) -> str:
     """Lowercase hex HMAC-SHA256 of the XT validate header string plus path.
@@ -137,8 +95,6 @@ def sign_xt(
     parts = [method.upper(), path]
     if query:
         parts.append(query)
-    if body:
-        parts.append(body)
     message = signed_headers + "#" + "#".join(parts)
     return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
 
@@ -159,12 +115,9 @@ def pack_pair(symbol: str) -> str:
     return str(symbol)
 
 
-def _quantize_qty(value: Decimal, decimals: int) -> Decimal:
-    return value.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_DOWN)
-
-
-def _quantize_price(value: Decimal, decimals: int) -> Decimal:
-    return value.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_DOWN)
+def _refuse_order_change() -> NoReturn:
+    release_policy.ensure_live_orders_allowed()
+    raise NotImplementedError("xt: spot order mutations are disabled pending live qualification")
 
 
 def _default_now_ms() -> int:
@@ -172,11 +125,10 @@ def _default_now_ms() -> int:
 
 
 class XtVenue:
-    """XT spot adapter for balances, open orders, and place/cancel.
+    """Read-only XT spot adapter for rules, balances, orders, and fills.
 
-    ``transport`` is mandatory. Passing ``None`` raises before any secret is
-    registered and before any network call. Order mutations call
-    ``release_policy.ensure_live_orders_allowed`` first.
+    An injected transport is required. Order mutation methods fail closed
+    even when the global release permits live trading.
     """
 
     def __init__(
@@ -194,8 +146,6 @@ class XtVenue:
         self._api_secret = api_secret
         self._transport = transport
         self._now_fn = now_fn or _default_now_ms
-        self._recent: dict[str, OrderRef] = {}
-        self._prices: dict[str, Decimal] = {}
 
     def rules(self, pair: str) -> PairRules:
         if not pair:
@@ -209,9 +159,6 @@ class XtVenue:
         price_precision = _precision(row.get("pricePrecision"))
         step = Decimal(1).scaleb(-quantity_precision)
         min_notional = _quote_min(row)
-        ask = self._ask(symbol)
-        if ask is not None:
-            self._prices[pair] = ask
         return PairRules(
             ordermin=step,
             costmin=min_notional,
@@ -230,155 +177,27 @@ class XtVenue:
         )
 
     def place_entry_with_stop(self, coid: str, qty: Decimal, stop: Decimal, *, pair: str) -> OrderRef:
-        release_policy.ensure_live_orders_allowed()
-        if coid in self._recent:
-            return self._recent[coid]
-        if not pair:
-            raise ValueError("xt entry requires a pair")
-        rules = self.rules(pair)
-        lot = _quantize_qty(qty, rules.lot_decimals)
-        price_stop = _quantize_price(stop, rules.price_decimals)
-        ask = self._prices.get(pair)
-        if ask is None:
-            raise RuntimeError("xt book ticker did not provide an ask")
-        _reject_size(lot, rules, ask)
-        quote_spend = _quantize_price(lot * ask, rules.price_decimals)
-        symbol = wire_symbol(pair)
-        entry = self._signed_post(
-            "/v4/order",
-            {
-                "symbol": symbol,
-                "side": "BUY",
-                "type": "MARKET",
-                "timeInForce": "IOC",
-                "bizType": "SPOT",
-                "quoteQty": format(quote_spend, "f"),
-                "clientOrderId": coid,
-            },
-        )
-        if not _order_ok(entry):
-            raise RuntimeError("xt entry was not accepted; stop not placed")
-        limit_price = _quantize_price(price_stop * (Decimal(1) - STOP_BUFFER), rules.price_decimals)
-        stop_resp = self._signed_post(
-            "/v4/order",
-            {
-                "symbol": symbol,
-                "side": "SELL",
-                "type": "LIMIT",
-                "timeInForce": "GTC",
-                "bizType": "SPOT",
-                "quantity": format(lot, "f"),
-                "price": format(limit_price, "f"),
-                "clientOrderId": f"{coid}-stop",
-            },
-        )
-        if not _order_ok(stop_resp):
-            raise RuntimeError("xt stop was not accepted")
-        ref = OrderRef(
-            id=str(entry.get("orderId") or ""),
-            coid=coid,
-            pair=pair,
-            side="buy",
-            qty=lot,
-            filled_qty=lot,
-            stop_price=price_stop,
-        )
-        self._recent[coid] = ref
-        return ref
+        _refuse_order_change()
 
     def place_exit(self, coid: str, qty: Decimal, *, pair: str) -> OrderRef:
-        release_policy.ensure_live_orders_allowed()
-        if not pair:
-            raise ValueError("xt exit requires a pair")
-        rules = self.rules(pair)
-        lot = _quantize_qty(qty, rules.lot_decimals)
-        _reject_size(lot, rules, self._prices.get(pair))
-        resp = self._signed_post(
-            "/v4/order",
-            {
-                "symbol": wire_symbol(pair),
-                "side": "SELL",
-                "type": "MARKET",
-                "timeInForce": "IOC",
-                "bizType": "SPOT",
-                "quantity": format(lot, "f"),
-                "clientOrderId": coid,
-            },
-        )
-        if not _order_ok(resp):
-            raise RuntimeError("xt exit was not accepted")
-        return OrderRef(
-            id=str(resp.get("orderId") or ""),
-            coid=coid,
-            pair=pair,
-            side="sell",
-            qty=lot,
-            filled_qty=lot,
-            stop_price=None,
-        )
+        _refuse_order_change()
 
     def cancel_stops(self, pair: str) -> None:
-        release_policy.ensure_live_orders_allowed()
-        for order in self.snapshot().open_orders:
-            if order.pair == pair and order.stop_price is not None:
-                self._signed_delete(f"/v4/order/{order.id}")
+        _refuse_order_change()
 
     def raise_stop(self, pair: str, new_stop: Decimal) -> None:
-        release_policy.ensure_live_orders_allowed()
-        rules = self.rules(pair)
-        price = _quantize_price(new_stop, rules.price_decimals)
-        limit_price = _quantize_price(price * (Decimal(1) - STOP_BUFFER), rules.price_decimals)
-        symbol = wire_symbol(pair)
-        for order in self.snapshot().open_orders:
-            if order.pair != pair or order.stop_price is None:
-                continue
-            self._signed_delete(f"/v4/order/{order.id}")
-            self._signed_post(
-                "/v4/order",
-                {
-                    "symbol": symbol,
-                    "side": "SELL",
-                    "type": "LIMIT",
-                    "timeInForce": "GTC",
-                    "bizType": "SPOT",
-                    "quantity": format(order.qty, "f"),
-                    "price": format(limit_price, "f"),
-                    "clientOrderId": f"{order.coid or order.id}-raised",
-                },
-            )
+        _refuse_order_change()
 
     def order_by_coid(self, coid: str) -> OpenOrder | None:
-        ref = self._recent.get(coid)
-        if ref is None:
-            return None
-        return OpenOrder(
-            id=ref.id,
-            coid=ref.coid,
-            pair=ref.pair,
-            side=ref.side,
-            qty=ref.qty,
-            stop_price=ref.stop_price,
-        )
+        # Only finds pending orders. This adapter does not submit orders.
+        orders = _parse_orders(self._signed_get("/v4/open-order", {"bizType": "SPOT"}))
+        return next((order for order in orders if order.coid == coid), None)
 
     def check_key(self) -> KeyPerms:
         payload = self._signed_get("/v4/balances")
-        if not isinstance(payload, dict) and not isinstance(payload, list):
-            raise TypeError("xt balances response missing")
         if _withdraw_capable(payload):
             raise WithdrawCapableError("xt key can withdraw; trade-only keys refused")
-        return KeyPerms(can_trade=_has_assets(payload), can_withdraw=False)
-
-    def _ask(self, symbol: str) -> Decimal | None:
-        payload = self._public_get("/v4/public/ticker/book", {"symbol": symbol})
-        rows = payload if isinstance(payload, list) else None
-        if isinstance(payload, dict):
-            rows = payload.get("result") if isinstance(payload.get("result"), list) else [payload]
-        if not isinstance(rows, list):
-            return None
-        for row in rows:
-            if isinstance(row, dict) and str(row.get("s") or row.get("symbol") or "") in {symbol, ""}:
-                return _optional_decimal(row.get("ap") or row.get("askPrice"))
-        return None
+        raise RuntimeError("xt: balance access does not establish trade-only key permissions")
 
     def _public_get(self, path: str, params: dict[str, str] | None = None) -> Any:
         query = urllib.parse.urlencode(params or {})
@@ -395,17 +214,7 @@ class XtVenue:
             url = f"{url}?{query}"
         return _unwrap(self._transport.get(url, headers))
 
-    def _signed_post(self, path: str, body: dict[str, str]) -> Any:
-        encoded = compact_json(body)
-        headers = self._auth_headers("POST", path, body=encoded)
-        headers["content-type"] = "application/json"
-        return _unwrap(self._transport.post(f"{BASE_URL}{path}", body, headers))
-
-    def _signed_delete(self, path: str) -> Any:
-        headers = self._auth_headers("DELETE", path)
-        return _unwrap(self._transport.delete(f"{BASE_URL}{path}", headers))
-
-    def _auth_headers(self, method: str, path: str, *, query: str = "", body: str = "") -> dict[str, str]:
+    def _auth_headers(self, method: str, path: str, *, query: str = "") -> dict[str, str]:
         timestamp = str(int(self._now_fn()))
         signature = sign_xt(
             self._api_secret,
@@ -414,7 +223,6 @@ class XtVenue:
             method=method,
             path=path,
             query=query,
-            body=body,
         )
         return {
             "xt-validate-algorithms": "HmacSHA256",
@@ -495,17 +303,6 @@ def _withdraw_capable(payload: Any) -> bool:
     return False
 
 
-def _has_assets(payload: Any) -> bool:
-    if isinstance(payload, list):
-        return True
-    if isinstance(payload, dict):
-        assets = payload.get("assets")
-        if assets is None:
-            assets = payload.get("balances")
-        return isinstance(assets, list)
-    return False
-
-
 def _asset_rows(payload: Any) -> list:
     if isinstance(payload, list):
         return payload
@@ -516,19 +313,6 @@ def _asset_rows(payload: Any) -> list:
         if isinstance(assets, list):
             return assets
     return []
-
-
-def _reject_size(qty: Decimal, rules: PairRules, price: Decimal | None) -> None:
-    if qty < rules.ordermin:
-        raise ValueError("qty below ordermin")
-    if price is not None and qty * price < rules.costmin:
-        raise ValueError("notional below costmin")
-
-
-def _order_ok(resp: Any) -> bool:
-    if not isinstance(resp, dict):
-        return False
-    return resp.get("orderId") not in (None, "")
 
 
 def _parse_balances(payload: Any) -> list[Balance]:
@@ -567,9 +351,6 @@ def _parse_orders(payload: Any) -> list[OpenOrder]:
         if qty is None:
             continue
         coid = str(raw.get("clientOrderId") or "")
-        stop = None
-        if coid.endswith(("-stop", "-raised")):
-            stop = _optional_decimal(raw.get("price"))
         out.append(
             OpenOrder(
                 id=str(raw.get("orderId") or ""),
@@ -577,7 +358,6 @@ def _parse_orders(payload: Any) -> list[OpenOrder]:
                 pair=pack_pair(str(raw.get("symbol") or "")),
                 side=str(raw.get("side") or "").lower(),
                 qty=qty,
-                stop_price=stop,
             )
         )
     return out
