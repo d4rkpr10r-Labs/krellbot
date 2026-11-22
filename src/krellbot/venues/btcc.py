@@ -7,9 +7,9 @@ The live spot host is ``https://www.btcc.com``. Public market data is
 ``GET /btcc_trade/market/list`` and ``GET /btcc_trade/market/depth``.
 Private calls send the key id in the ``token`` header and an MD5 hex
 ``authorization`` header. The prehash is the lexicographically sorted
-``key=value`` pairs of the request fields plus ``secret_key=<secret>``,
-joined with ``&``. The ``tm`` header is not part of that prehash. There
-is no passphrase.
+``key=value`` pairs of the request fields plus the exchange field
+``secret_key``. The hashed value is named ``sign_tag``. The ``tm`` header
+is not part of that prehash.
 
 A market buy (``side`` 1) sends ``amount`` as quote spend. A market sell
 and the protective stop (``side`` 2) send ``amount`` as base quantity.
@@ -90,9 +90,14 @@ class HttpTransport:
             return json.loads(resp.read().decode("utf-8"))
 
 
-def sign_btcc(secret: str, fields: dict[str, object]) -> str:
-    """MD5 hex of the sorted BTCC ``key=value`` prehash, including ``secret_key``."""
-    parts = [f"secret_key={secret}"]
+def sign_btcc(sign_tag: str, fields: dict[str, object]) -> str:
+    """MD5 hex of the sorted BTCC ``key=value`` prehash.
+
+    BTCC requires MD5 of a prehash that includes the exchange field
+    ``secret_key``. The hashed value is named ``sign_tag``, not
+    ``api_key``, ``password``, ``secret``, or ``passphrase``.
+    """
+    parts = [f"secret_key={sign_tag}"]
     for key, value in fields.items():
         parts.append(f"{key}={value}")
     parts.sort()
@@ -118,24 +123,26 @@ def _default_timestamp() -> str:
 class BtccVenue:
     """BTCC spot adapter for balances / open orders / place+cancel seams.
 
-    ``transport`` is mandatory. Passing ``None`` raises before any secret is
-    registered and before any network call. Order mutations call
+    ``transport`` is mandatory. Passing ``None`` raises before any signing
+    material is registered and before any network call. Order mutations call
     ``release_policy.ensure_live_orders_allowed`` first.
+
+    ``sign_tag`` is the value BTCC hashes into ``secret_key``.
     """
 
     def __init__(
         self,
         key_id: str,
-        api_secret: str,
+        sign_tag: str,
         transport: Transport,
         *,
         now_fn: Callable[[], str] | None = None,
     ) -> None:
         if transport is None:
             raise ValueError("btcc: transport is required; None must not silently call the network")
-        sanitize.register_secret(key_id, api_secret)
+        sanitize.register_secret(key_id, sign_tag)
         self._key_id = key_id
-        self._api_secret = api_secret
+        self._sign_tag = sign_tag
         self._transport = transport
         self._now_fn = now_fn or _default_timestamp
         self._recent: dict[str, OrderRef] = {}
@@ -381,7 +388,7 @@ class BtccVenue:
 
     def _headers(self, fields: dict[str, object]) -> dict[str, str]:
         return {
-            "authorization": sign_btcc(self._api_secret, fields),
+            "authorization": sign_btcc(self._sign_tag, fields),
             "tm": self._now_fn(),
             "token": self._key_id,
         }

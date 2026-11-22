@@ -12,17 +12,17 @@ from krellbot.venues.base import WithdrawCapableError
 from krellbot.venues.btcc import BASE_URL, BtccVenue, sign_btcc
 
 WAVE_PAIR = "BTCUSDT"
-SECRET = "BTCC-SYNTHETIC-SECRET"
+SIGN_TAG = "BTCC-SYNTHETIC-SECRET"
 TIMESTAMP = "1700000000000"
 
 
 def _venue(transport: FakeBtccTransport) -> BtccVenue:
-    return BtccVenue("key", SECRET, transport, now_fn=lambda: TIMESTAMP)
+    return BtccVenue("key", SIGN_TAG, transport, now_fn=lambda: TIMESTAMP)
 
 
 def test_btcc_signature_matches_sorted_secret_prehash() -> None:
     signature = sign_btcc(
-        SECRET,
+        SIGN_TAG,
         {
             "amount": "100.0000",
             "client_id": "3",
@@ -44,7 +44,7 @@ def test_btcc_venue_refuses_none_transport(monkeypatch: pytest.MonkeyPatch) -> N
 
     monkeypatch.setattr("krellbot.venues.btcc.sanitize.register_secret", _register)
     with pytest.raises(ValueError, match="transport is required"):
-        BtccVenue("key", SECRET, None)  # type: ignore[arg-type]
+        BtccVenue("key", SIGN_TAG, None)  # type: ignore[arg-type]
     assert called is False
 
 
