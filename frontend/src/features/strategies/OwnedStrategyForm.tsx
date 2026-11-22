@@ -82,6 +82,7 @@ const VENUE_LABELS: Record<Venue, string> = {
   bybit: "Bybit (paper)",
   kucoin: "KuCoin (paper)",
   ourbit: "Ourbit (paper)",
+  toobit: "Toobit (paper)",
 };
 
 const STOP_KIND_LABELS: Record<StopKind, string> = {

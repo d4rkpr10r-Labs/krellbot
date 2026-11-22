@@ -224,6 +224,7 @@ _PAPER_TAKER_BPS = {
     "bybit": 10,
     "kucoin": 10,
     "ourbit": 0,
+    "toobit": 0,
 }
 
 
