@@ -25,6 +25,7 @@ REMOTE_MODULES = {
     "krellbot.venues.okx",
     "krellbot.venues.bybit",
     "krellbot.venues.kucoin",
+    "krellbot.venues.xt",
 }
 PUBLIC_NAMES = [
     "Balance",
@@ -44,6 +45,7 @@ PUBLIC_NAMES = [
     "Truth",
     "Venue",
     "WithdrawCapableError",
+    "XtVenue",
 ]
 PRELUDE = """
 import json
@@ -153,6 +155,7 @@ def test_offline_import_does_not_load_remote_adapters(tmp_path, source, expected
         ("okx", "OkxVenue"),
         ("bybit", "BybitVenue"),
         ("kucoin", "KucoinVenue"),
+        ("xt", "XtVenue"),
     ],
 )
 @pytest.mark.parametrize("direct_first", [False, True], ids=["reexport-first", "direct-first"])
@@ -192,12 +195,14 @@ def test_import_star_preserves_public_names_and_class_identity(tmp_path):
         from krellbot.venues.okx import OkxVenue
         from krellbot.venues.bybit import BybitVenue
         from krellbot.venues.kucoin import KucoinVenue
+        from krellbot.venues.xt import XtVenue
         assert namespace['KrakenVenue'] is KrakenVenue
         assert namespace['CoinbaseVenue'] is CoinbaseVenue
         assert namespace['BinanceVenue'] is BinanceVenue
         assert namespace['GateVenue'] is GateVenue
         assert namespace['PionexVenue'] is PionexVenue
         assert namespace['KucoinVenue'] is KucoinVenue
+        assert namespace['XtVenue'] is XtVenue
         assert vars(venues)['KrakenVenue'] is KrakenVenue
         assert vars(venues)['CoinbaseVenue'] is CoinbaseVenue
         assert vars(venues)['BinanceVenue'] is BinanceVenue
@@ -208,6 +213,7 @@ def test_import_star_preserves_public_names_and_class_identity(tmp_path):
         assert namespace['BybitVenue'] is BybitVenue
         assert vars(venues)['BybitVenue'] is BybitVenue
         assert vars(venues)['KucoinVenue'] is KucoinVenue
+        assert vars(venues)['XtVenue'] is XtVenue
         for name in venues.__all__:
             assert namespace[name] is getattr(venues, name)
         """,
@@ -258,6 +264,7 @@ def test_all_is_preserved_without_resolving_lazy_names(tmp_path):
         "OkxVenue",
         "BybitVenue",
         "KucoinVenue",
+        "XtVenue",
     ],
 )
 def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, resolved_name):
@@ -274,6 +281,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
             'krellbot.venues.okx',
             'krellbot.venues.bybit',
             'krellbot.venues.kucoin',
+            'krellbot.venues.xt',
         }}
         assert remote_modules.isdisjoint(sys.modules)
         names = dir(venues)
@@ -289,6 +297,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
         assert 'OkxVenue' not in vars(venues)
         assert 'BybitVenue' not in vars(venues)
         assert 'KucoinVenue' not in vars(venues)
+        assert 'XtVenue' not in vars(venues)
         resolved_name = {resolved_name!r}
         if resolved_name is not None:
             resolved = getattr(venues, resolved_name)
@@ -311,6 +320,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
         "OkxVenue": {"krellbot.venues.okx"},
         "BybitVenue": {"krellbot.venues.bybit"},
         "KucoinVenue": {"krellbot.venues.kucoin"},
+        "XtVenue": {"krellbot.venues.xt"},
     }
     assert set(observed["modules"]) & REMOTE_MODULES == expected_remote[resolved_name]
 
@@ -326,6 +336,7 @@ def test_dir_discovers_public_names_without_loading_remote_adapters(tmp_path, re
         ("okx", "OkxVenue"),
         ("bybit", "BybitVenue"),
         ("kucoin", "KucoinVenue"),
+        ("xt", "XtVenue"),
     ],
 )
 def test_adapter_import_errors_propagate_without_caching_a_placeholder(tmp_path, module, name):

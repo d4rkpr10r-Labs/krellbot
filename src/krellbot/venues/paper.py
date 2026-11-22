@@ -58,6 +58,10 @@ BYBIT_TAKER_BPS = 10
 # (VIP Fee Structure, updated 2026-05-07). BTC/USDT is Class A. Pinned at 10 bps.
 # The KCS discount is not applied.
 KUCOIN_TAKER_BPS = 10
+# XT's public btc_usdt symbol publishes takerFeeRate 0.002 (0.20%).
+# The help-center special-mechanism table (updated 2025-12-29) lists the
+# same taker rate. Pinned at 20 bps. Futures fees are not used.
+XT_TAKER_BPS = 20
 SLIPPAGE_BPS = 5
 
 
@@ -80,17 +84,19 @@ def _fee_bps_for(venue: str) -> int:
         return BYBIT_TAKER_BPS
     if venue == "kucoin":
         return KUCOIN_TAKER_BPS
+    if venue == "xt":
+        return XT_TAKER_BPS
     return COINBASE_TAKER_BPS
 
 
 def _seed_quote_asset(venue: str) -> str:
     """Quote asset used when seeding paper starting cash for a venue.
 
-    Binance and Bybit wave paper markets are USDT-quoted (``BTCUSDT``).
+    Binance, Bybit, and XT wave paper markets are USDT-quoted (``BTCUSDT``).
     Gate, Pionex, OKX, and KuCoin wave paper markets are USDT-quoted (``BTC-USDT``).
     Kraken and Coinbase wave paper markets seed ``USD``.
     """
-    if venue in {"binance", "gate", "pionex", "okx", "bybit", "kucoin"}:
+    if venue in {"binance", "gate", "pionex", "okx", "bybit", "kucoin", "xt"}:
         return "USDT"
     return "USD"
 
