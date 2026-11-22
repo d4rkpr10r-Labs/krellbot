@@ -83,6 +83,7 @@ const VENUE_LABELS: Record<Venue, string> = {
   kucoin: "KuCoin (paper)",
   ourbit: "Ourbit (paper)",
   toobit: "Toobit (paper)",
+  xt: "XT (paper)",
   mexc: "MEXC (paper)",
 };
 

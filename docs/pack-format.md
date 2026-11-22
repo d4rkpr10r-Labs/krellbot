@@ -28,7 +28,7 @@ Required keys: `schema_version`, `id`, `version`, `label`, `author`, `timeframe`
   nest with `{all: [...]}` or `{any: [...]}` up to depth 3.
 - `risk.max_account_pct` is an integer 1 to 100. `risk.stop` is either
   `{type: pct, pct: number}` or `{type: atr, len: int, mult: number}`.
-- `markets` is 1 to 4 items of `{venue: kraken|coinbase|binance|gate|pionex|okx|bybit|kucoin|ourbit|toobit|mexc, pair: ...}`.
+- `markets` is 1 to 4 items of `{venue: kraken|coinbase|binance|gate|pionex|okx|bybit|kucoin|ourbit|toobit|xt|mexc, pair: ...}`.
 
 ### Markets venue allow-list
 
@@ -48,6 +48,7 @@ enum). Do not admit a new id in the schema without updating this section.
 | `kucoin`   | KuCoin spot       | Pack and venue `BASE-QUOTE` | `BTC-USDT` |
 | `ourbit`   | Ourbit spot       | Concatenated `BASEQUOTE` symbol | `BTCUSDT` |
 | `toobit`   | Toobit spot       | Concatenated `BASEQUOTE` symbol | `BTCUSDT` |
+| `xt`       | XT spot           | Pack `BTCUSDT`; public symbol `btc_usdt` | `BTCUSDT` |
 | `mexc`     | MEXC spot         | Concatenated `BASEQUOTE` symbol | `BTCUSDT` |
 
 `binance` is the first Binance-class spot venue id. Pack pairs for Binance use
@@ -72,8 +73,8 @@ paper+preflight path relies on:
 - `check_key() -> KeyPerms`
 
 Adapters live under `src/krellbot/venues/` (`kraken.py`, `coinbase.py`,
-`binance.py`, `gate.py`, `pionex.py`, `okx.py`, `bybit.py`, `kucoin.py`, `ourbit.py`, `toobit.py`, `mexc.py`). Qualified live venues for the distribution product path are
-`kraken` and `coinbase` (see `docs/live.md`). `binance`, `gate`, `pionex`, `okx`, `bybit`, `kucoin`, `ourbit`, `toobit`, and `mexc` stay paper-only.
+`binance.py`, `gate.py`, `pionex.py`, `okx.py`, `bybit.py`, `kucoin.py`, `ourbit.py`, `toobit.py`, `xt.py`, `mexc.py`). Qualified live venues for the distribution product path are
+`kraken` and `coinbase` (see `docs/live.md`). `binance`, `gate`, `pionex`, `okx`, `bybit`, `kucoin`, `ourbit`, `toobit`, `xt`, and `mexc` stay paper-only.
 Qualified live remains owner-gated behind `PAPER_ONLY_RELEASE`; agents keep
 that flag True.
 

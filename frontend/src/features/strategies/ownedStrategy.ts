@@ -3,7 +3,7 @@
 // Guided subset of the Pack DSL (src/krellbot/pack/schema.json): close versus
 // one indicator or a two-average crossover, optional single-level all/any
 // nesting with a close-vs-threshold confirm leaf, percentage or ATR protective
-// stops, and one or two kraken|coinbase|binance|gate|pionex|okx|bybit|kucoin|ourbit|toobit|mexc markets (paper-capable). Anything else
+// stops, and one or two kraken|coinbase|binance|gate|pionex|okx|bybit|kucoin|ourbit|toobit|xt|mexc markets (paper-capable). Anything else
 // — deeper nesting, extra indicator params (power_mean / roofing), more than
 // two markets, unknown keys — returns null from `readOwnedStrategy` so the
 // editor never silently rewrites or strips it.
@@ -47,7 +47,7 @@ export const COMPARISONS = [
 ] as const;
 export type Comparison = (typeof COMPARISONS)[number];
 
-export const VENUES = ["kraken", "coinbase", "binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "mexc"] as const;
+export const VENUES = ["kraken", "coinbase", "binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt", "mexc"] as const;
 export type Venue = (typeof VENUES)[number];
 
 /** Canonical Binance-class paper wave pair (concatenated BASEQUOTE). */
@@ -59,6 +59,7 @@ export const BYBIT_PAPER_WAVE_PAIR = "BTCUSDT";
 export const KUCOIN_PAPER_WAVE_PAIR = "BTC-USDT";
 export const OURBIT_PAPER_WAVE_PAIR = "BTCUSDT";
 export const TOOBIT_PAPER_WAVE_PAIR = "BTCUSDT";
+export const XT_PAPER_WAVE_PAIR = "BTCUSDT";
 export const MEXC_PAPER_WAVE_PAIR = "BTCUSDT";
 
 export const STOP_KINDS = ["pct", "atr"] as const;
@@ -394,7 +395,7 @@ function wrapGuidedCondition(
  * either the generated single-indicator shape (close compared to it) or the
  * generated two-average crossover shape (`fast` and `slow`), with optional
  * single-level all/any confirm nesting, pct or ATR stop, and one or two
- * kraken|coinbase|binance|gate|pionex|okx|bybit|kucoin|ourbit|toobit|mexc markets. Anything else returns null so callers keep the
+ * kraken|coinbase|binance|gate|pionex|okx|bybit|kucoin|ourbit|toobit|xt|mexc markets. Anything else returns null so callers keep the
  * original bytes untouched instead of guessing at a partial edit.
  */
 export function readOwnedStrategy(pack: Pack | null): OwnedStrategyFormState | null {
