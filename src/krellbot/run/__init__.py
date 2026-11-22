@@ -1036,6 +1036,8 @@ def _fee_bps_for_venue(venue: str) -> int:
         return 10
     if venue in {"ourbit", "toobit"}:
         return 0
+    if venue == "mexc":
+        return 5
     return 0
 
 
