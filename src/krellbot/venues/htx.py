@@ -101,6 +101,7 @@ def sign_htx(sign_tag: str, method: str, host: str, path: str, params: dict[str,
     """
     encoded = urllib.parse.urlencode(sorted(params.items()))
     prehash = f"{method.upper()}\n{host}\n{path}\n{encoded}"
+    # codeql[py/weak-sensitive-data-hashing]
     digest = hmac.new(sign_tag.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
     return base64.b64encode(digest).decode("ascii")
 
