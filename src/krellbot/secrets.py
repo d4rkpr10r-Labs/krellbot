@@ -30,6 +30,8 @@ VENUES = {
     "ourbit",
     "toobit",
     "xt",
+    "mexc",
+    "deepcoin",
     "lbank",
 }
 

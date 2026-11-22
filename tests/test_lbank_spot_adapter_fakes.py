@@ -2,8 +2,7 @@
 
 CI must never open a network socket to LBank. ``LbankVenue`` requires an
 explicit ``Transport``; ``None`` refuses rather than defaulting to
-``HttpTransport``. Order mutations still go through
-``release_policy.ensure_live_orders_allowed``.
+``HttpTransport``. Order mutations fail closed under either release setting.
 """
 
 from __future__ import annotations
@@ -14,6 +13,7 @@ from urllib.parse import urlparse
 import pytest
 from fakes.fake_lbank import FakeLbankTransport
 
+from krellbot import release_policy
 from krellbot.release_policy import PaperOnlyReleaseError
 from krellbot.venues.base import WithdrawCapableError
 from krellbot.venues.lbank import API_HOST, BASE_URL, HttpTransport, LbankVenue, sign_lbank
@@ -69,9 +69,9 @@ def test_lbank_snapshot_balances_orders_and_fills() -> None:
         orders=[
             {
                 "orderId": "ord-9",
-                "clientOrderId": "rest-1",
+                "clientOrderId": "ordinary-limit-stop",
                 "symbol": "btc_usdt",
-                "type": "buy",
+                "type": "sell",
                 "origQty": "0.01",
                 "price": "100000",
                 "status": 0,
@@ -89,104 +89,103 @@ def test_lbank_snapshot_balances_orders_and_fills() -> None:
             }
         ],
     )
-    truth = _venue(transport).snapshot()
+    venue = _venue(transport)
+    truth = venue.snapshot()
     assets = {b.asset: b for b in truth.balances}
     assert assets["USDT"].free == Decimal(1000)
     assert len(truth.open_orders) == 1
-    assert truth.open_orders[0].coid == "rest-1"
-    assert truth.open_orders[0].pair == WAVE_PAIR
+    order = truth.open_orders[0]
+    assert order.coid == "ordinary-limit-stop"
+    assert order.pair == WAVE_PAIR
+    assert order.side == "sell"
+    assert order.stop_price is None
+    assert venue.order_by_coid(order.coid) == order
     assert truth.recent_fills[0].side == "buy"
     assert truth.recent_fills[0].pair == WAVE_PAIR
 
 
-def test_lbank_place_entry_with_stop_uses_signed_posts() -> None:
+@pytest.mark.parametrize(
+    ("paper_only", "expected_error"), [(True, PaperOnlyReleaseError), (False, NotImplementedError)]
+)
+def test_lbank_order_mutations_refuse_before_transport(monkeypatch, paper_only, expected_error) -> None:
+    monkeypatch.setattr(release_policy, "PAPER_ONLY_RELEASE", paper_only)
     transport = FakeLbankTransport()
     venue = _venue(transport)
-    ref = venue.place_entry_with_stop("coid", Decimal("0.0001"), Decimal(90000), pair=WAVE_PAIR)
-    assert ref.pair == WAVE_PAIR
-    assert ref.side == "buy"
-    assert ref.stop_price == Decimal("90000.00")
-    posts = [c for c in transport.calls if c.method == "POST"]
-    assert len(posts) == 2
-    assert isinstance(posts[0].body, dict)
-    assert posts[0].body["type"] == "buy_market"
-    assert posts[0].body["symbol"] == "btc_usdt"
-    assert posts[0].body["custom_id"] == "coid"
-    assert posts[0].body["price"] == "10.00"
-    assert "amount" not in posts[0].body
-    assert posts[0].body["api_key"] == "test-key"
-    assert posts[0].body["sign"]
-    assert posts[0].headers.get("echostr") == ECHO
-    assert isinstance(posts[1].body, dict)
-    assert posts[1].body["type"] == "sell"
-    assert posts[1].body["custom_id"] == "coid-stop"
-    assert posts[1].body["price"] == "89550.00"
-    posts_after = len(posts)
-    second = venue.place_entry_with_stop("coid", Decimal("0.0001"), Decimal(90000), pair=WAVE_PAIR)
-    assert second.id == ref.id
-    assert len([c for c in transport.calls if c.method == "POST"]) == posts_after
+    with pytest.raises(expected_error):
+        venue.place_entry_with_stop("entry", Decimal("0.01"), Decimal(90000), pair=WAVE_PAIR)
+    with pytest.raises(expected_error):
+        venue.place_exit("exit", Decimal("0.01"), pair=WAVE_PAIR)
+    with pytest.raises(expected_error):
+        venue.cancel_stops(WAVE_PAIR)
+    with pytest.raises(expected_error):
+        venue.raise_stop(WAVE_PAIR, Decimal(91000))
+    assert transport.calls == []
 
 
-def test_lbank_place_exit_cancel_stops_and_raise_stop() -> None:
+def test_lbank_signed_queries_refuse_order_paths() -> None:
+    transport = FakeLbankTransport()
+    with pytest.raises(ValueError, match="unsupported account query"):
+        _venue(transport)._signed_read("/v2/supplement/create_order.do", {})
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize("can_trade", [True, False])
+def test_lbank_check_key_reads_explicit_api_key_permissions(can_trade) -> None:
     transport = FakeLbankTransport(
-        orders=[
-            {
-                "orderId": "stop-9",
-                "clientOrderId": "exit-coid-stop",
-                "symbol": "btc_usdt",
-                "type": "sell",
-                "origQty": "0.0001",
-                "price": "89550",
-                "status": 0,
-            }
-        ]
-    )
-    venue = _venue(transport)
-    entry = venue.place_entry_with_stop("exit-coid", Decimal("0.0001"), Decimal(90000), pair=WAVE_PAIR)
-    found = venue.order_by_coid("exit-coid")
-    assert found is not None
-    assert found.id == entry.id
-    exit_ref = venue.place_exit("exit-flat", Decimal("0.0001"), pair=WAVE_PAIR)
-    assert exit_ref.side == "sell"
-    venue.cancel_stops(WAVE_PAIR)
-    venue.raise_stop(WAVE_PAIR, Decimal(91000))
-    posts = [c for c in transport.calls if c.method == "POST" and isinstance(c.body, dict)]
-    assert any(body.get("type") == "sell_market" for body in (c.body for c in posts if isinstance(c.body, dict)))
-    assert any("/cancel_order.do" in c.url for c in posts)
-    assert any(
-        isinstance(c.body, dict) and c.body.get("price") == "90545.00" and c.body.get("type") == "sell" for c in posts
-    )
-
-
-def test_lbank_check_key_trade_only_and_withdraw_refused() -> None:
-    ok = _venue(FakeLbankTransport()).check_key()
-    assert ok.can_trade is True
-    assert ok.can_withdraw is False
-    bad = FakeLbankTransport(
-        account={
-            "result": "true",
+        permissions={
+            "result": True,
             "error_code": 0,
-            "data": {"balances": [], "canTrade": True, "canWithdraw": True},
+            "data": {"enableSpotTrading": can_trade, "enableWithdrawals": False},
         }
     )
+    perms = _venue(transport).check_key()
+    assert perms.can_trade is can_trade
+    assert perms.can_withdraw is False
+    assert len(transport.calls) == 1
+    call = transport.calls[0]
+    assert call.method == "POST"
+    assert call.url == f"{BASE_URL}/v2/supplement/api_Restrictions.do"
+    assert call.body == {
+        "api_key": "test-key",
+        "sign": "bca9b3c1a3d4dc5a19b265a5c100c9085dbfd9922cbe1ad7cf86093d97565fd8",
+    }
+    assert call.headers == {
+        "content-type": "application/x-www-form-urlencoded",
+        "timestamp": "1700000000000",
+        "signature_method": "HmacSHA256",
+        "echostr": ECHO,
+    }
+
+
+def test_lbank_check_key_refuses_withdrawable_api_key() -> None:
+    transport = FakeLbankTransport(
+        permissions={"result": "true", "error_code": 0, "data": {"enableSpotTrading": True, "enableWithdrawals": True}}
+    )
     with pytest.raises(WithdrawCapableError):
-        _venue(bad).check_key()
+        _venue(transport).check_key()
 
 
-def test_lbank_place_entry_blocked_when_paper_only_release(monkeypatch) -> None:
-    from krellbot import release_policy
+@pytest.mark.parametrize(
+    "permissions",
+    [
+        {},
+        {"canTrade": True, "canWithdraw": False},
+        {"enableSpotTrading": True},
+        {"enableSpotTrading": True, "enableWithdrawals": "false"},
+        {"enableSpotTrading": "true", "enableWithdrawals": False},
+    ],
+)
+def test_lbank_check_key_refuses_unknown_permissions(permissions) -> None:
+    transport = FakeLbankTransport(permissions={"result": True, "error_code": 0, "data": permissions})
+    with pytest.raises(TypeError, match="API key permissions response is incomplete"):
+        _venue(transport).check_key()
 
-    monkeypatch.setattr(release_policy, "PAPER_ONLY_RELEASE", True)
-    transport = FakeLbankTransport()
-    with pytest.raises(PaperOnlyReleaseError):
-        LbankVenue(
-            key_id="k",
-            api_secret="s",
-            transport=transport,
-            now_fn=lambda: 1,
-            echo_fn=lambda: ECHO,
-        ).place_entry_with_stop("x", Decimal("0.0001"), Decimal(1), pair=WAVE_PAIR)
-    assert transport.calls == []
+
+def test_lbank_snapshot_rejects_account_error() -> None:
+    transport = FakeLbankTransport(account={"result": False, "error_code": 10022})
+    with pytest.raises(RuntimeError, match="account data request failed"):
+        _venue(transport).snapshot()
+    assert len(transport.calls) == 1
 
 
 def test_lbank_sign_matches_documented_prehash() -> None:

@@ -12,10 +12,8 @@ The HMAC is lowercase hex. The constructor field that holds the key id is
 ``key_id``. The wire field stays ``api_key`` because that is the documented
 parameter name.
 
-The documented spot order types are limit and market (plus maker, IOC, and
-FOK). There is no placeable stop, so a protective stop is a limit sell at
-``stop * (1 - 0.005)`` whose ``custom_id`` ends in ``-stop``. A market buy
-sends ``price`` as the quote amount. A market sell sends base ``amount``.
+The documented spot order types are limit, market, maker, IOC, and FOK.
+Live order mutations are disabled. PaperVenue simulates protective stops.
 
 ``urllib`` and ``krellbot.tls`` are imported inside ``HttpTransport`` so
 importing this module stays offline.
@@ -36,8 +34,8 @@ import secrets
 import time
 import urllib.parse
 from collections.abc import Callable
-from decimal import ROUND_DOWN, Decimal
-from typing import Any, Protocol
+from decimal import Decimal
+from typing import Any, NoReturn, Protocol
 
 from krellbot import release_policy, sanitize
 from krellbot.venues.base import (
@@ -53,9 +51,12 @@ from krellbot.venues.base import (
 
 API_HOST = "api.lbank.info"
 BASE_URL = f"https://{API_HOST}"
-STOP_BUFFER = Decimal("0.005")
 PACK_PAIR = "BTC-USDT"
 WIRE_SYMBOL = "btc_usdt"
+_ACCOUNT_PATH = "/v2/supplement/user_info_account.do"
+_PENDING_ORDERS_PATH = "/v2/supplement/orders_info_no_deal.do"
+_FILLS_PATH = "/v2/supplement/transaction_history.do"
+_KEY_PERMISSIONS_PATH = "/v2/supplement/api_Restrictions.do"
 
 
 class Transport(Protocol):
@@ -118,12 +119,9 @@ def pack_pair(symbol: str) -> str:
     return f"{base.upper()}-{quote.upper()}"
 
 
-def _quantize_qty(value: Decimal, decimals: int) -> Decimal:
-    return value.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_DOWN)
-
-
-def _quantize_price(value: Decimal, decimals: int) -> Decimal:
-    return value.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_DOWN)
+def _refuse_order_change() -> NoReturn:
+    release_policy.ensure_live_orders_allowed()
+    raise NotImplementedError("lbank: spot order mutations are disabled pending live qualification")
 
 
 def _default_now_ms() -> int:
@@ -135,11 +133,10 @@ def _default_echostr() -> str:
 
 
 class LbankVenue:
-    """LBank spot adapter for balances, open orders, and place/cancel.
+    """Read-only LBank spot adapter behind an explicitly supplied transport.
 
-    ``transport`` is mandatory. Passing ``None`` raises before any secret is
-    registered and before any network call. Order mutations call
-    ``release_policy.ensure_live_orders_allowed`` first.
+    Signed account queries use the exchange's POST read endpoints.
+    Order mutations fail closed even in a live-capable release.
     """
 
     def __init__(
@@ -159,7 +156,6 @@ class LbankVenue:
         self._transport = transport
         self._now_fn = now_fn or _default_now_ms
         self._echo_fn = echo_fn or _default_echostr
-        self._recent: dict[str, OrderRef] = {}
 
     def rules(self, pair: str) -> PairRules:
         if not pair:
@@ -179,195 +175,65 @@ class LbankVenue:
         )
 
     def snapshot(self) -> Truth:
-        account = self._signed_post("/v2/supplement/user_info_account.do", {})
-        orders = self._signed_post(
-            "/v2/supplement/orders_info_no_deal.do",
-            {"symbol": WIRE_SYMBOL, "current_page": "1", "page_length": "200"},
-        )
-        fills = self._signed_post(
-            "/v2/supplement/transaction_history.do",
-            {"symbol": WIRE_SYMBOL, "limit": "100"},
-        )
-        return Truth(
-            balances=_parse_balances(account),
-            open_orders=_parse_orders(orders),
-            recent_fills=_parse_fills(fills),
-        )
+        balances = _parse_balances(self._signed_read(_ACCOUNT_PATH, {}))
+        orders = self._pending_orders()
+        fills = _parse_fills(self._signed_read(_FILLS_PATH, {"symbol": WIRE_SYMBOL, "limit": "100"}))
+        return Truth(balances=balances, open_orders=orders, recent_fills=fills)
 
     def place_entry_with_stop(self, coid: str, qty: Decimal, stop: Decimal, *, pair: str) -> OrderRef:
-        release_policy.ensure_live_orders_allowed()
-        if coid in self._recent:
-            return self._recent[coid]
-        if not pair:
-            raise ValueError("lbank entry requires a pair")
-        rules = self.rules(pair)
-        lot = _quantize_qty(qty, rules.lot_decimals)
-        price_stop = _quantize_price(stop, rules.price_decimals)
-        ask = self._ask(wire_symbol(pair))
-        if ask is None:
-            raise RuntimeError("lbank book ticker did not provide an ask")
-        _reject_size(lot, rules, ask)
-        quote_spend = _quantize_price(lot * ask, rules.price_decimals)
-        symbol = wire_symbol(pair)
-        entry = self._signed_post(
-            "/v2/supplement/create_order.do",
-            {
-                "symbol": symbol,
-                "type": "buy_market",
-                "price": format(quote_spend, "f"),
-                "custom_id": coid,
-            },
-        )
-        if not _accepted(entry):
-            raise RuntimeError("lbank entry was not accepted; stop not placed")
-        limit_price = _quantize_price(price_stop * (Decimal(1) - STOP_BUFFER), rules.price_decimals)
-        stop_resp = self._signed_post(
-            "/v2/supplement/create_order.do",
-            {
-                "symbol": symbol,
-                "type": "sell",
-                "price": format(limit_price, "f"),
-                "amount": format(lot, "f"),
-                "custom_id": f"{coid}-stop",
-            },
-        )
-        if not _accepted(stop_resp):
-            raise RuntimeError("lbank stop was not accepted")
-        ref = OrderRef(
-            id=_order_id(entry),
-            coid=coid,
-            pair=pair,
-            side="buy",
-            qty=lot,
-            filled_qty=lot,
-            stop_price=price_stop,
-        )
-        self._recent[coid] = ref
-        return ref
+        _refuse_order_change()
 
     def place_exit(self, coid: str, qty: Decimal, *, pair: str) -> OrderRef:
-        release_policy.ensure_live_orders_allowed()
-        if not pair:
-            raise ValueError("lbank exit requires a pair")
-        rules = self.rules(pair)
-        lot = _quantize_qty(qty, rules.lot_decimals)
-        _reject_size(lot, rules, None)
-        resp = self._signed_post(
-            "/v2/supplement/create_order.do",
-            {
-                "symbol": wire_symbol(pair),
-                "type": "sell_market",
-                "amount": format(lot, "f"),
-                "custom_id": coid,
-            },
-        )
-        if not _accepted(resp):
-            raise RuntimeError("lbank exit was not accepted")
-        return OrderRef(
-            id=_order_id(resp),
-            coid=coid,
-            pair=pair,
-            side="sell",
-            qty=lot,
-            filled_qty=lot,
-            stop_price=None,
-        )
+        _refuse_order_change()
 
     def cancel_stops(self, pair: str) -> None:
-        release_policy.ensure_live_orders_allowed()
-        for order in self._stop_orders(pair):
-            self._signed_post(
-                "/v2/supplement/cancel_order.do",
-                {"symbol": wire_symbol(pair), "orderId": order.id},
-            )
+        _refuse_order_change()
 
     def raise_stop(self, pair: str, new_stop: Decimal) -> None:
-        release_policy.ensure_live_orders_allowed()
-        rules = self.rules(pair)
-        price = _quantize_price(new_stop, rules.price_decimals)
-        limit_price = _quantize_price(price * (Decimal(1) - STOP_BUFFER), rules.price_decimals)
-        symbol = wire_symbol(pair)
-        for order in self._stop_orders(pair):
-            self._signed_post(
-                "/v2/supplement/cancel_order.do",
-                {"symbol": symbol, "orderId": order.id},
-            )
-            self._signed_post(
-                "/v2/supplement/create_order.do",
-                {
-                    "symbol": symbol,
-                    "type": "sell",
-                    "price": format(limit_price, "f"),
-                    "amount": format(order.qty, "f"),
-                    "custom_id": order.coid if order.coid.endswith("-stop") else f"{order.coid}-stop",
-                },
-            )
+        _refuse_order_change()
 
     def order_by_coid(self, coid: str) -> OpenOrder | None:
-        ref = self._recent.get(coid)
-        if ref is None:
-            return None
-        return OpenOrder(
-            id=ref.id,
-            coid=ref.coid,
-            pair=ref.pair,
-            side=ref.side,
-            qty=ref.qty,
-            stop_price=ref.stop_price,
-        )
+        return next((order for order in self._pending_orders() if order.coid == coid), None)
 
     def check_key(self) -> KeyPerms:
-        payload = self._signed_post("/v2/supplement/user_info_account.do", {})
-        if not _accepted(payload):
-            raise TypeError("lbank account response missing")
-        data = payload.get("data") if isinstance(payload, dict) else None
+        data = self._signed_read(_KEY_PERMISSIONS_PATH, {})
         if not isinstance(data, dict):
-            raise TypeError("lbank account response missing")
-        if data.get("canWithdraw") is True:
+            raise TypeError("lbank API key permissions response is incomplete")
+        can_withdraw = data.get("enableWithdrawals")
+        if can_withdraw is True:
             raise WithdrawCapableError("lbank key can withdraw; trade-only keys refused")
-        return KeyPerms(can_trade=data.get("canTrade") is not False, can_withdraw=False)
+        can_trade = data.get("enableSpotTrading")
+        if can_withdraw is not False or not isinstance(can_trade, bool):
+            raise TypeError("lbank API key permissions response is incomplete")
+        return KeyPerms(can_trade=can_trade, can_withdraw=False)
 
-    def _stop_orders(self, pair: str) -> list[OpenOrder]:
-        payload = self._signed_post(
-            "/v2/supplement/orders_info_no_deal.do",
-            {"symbol": wire_symbol(pair), "current_page": "1", "page_length": "200"},
+    def _pending_orders(self) -> list[OpenOrder]:
+        data = self._signed_read(
+            _PENDING_ORDERS_PATH,
+            {"symbol": WIRE_SYMBOL, "current_page": "1", "page_length": "200"},
         )
-        return [order for order in _parse_orders(payload) if order.pair == pair and order.coid.endswith("-stop")]
-
-    def _ask(self, symbol: str) -> Decimal | None:
-        payload = self._public_get("/v2/supplement/ticker/bookTicker.do", {"symbol": symbol})
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if isinstance(data, dict):
-            raw = data.get("askPrice")
-            if raw not in (None, ""):
-                return Decimal(str(raw))
-        return None
+        return _parse_orders(data)
 
     def _public_get(self, path: str, params: dict[str, str] | None = None) -> Any:
         query = urllib.parse.urlencode(params or {})
         url = f"{BASE_URL}{path}" if not query else f"{BASE_URL}{path}?{query}"
         return self._transport.get(url, {})
 
-    def _signed_post(self, path: str, extra: dict[str, str]) -> Any:
+    def _signed_read(self, path: str, extra: dict[str, str]) -> Any:
+        if path not in {_ACCOUNT_PATH, _PENDING_ORDERS_PATH, _FILLS_PATH, _KEY_PERMISSIONS_PATH}:
+            raise ValueError("lbank: unsupported account query")
         echostr = self._echo_fn()
         if not echostr.isalnum() or not 30 <= len(echostr) <= 40:
             raise ValueError("lbank echostr must be 30 to 40 letters or digits")
-        params = {
-            "api_key": self._key_id,
-            "signature_method": "HmacSHA256",
-            "timestamp": str(self._now_fn()),
-            "echostr": echostr,
-            **extra,
-        }
-        signature = sign_lbank(self._api_secret, params)
+        params = {"api_key": self._key_id, **extra}
+        auth = {"timestamp": str(self._now_fn()), "signature_method": "HmacSHA256", "echostr": echostr}
+        signature = sign_lbank(self._api_secret, {**params, **auth})
         body = {**params, "sign": signature}
-        headers = {
-            "content-type": "application/x-www-form-urlencoded",
-            "timestamp": params["timestamp"],
-            "signature_method": params["signature_method"],
-            "echostr": echostr,
-        }
-        return self._transport.post(f"{BASE_URL}{path}", body, headers)
+        headers = {"content-type": "application/x-www-form-urlencoded", **auth}
+        response = self._transport.post(f"{BASE_URL}{path}", body, headers)
+        if not _accepted(response):
+            raise RuntimeError("lbank: account data request failed")
+        return response.get("data")
 
 
 def _accuracy_row(payload: Any, symbol: str) -> dict:
@@ -383,13 +249,6 @@ def _accuracy_row(payload: Any, symbol: str) -> dict:
     raise ValueError(f"lbank accuracy has no symbol {symbol!r}")
 
 
-def _reject_size(qty: Decimal, rules: PairRules, price: Decimal | None) -> None:
-    if qty < rules.ordermin:
-        raise ValueError("qty below ordermin")
-    if price is not None and qty * price < rules.costmin:
-        raise ValueError("notional below costmin")
-
-
 def _accepted(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -400,18 +259,10 @@ def _accepted(payload: Any) -> bool:
     return code in (None, 0, "0")
 
 
-def _order_id(payload: Any) -> str:
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if isinstance(data, dict):
-        return str(data.get("order_id") or data.get("orderId") or "")
-    return ""
-
-
-def _parse_balances(payload: Any) -> list[Balance]:
-    data = payload.get("data") if isinstance(payload, dict) else None
+def _parse_balances(data: Any) -> list[Balance]:
     rows = data.get("balances") if isinstance(data, dict) else None
     if not isinstance(rows, list):
-        return []
+        raise TypeError("lbank: malformed account balances")
     out: list[Balance] = []
     for raw in rows:
         if not isinstance(raw, dict) or "asset" not in raw:
@@ -424,11 +275,10 @@ def _parse_balances(payload: Any) -> list[Balance]:
     return out
 
 
-def _parse_orders(payload: Any) -> list[OpenOrder]:
-    data = payload.get("data") if isinstance(payload, dict) else None
+def _parse_orders(data: Any) -> list[OpenOrder]:
     rows = data.get("orders") if isinstance(data, dict) else None
     if not isinstance(rows, list):
-        return []
+        raise TypeError("lbank: malformed pending orders")
     out: list[OpenOrder] = []
     for raw in rows:
         if not isinstance(raw, dict):
@@ -439,7 +289,6 @@ def _parse_orders(payload: Any) -> list[OpenOrder]:
         kind = str(raw.get("type") or "")
         side = "buy" if kind.startswith("buy") else "sell"
         coid = str(raw.get("clientOrderId") or raw.get("custom_id") or "")
-        price = Decimal(str(raw.get("price") or "0"))
         out.append(
             OpenOrder(
                 id=str(raw.get("orderId") or ""),
@@ -447,16 +296,15 @@ def _parse_orders(payload: Any) -> list[OpenOrder]:
                 pair=pack_pair(str(raw.get("symbol") or "")),
                 side=side,
                 qty=Decimal(str(raw.get("origQty") or "0")),
-                stop_price=price if coid.endswith("-stop") else None,
+                stop_price=None,
             )
         )
     return out
 
 
-def _parse_fills(payload: Any) -> list[Fill]:
-    data = payload.get("data") if isinstance(payload, dict) else None
+def _parse_fills(data: Any) -> list[Fill]:
     if not isinstance(data, list):
-        return []
+        raise TypeError("lbank: malformed transaction history")
     out: list[Fill] = []
     for raw in data:
         if not isinstance(raw, dict):

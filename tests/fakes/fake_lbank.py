@@ -23,12 +23,6 @@ _DEFAULT_ACCURACY = {
     ],
 }
 
-_DEFAULT_BOOK = {
-    "result": "true",
-    "error_code": 0,
-    "data": {"symbol": "btc_usdt", "askPrice": "100000", "bidPrice": "99990"},
-}
-
 _DEFAULT_ACCOUNT = {
     "result": "true",
     "error_code": 0,
@@ -37,8 +31,6 @@ _DEFAULT_ACCOUNT = {
             {"asset": "usdt", "free": "1000", "locked": "0"},
             {"asset": "btc", "free": "0", "locked": "0"},
         ],
-        "canTrade": True,
-        "canWithdraw": False,
     },
 }
 
@@ -60,14 +52,14 @@ class FakeLbankTransport:
         self,
         *,
         accuracy: dict | None = None,
-        book: dict | None = None,
         account: dict | None = None,
+        permissions: dict | None = None,
         orders: list | None = None,
         fills: list | None = None,
     ) -> None:
         self._accuracy = accuracy if accuracy is not None else dict(_DEFAULT_ACCURACY)
-        self._book = book if book is not None else dict(_DEFAULT_BOOK)
         self._account = account if account is not None else dict(_DEFAULT_ACCOUNT)
+        self._permissions = permissions
         self._orders = list(orders) if orders is not None else []
         self._fills = list(fills) if fills is not None else []
         self.calls: list[RecordedCall] = []
@@ -77,9 +69,7 @@ class FakeLbankTransport:
         path = urlparse(url).path
         if path.endswith("/v2/accuracy.do"):
             return dict(self._accuracy)
-        if path.endswith("/v2/supplement/ticker/bookTicker.do"):
-            return dict(self._book)
-        return {"result": "true", "error_code": 0, "data": []}
+        raise AssertionError(f"unexpected LBank GET {path}")
 
     def post(self, url: str, body: dict | list | None, headers: dict[str, str]) -> dict:
         self.calls.append(RecordedCall(method="POST", url=url, headers=dict(headers), body=body))
@@ -90,8 +80,6 @@ class FakeLbankTransport:
             return {"result": "true", "error_code": 0, "data": {"orders": list(self._orders), "current_page": 1}}
         if path.endswith("/v2/supplement/transaction_history.do"):
             return {"result": "true", "error_code": 0, "data": list(self._fills)}
-        if path.endswith("/v2/supplement/create_order.do"):
-            return {"result": "true", "error_code": 0, "data": {"order_id": "ord-1", "symbol": "btc_usdt"}}
-        if path.endswith("/v2/supplement/cancel_order.do"):
-            return {"result": "true", "error_code": 0, "data": {"status": 0}}
-        return {"result": "true", "error_code": 0, "data": {}}
+        if path.endswith("/v2/supplement/api_Restrictions.do") and self._permissions is not None:
+            return dict(self._permissions)
+        raise AssertionError(f"unexpected LBank POST {path}")

@@ -1038,7 +1038,9 @@ def _fee_bps_for_venue(venue: str) -> int:
         return 0
     if venue == "xt":
         return 20
-    if venue == "lbank":
+    if venue == "mexc":
+        return 5
+    if venue in {"deepcoin", "lbank"}:
         return 10
     return 0
 

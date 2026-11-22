@@ -73,6 +73,17 @@ TOOBIT_TAKER_BPS = 0
 # The help-center special-mechanism table (updated 2025-12-29) lists the
 # same taker rate. Pinned at 20 bps. Futures fees are not used.
 XT_TAKER_BPS = 20
+
+# MEXC's public BTCUSDT symbol publishes takerCommission 0.0005 (0.05%).
+# The official fee page lists the same standard spot taker. Pinned at 5 bps.
+# The MX deduction is not applied. Futures fees are not used.
+MEXC_TAKER_BPS = 5
+
+# Deepcoin's public spot schedule lists a 0.10% taker. The 2025-11-26
+# fee notice keeps BTC/USDT at 0.10%. Pinned at 10 bps. Futures fees
+# are not used.
+DEEPCOIN_TAKER_BPS = 10
+
 # LBank's support article on spot fee vouchers states that BTC/USDT's
 # original maker and taker rate is 0.10%. Pinned at 10 bps. Futures
 # fees are not used.
@@ -105,6 +116,10 @@ def _fee_bps_for(venue: str) -> int:
         return TOOBIT_TAKER_BPS
     if venue == "xt":
         return XT_TAKER_BPS
+    if venue == "mexc":
+        return MEXC_TAKER_BPS
+    if venue == "deepcoin":
+        return DEEPCOIN_TAKER_BPS
     if venue == "lbank":
         return LBANK_TAKER_BPS
     return COINBASE_TAKER_BPS
@@ -113,11 +128,24 @@ def _fee_bps_for(venue: str) -> int:
 def _seed_quote_asset(venue: str) -> str:
     """Quote asset used when seeding paper starting cash for a venue.
 
-    Binance, Bybit, Ourbit, Toobit, and XT wave paper markets are USDT-quoted (``BTCUSDT``).
-    Gate, Pionex, OKX, KuCoin, and LBank wave paper markets are USDT-quoted (``BTC-USDT``).
+    Binance, Bybit, Ourbit, Toobit, XT, and MEXC wave paper markets are USDT-quoted (``BTCUSDT``).
+    Gate, Pionex, OKX, KuCoin, Deepcoin, and LBank wave paper markets are USDT-quoted (``BTC-USDT``).
     Kraken and Coinbase wave paper markets seed ``USD``.
     """
-    if venue in {"binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt", "lbank"}:
+    if venue in {
+        "binance",
+        "gate",
+        "pionex",
+        "okx",
+        "bybit",
+        "kucoin",
+        "ourbit",
+        "toobit",
+        "xt",
+        "mexc",
+        "deepcoin",
+        "lbank",
+    }:
         return "USDT"
     return "USD"
 
