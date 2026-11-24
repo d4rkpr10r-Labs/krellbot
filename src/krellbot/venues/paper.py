@@ -98,6 +98,10 @@ BITGET_TAKER_BPS = 10
 # Pinned at 20 bps. The 25% HTX-token discount is not applied. Futures
 # fees are not used. huobi is the same family, not a second id.
 HTX_TAKER_BPS = 20
+# BTCC's public spot schedule lists taker at 0.30% for every user.
+# The public BTCUSDT market record publishes taker_fee 0.0030.
+# Pinned at 30 bps. Futures VIP fees are not used.
+BTCC_TAKER_BPS = 30
 SLIPPAGE_BPS = 5
 
 
@@ -136,13 +140,15 @@ def _fee_bps_for(venue: str) -> int:
         return BITGET_TAKER_BPS
     if venue == "htx":
         return HTX_TAKER_BPS
+    if venue == "btcc":
+        return BTCC_TAKER_BPS
     return COINBASE_TAKER_BPS
 
 
 def _seed_quote_asset(venue: str) -> str:
     """Quote asset used when seeding paper starting cash for a venue.
 
-    Binance, Bybit, Ourbit, Toobit, XT, MEXC, Bitget, and HTX wave paper markets are USDT-quoted (``BTCUSDT``).
+    Binance, Bybit, Ourbit, Toobit, XT, MEXC, Bitget, HTX, and BTCC wave paper markets are USDT-quoted (``BTCUSDT``).
     Gate, Pionex, OKX, KuCoin, Deepcoin, and LBank wave paper markets are USDT-quoted (``BTC-USDT``).
     Kraken and Coinbase wave paper markets seed ``USD``.
     """
@@ -161,6 +167,7 @@ def _seed_quote_asset(venue: str) -> str:
         "lbank",
         "bitget",
         "htx",
+        "btcc",
     }:
         return "USDT"
     return "USD"

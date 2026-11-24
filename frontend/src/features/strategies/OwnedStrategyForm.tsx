@@ -89,6 +89,7 @@ const VENUE_LABELS: Record<Venue, string> = {
   lbank: "LBank (paper)",
   bitget: "Bitget (paper)",
   htx: "HTX (paper)",
+  btcc: "BTCC (paper)",
 };
 
 const STOP_KIND_LABELS: Record<StopKind, string> = {

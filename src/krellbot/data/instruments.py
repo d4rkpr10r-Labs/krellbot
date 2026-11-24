@@ -93,6 +93,8 @@ PAPER_WAVE_LBANK_BTC_USDT = "BTC-USDT"
 PAPER_WAVE_BITGET_BTC_USDT = "BTCUSDT"
 # Wave HTX BTC/USDT pack pair. The public symbol is ``btcusdt``.
 PAPER_WAVE_HTX_BTC_USDT = "BTCUSDT"
+# Wave BTCC BTC/USDT symbol. The public market name is this concatenated spelling.
+PAPER_WAVE_BTCC_BTC_USDT = "BTCUSDT"
 
 
 SCHEMA_VERSION = "1"
@@ -136,6 +138,7 @@ DEEPCOIN_PAPER_MIN_NOTIONAL = "1"
 LBANK_ACCURACY_URL = "https://api.lbank.info/v2/accuracy.do"
 BITGET_SYMBOLS_URL = "https://api.bitget.com/api/v2/spot/public/symbols"
 HTX_MARKET_SYMBOLS_URL = "https://api.htx.com/v1/settings/common/market-symbols"
+BTCC_MARKET_LIST_URL = "https://www.btcc.com/btcc_trade/market/list"
 
 SNAPSHOT_FILENAME = "instrument-rules.json"
 
@@ -232,6 +235,7 @@ class InstrumentRulesV1:
             "lbank",
             "bitget",
             "htx",
+            "btcc",
         ):
             raise ValueError(f"instrument: unsupported venue {self.venue!r}")
 
@@ -316,6 +320,8 @@ class InstrumentMetadataClient:
             return self._fetch_bitget(canonical_pair)
         if venue == "htx":
             return self._fetch_htx(canonical_pair)
+        if venue == "btcc":
+            return self._fetch_btcc(canonical_pair)
         raise InstrumentMetadataError(
             METADATA_UNAVAILABLE,
             venue,
@@ -1860,6 +1866,111 @@ class InstrumentMetadataClient:
             usable_until=usable_until,
         )
 
+    # ---- BTCC public instrument metadata ----
+
+    def _fetch_btcc(self, canonical_pair: str) -> InstrumentRulesV1:
+        symbol = canonical_pair.replace("-", "").replace("_", "").upper()
+        payload = self._transport.get(BTCC_MARKET_LIST_URL, {}) or {}
+        if not isinstance(payload, dict):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "btcc",
+                canonical_pair,
+                "instrument: btcc market list body is not a JSON object",
+            )
+        if str(payload.get("code")) != "0":
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "btcc",
+                canonical_pair,
+                "instrument: btcc market list refused the request",
+            )
+        row = _find_btcc_record(payload, symbol)
+        if row is None:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "btcc",
+                canonical_pair,
+                "instrument: btcc market list response did not contain the requested symbol",
+            )
+        if row.get("switch") is not True:
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "btcc",
+                canonical_pair,
+                "instrument: btcc symbol is not online",
+            )
+        venue_symbol = str(row.get("name") or "")
+        if venue_symbol != symbol:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "btcc",
+                canonical_pair,
+                "instrument: btcc market list returned a different symbol than requested",
+            )
+        try:
+            quantity_precision = int(str(row["stock_prec"]))
+            price_precision = int(str(row["money_prec"]))
+            min_trade = Decimal(str(row.get("min_amount") or "0"))
+            min_quantity = _decimals_to_increment(quantity_precision)
+            if min_trade > 0:
+                min_quantity = format(min_trade, "f")
+            quantity_increment = _decimals_to_increment(quantity_precision)
+            price_increment = _decimals_to_increment(price_precision)
+            min_notional_raw = Decimal(str(row.get("min_order_value") or "0"))
+            min_notional = format(min_notional_raw, "f") if min_notional_raw > 0 else "1"
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "btcc",
+                canonical_pair,
+                "instrument: btcc market list payload missing required fields",
+            ) from exc
+        if (
+            Decimal(min_quantity) <= 0
+            or Decimal(min_notional) <= 0
+            or Decimal(quantity_increment) <= 0
+            or Decimal(price_increment) <= 0
+        ):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "btcc",
+                canonical_pair,
+                "instrument: btcc minima and increments must be positive",
+            )
+        base_asset = str(row.get("stock") or "").upper()
+        quote_asset = str(row.get("money") or "").upper()
+        if not base_asset or not quote_asset:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "btcc",
+                canonical_pair,
+                "instrument: btcc market list missing base or quote",
+            )
+        retrieved_at = _unix_to_iso(self._clock())
+        usable_until = _unix_to_iso(self._clock() + self._ttl_seconds)
+        payload_bytes = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        return InstrumentRulesV1(
+            schema_version=SCHEMA_VERSION,
+            venue="btcc",
+            canonical_pair=canonical_pair,
+            venue_symbol=venue_symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            min_quantity=min_quantity,
+            min_notional=min_notional,
+            quantity_increment=quantity_increment,
+            price_increment=price_increment,
+            source={
+                "endpoint": BTCC_MARKET_LIST_URL,
+                "retrieved_at": retrieved_at,
+                "source_version": payload_sha256[:16],
+                "payload_sha256": payload_sha256,
+            },
+            usable_until=usable_until,
+        )
+
 
 # ---- snapshot ----------------------------------------------------------
 
@@ -2267,6 +2378,21 @@ def _find_htx_symbol(payload: dict, symbol: str) -> dict | None:
     if isinstance(data, list):
         for item in data:
             if isinstance(item, dict) and str(item.get("symbol") or item.get("sc") or "") == symbol:
+                return item
+    return None
+
+
+def _find_btcc_record(payload: dict, symbol: str) -> dict | None:
+    """Return the market-list row whose ``name`` is ``symbol``."""
+    data = payload.get("data")
+    records = None
+    if isinstance(data, dict):
+        records = data.get("records")
+    elif isinstance(data, list):
+        records = data
+    if isinstance(records, list):
+        for item in records:
+            if isinstance(item, dict) and str(item.get("name") or "") == symbol:
                 return item
     return None
 

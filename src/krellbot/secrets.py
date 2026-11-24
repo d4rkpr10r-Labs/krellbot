@@ -35,6 +35,7 @@ VENUES = {
     "lbank",
     "bitget",
     "htx",
+    "btcc",
 }
 
 

@@ -231,6 +231,7 @@ _PAPER_TAKER_BPS = {
     "lbank": 10,
     "bitget": 10,
     "htx": 20,
+    "btcc": 30,
 }
 
 

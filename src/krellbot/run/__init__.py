@@ -1044,6 +1044,8 @@ def _fee_bps_for_venue(venue: str) -> int:
         return 10
     if venue == "htx":
         return 20
+    if venue == "btcc":
+        return 30
     return 0
 
 

@@ -36,6 +36,7 @@ PAPER_ONLY_VENUES: Final[frozenset[str]] = frozenset(
         "lbank",
         "bitget",
         "htx",
+        "btcc",
     }
 )
 

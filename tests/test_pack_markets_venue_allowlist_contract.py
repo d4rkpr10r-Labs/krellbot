@@ -38,6 +38,7 @@ DOCUMENTED_PACK_MARKET_VENUES = frozenset(
         "lbank",
         "bitget",
         "htx",
+        "btcc",
     }
 )
 
