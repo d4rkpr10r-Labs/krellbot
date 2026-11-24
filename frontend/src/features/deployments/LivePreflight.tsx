@@ -186,6 +186,8 @@ export function LivePreflight(): JSX.Element {
           use paper arm for lbank / BTC-USDT; do not claim qualified LBank live.
           Bitget is paper-only —
           use paper arm for bitget / BTCUSDT; do not claim qualified Bitget live.
+          HTX is paper-only —
+          use paper arm for htx / BTCUSDT; do not claim qualified HTX live.
           BTCC is paper-only —
           use paper arm for btcc / BTCUSDT; do not claim qualified BTCC live.
         </p>
