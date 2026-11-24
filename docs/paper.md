@@ -35,6 +35,18 @@ instrument rules separately. Order simulation remains local. For paper
 venues without a scheduled candle reader, the pinned CSV path is the
 verified end-to-end tick path.
 
+The paper acceptance suite exercises one spot market per registered venue
+using pinned candles and instrument rules. For each market it validates and
+arms a strategy, checks the simulated fill and balance in the workstation,
+and confirms that the release refuses live arming and live ticks.
+
+| Tested pair | Venues |
+| --- | --- |
+| `XXBTZUSD` (BTC/USD) | Kraken |
+| `BTC-USD` | Coinbase |
+| `BTCUSDT` | Binance, Bybit, Ourbit, Toobit, XT, MEXC, Bitget, HTX, BTCC |
+| `BTC-USDT` | Gate, Pionex, OKX, KuCoin, Deepcoin, LBank, Crypto.com |
+
 The tick engine:
 
 1. Acquires `<home>/run/<venue>.lock`. If another tick is already running,

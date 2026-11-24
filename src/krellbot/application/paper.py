@@ -48,6 +48,7 @@ from pathlib import Path
 
 from krellbot import config as kb_config
 from krellbot import secrets as kb_secrets
+from krellbot.data.instruments import PAPER_WAVE_KRAKEN_BTC_USD
 from krellbot.execution import reservations
 from krellbot.pack import lint as kb_pack_lint
 
@@ -191,7 +192,9 @@ def project_owned_position(
         if raw is not None:
             try:
                 if Decimal(str(raw)) > 0:
-                    holdings.append({"symbol": base, "qty": str(raw)})
+                    # The simulator persists Kraken's historical pair-derived balance key.
+                    symbol = "BTC" if venue == "kraken" and pair == PAPER_WAVE_KRAKEN_BTC_USD else base
+                    holdings.append({"symbol": symbol, "qty": str(raw)})
             except (InvalidOperation, ValueError, ArithmeticError):
                 pass
     return {
