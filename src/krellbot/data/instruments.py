@@ -95,6 +95,8 @@ PAPER_WAVE_BITGET_BTC_USDT = "BTCUSDT"
 PAPER_WAVE_HTX_BTC_USDT = "BTCUSDT"
 # Wave BTCC BTC/USDT symbol. The public market name is this concatenated spelling.
 PAPER_WAVE_BTCC_BTC_USDT = "BTCUSDT"
+# Wave Crypto.com BTC/USDT pack pair. The public symbol is ``BTC_USDT``.
+PAPER_WAVE_CRYPTOCOM_BTC_USDT = "BTC-USDT"
 
 
 SCHEMA_VERSION = "1"
@@ -139,6 +141,8 @@ LBANK_ACCURACY_URL = "https://api.lbank.info/v2/accuracy.do"
 BITGET_SYMBOLS_URL = "https://api.bitget.com/api/v2/spot/public/symbols"
 HTX_MARKET_SYMBOLS_URL = "https://api.htx.com/v1/settings/common/market-symbols"
 BTCC_MARKET_LIST_URL = "https://www.btcc.com/btcc_trade/market/list"
+CRYPTOCOM_INSTRUMENTS_URL = "https://api.crypto.com/exchange/v1/public/get-instruments"
+CRYPTOCOM_RISK_URL = "https://api.crypto.com/exchange/v1/public/get-risk-parameters"
 
 SNAPSHOT_FILENAME = "instrument-rules.json"
 
@@ -236,6 +240,7 @@ class InstrumentRulesV1:
             "bitget",
             "htx",
             "btcc",
+            "cryptocom",
         ):
             raise ValueError(f"instrument: unsupported venue {self.venue!r}")
 
@@ -322,6 +327,8 @@ class InstrumentMetadataClient:
             return self._fetch_htx(canonical_pair)
         if venue == "btcc":
             return self._fetch_btcc(canonical_pair)
+        if venue == "cryptocom":
+            return self._fetch_cryptocom(canonical_pair)
         raise InstrumentMetadataError(
             METADATA_UNAVAILABLE,
             venue,
@@ -1971,6 +1978,127 @@ class InstrumentMetadataClient:
             usable_until=usable_until,
         )
 
+    # ---- CRYPTOCOM public instrument metadata ----
+
+    def _fetch_cryptocom(self, canonical_pair: str) -> InstrumentRulesV1:
+        symbol = canonical_pair.replace("-", "_").upper()
+        payload = self._transport.get(CRYPTOCOM_INSTRUMENTS_URL, {}) or {}
+        if not isinstance(payload, dict):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "cryptocom",
+                canonical_pair,
+                "instrument: cryptocom instruments body is not a JSON object",
+            )
+        if str(payload.get("code")) != "0":
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "cryptocom",
+                canonical_pair,
+                "instrument: cryptocom instruments refused the request",
+            )
+        row = _find_cryptocom_instrument(payload, symbol)
+        if row is None:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "cryptocom",
+                canonical_pair,
+                "instrument: cryptocom instruments response did not contain the requested symbol",
+            )
+        if row.get("tradable") is not True or str(row.get("inst_type") or "") != "CCY_PAIR":
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "cryptocom",
+                canonical_pair,
+                "instrument: cryptocom symbol is not a tradable spot pair",
+            )
+        venue_symbol = str(row.get("symbol") or "")
+        if venue_symbol != symbol:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "cryptocom",
+                canonical_pair,
+                "instrument: cryptocom instruments returned a different symbol than requested",
+            )
+        risk = self._transport.get(CRYPTOCOM_RISK_URL, {}) or {}
+        if not isinstance(risk, dict) or str(risk.get("code")) != "0":
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "cryptocom",
+                canonical_pair,
+                "instrument: cryptocom risk parameters refused the request",
+            )
+        base_asset = str(row.get("base_ccy") or "").upper()
+        quote_asset = str(row.get("quote_ccy") or "").upper()
+        minimum = _cryptocom_min_notional(risk, base_asset)
+        if minimum is None:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "cryptocom",
+                canonical_pair,
+                "instrument: cryptocom risk parameters missing the base minimum",
+            )
+        try:
+            quantity_increment = str(row["qty_tick_size"])
+            price_increment = str(row["price_tick_size"])
+            Decimal(quantity_increment)
+            Decimal(price_increment)
+            min_quantity = quantity_increment
+            min_notional = minimum
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "cryptocom",
+                canonical_pair,
+                "instrument: cryptocom instruments payload missing required fields",
+            ) from exc
+        if (
+            Decimal(min_quantity) <= 0
+            or Decimal(min_notional) <= 0
+            or Decimal(quantity_increment) <= 0
+            or Decimal(price_increment) <= 0
+        ):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "cryptocom",
+                canonical_pair,
+                "instrument: cryptocom minima and increments must be positive",
+            )
+        if not base_asset or not quote_asset:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "cryptocom",
+                canonical_pair,
+                "instrument: cryptocom instruments missing base or quote",
+            )
+        retrieved_at = _unix_to_iso(self._clock())
+        usable_until = _unix_to_iso(self._clock() + self._ttl_seconds)
+        payload_bytes = json.dumps(
+            {"instruments": payload, "risk": risk},
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        return InstrumentRulesV1(
+            schema_version=SCHEMA_VERSION,
+            venue="cryptocom",
+            canonical_pair=canonical_pair,
+            venue_symbol=venue_symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            min_quantity=min_quantity,
+            min_notional=min_notional,
+            quantity_increment=quantity_increment,
+            price_increment=price_increment,
+            source={
+                "endpoint": CRYPTOCOM_INSTRUMENTS_URL,
+                "retrieved_at": retrieved_at,
+                "source_version": payload_sha256[:16],
+                "payload_sha256": payload_sha256,
+            },
+            usable_until=usable_until,
+        )
+
 
 # ---- snapshot ----------------------------------------------------------
 
@@ -2394,6 +2522,31 @@ def _find_btcc_record(payload: dict, symbol: str) -> dict | None:
         for item in records:
             if isinstance(item, dict) and str(item.get("name") or "") == symbol:
                 return item
+    return None
+
+
+def _find_cryptocom_instrument(payload: dict, symbol: str) -> dict | None:
+    """Return the instruments row whose ``symbol`` is ``symbol``."""
+    result = payload.get("result")
+    data = result.get("data") if isinstance(result, dict) else None
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and str(item.get("symbol") or "") == symbol:
+                return item
+    return None
+
+
+def _cryptocom_min_notional(payload: dict, base: str) -> str | None:
+    """Return the public minimum quote notional for ``base``."""
+    result = payload.get("result")
+    rows = result.get("base_currency_config") if isinstance(result, dict) else None
+    if not isinstance(rows, list):
+        return None
+    for item in rows:
+        if isinstance(item, dict) and str(item.get("instrument_name") or "") == base:
+            raw = item.get("min_order_notional_usd")
+            if raw not in (None, ""):
+                return str(raw)
     return None
 
 

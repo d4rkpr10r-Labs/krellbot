@@ -190,6 +190,8 @@ export function LivePreflight(): JSX.Element {
           use paper arm for htx / BTCUSDT; do not claim qualified HTX live.
           BTCC is paper-only —
           use paper arm for btcc / BTCUSDT; do not claim qualified BTCC live.
+          Crypto.com is paper-only —
+          use paper arm for cryptocom / BTC-USDT; do not claim qualified Crypto.com live.
         </p>
         <label
           className="kbot-feature__live-preflight-root__field"

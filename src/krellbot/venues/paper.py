@@ -102,6 +102,10 @@ HTX_TAKER_BPS = 20
 # The public BTCUSDT market record publishes taker_fee 0.0030.
 # Pinned at 30 bps. Futures VIP fees are not used.
 BTCC_TAKER_BPS = 30
+# Crypto.com Exchange lists Level 1 spot taker at 0.500% without a CRO
+# balance. Pinned at 50 bps. The CRO-balance discount is not applied.
+# Derivatives fees are not used.
+CRYPTOCOM_TAKER_BPS = 50
 SLIPPAGE_BPS = 5
 
 
@@ -142,6 +146,8 @@ def _fee_bps_for(venue: str) -> int:
         return HTX_TAKER_BPS
     if venue == "btcc":
         return BTCC_TAKER_BPS
+    if venue == "cryptocom":
+        return CRYPTOCOM_TAKER_BPS
     return COINBASE_TAKER_BPS
 
 
@@ -149,7 +155,7 @@ def _seed_quote_asset(venue: str) -> str:
     """Quote asset used when seeding paper starting cash for a venue.
 
     Binance, Bybit, Ourbit, Toobit, XT, MEXC, Bitget, HTX, and BTCC wave paper markets are USDT-quoted (``BTCUSDT``).
-    Gate, Pionex, OKX, KuCoin, Deepcoin, and LBank wave paper markets are USDT-quoted (``BTC-USDT``).
+    Gate, Pionex, OKX, KuCoin, Deepcoin, LBank, and Crypto.com wave paper markets are USDT-quoted (``BTC-USDT``).
     Kraken and Coinbase wave paper markets seed ``USD``.
     """
     if venue in {
@@ -168,6 +174,7 @@ def _seed_quote_asset(venue: str) -> str:
         "bitget",
         "htx",
         "btcc",
+        "cryptocom",
     }:
         return "USDT"
     return "USD"

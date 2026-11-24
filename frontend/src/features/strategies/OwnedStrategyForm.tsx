@@ -90,6 +90,7 @@ const VENUE_LABELS: Record<Venue, string> = {
   bitget: "Bitget (paper)",
   htx: "HTX (paper)",
   btcc: "BTCC (paper)",
+  cryptocom: "Crypto.com (paper)",
 };
 
 const STOP_KIND_LABELS: Record<StopKind, string> = {

@@ -232,6 +232,7 @@ _PAPER_TAKER_BPS = {
     "bitget": 10,
     "htx": 20,
     "btcc": 30,
+    "cryptocom": 50,
 }
 
 
