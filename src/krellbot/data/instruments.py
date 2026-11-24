@@ -91,6 +91,9 @@ PAPER_WAVE_DEEPCOIN_BTC_USDT = "BTC-USDT"
 PAPER_WAVE_LBANK_BTC_USDT = "BTC-USDT"
 # Wave Bitget BTC/USDT symbol. Public symbols use this concatenated spelling.
 PAPER_WAVE_BITGET_BTC_USDT = "BTCUSDT"
+# Wave HTX BTC/USDT pack pair. The public symbol is ``btcusdt``.
+PAPER_WAVE_HTX_BTC_USDT = "BTCUSDT"
+
 
 SCHEMA_VERSION = "1"
 DEFAULT_TTL_SECONDS = 24 * 60 * 60  # 24h
@@ -132,6 +135,7 @@ DEEPCOIN_INSTRUMENTS_URL = "https://api.deepcoin.com/deepcoin/market/instruments
 DEEPCOIN_PAPER_MIN_NOTIONAL = "1"
 LBANK_ACCURACY_URL = "https://api.lbank.info/v2/accuracy.do"
 BITGET_SYMBOLS_URL = "https://api.bitget.com/api/v2/spot/public/symbols"
+HTX_MARKET_SYMBOLS_URL = "https://api.htx.com/v1/settings/common/market-symbols"
 
 SNAPSHOT_FILENAME = "instrument-rules.json"
 
@@ -227,6 +231,7 @@ class InstrumentRulesV1:
             "deepcoin",
             "lbank",
             "bitget",
+            "htx",
         ):
             raise ValueError(f"instrument: unsupported venue {self.venue!r}")
 
@@ -309,6 +314,8 @@ class InstrumentMetadataClient:
             return self._fetch_lbank(canonical_pair)
         if venue == "bitget":
             return self._fetch_bitget(canonical_pair)
+        if venue == "htx":
+            return self._fetch_htx(canonical_pair)
         raise InstrumentMetadataError(
             METADATA_UNAVAILABLE,
             venue,
@@ -1746,6 +1753,113 @@ class InstrumentMetadataClient:
             usable_until=usable_until,
         )
 
+    # ---- internal: HTX -------------------------------------------------
+
+    def _fetch_htx(self, canonical_pair: str) -> InstrumentRulesV1:
+        symbol = canonical_pair.replace("-", "").lower()
+        query = urllib.parse.urlencode({"symbols": symbol})
+        url = f"{HTX_MARKET_SYMBOLS_URL}?{query}"
+        payload = self._transport.get(url, {}) or {}
+        if not isinstance(payload, dict):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "htx",
+                canonical_pair,
+                "instrument: htx market symbols body is not a JSON object",
+            )
+        if str(payload.get("status") or "") != "ok":
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "htx",
+                canonical_pair,
+                "instrument: htx market symbols refused the request",
+            )
+        row = _find_htx_symbol(payload, symbol)
+        if row is None:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "htx",
+                canonical_pair,
+                "instrument: htx market symbols response did not contain the requested symbol",
+            )
+        if str(row.get("state") or "").lower() != "online":
+            raise InstrumentMetadataError(
+                METADATA_UNAVAILABLE,
+                "htx",
+                canonical_pair,
+                "instrument: htx symbol is not online",
+            )
+        venue_symbol = str(row.get("symbol") or row.get("sc") or "")
+        if venue_symbol != symbol:
+            raise InstrumentMetadataError(
+                METADATA_SYMBOL_MISMATCH,
+                "htx",
+                canonical_pair,
+                "instrument: htx market symbols returned a different symbol than requested",
+            )
+        try:
+            quantity_precision = int(str(row["ap"]))
+            price_precision = int(str(row["pp"]))
+            min_trade = Decimal(str(row.get("minoa") or "0"))
+            min_quantity = _decimals_to_increment(quantity_precision)
+            if min_trade > 0:
+                min_quantity = format(min_trade, "f")
+            quantity_increment = _decimals_to_increment(quantity_precision)
+            price_increment = _decimals_to_increment(price_precision)
+            min_notional_raw = Decimal(str(row.get("minov") or "0"))
+            min_notional = format(min_notional_raw, "f") if min_notional_raw > 0 else "1"
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "htx",
+                canonical_pair,
+                "instrument: htx market symbols payload missing required fields",
+            ) from exc
+        if (
+            Decimal(min_quantity) <= 0
+            or Decimal(min_notional) <= 0
+            or Decimal(quantity_increment) <= 0
+            or Decimal(price_increment) <= 0
+        ):
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "htx",
+                canonical_pair,
+                "instrument: htx minima and increments must be positive",
+            )
+        base_asset = str(row.get("bc") or "").upper()
+        quote_asset = str(row.get("qc") or "").upper()
+        if not base_asset or not quote_asset:
+            raise InstrumentMetadataError(
+                METADATA_INVALID,
+                "htx",
+                canonical_pair,
+                "instrument: htx market symbols missing base or quote",
+            )
+        retrieved_at = _unix_to_iso(self._clock())
+        usable_until = _unix_to_iso(self._clock() + self._ttl_seconds)
+        payload_bytes = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        return InstrumentRulesV1(
+            schema_version=SCHEMA_VERSION,
+            venue="htx",
+            canonical_pair=canonical_pair,
+            venue_symbol=venue_symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            min_quantity=min_quantity,
+            min_notional=min_notional,
+            quantity_increment=quantity_increment,
+            price_increment=price_increment,
+            source={
+                "endpoint": HTX_MARKET_SYMBOLS_URL,
+                "retrieved_at": retrieved_at,
+                "source_version": payload_sha256[:16],
+                "payload_sha256": payload_sha256,
+            },
+            usable_until=usable_until,
+        )
+
 
 # ---- snapshot ----------------------------------------------------------
 
@@ -2144,6 +2258,16 @@ def _find_bitget_symbol(payload: dict, canonical_pair: str) -> dict | None:
                 return item
     if isinstance(data, dict) and str(data.get("symbol") or "") == canonical_pair:
         return data
+    return None
+
+
+def _find_htx_symbol(payload: dict, symbol: str) -> dict | None:
+    """Return the market-symbols row whose ``symbol`` is ``symbol``."""
+    data = payload.get("data")
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and str(item.get("symbol") or item.get("sc") or "") == symbol:
+                return item
     return None
 
 
