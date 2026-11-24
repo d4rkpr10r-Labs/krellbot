@@ -8,9 +8,8 @@ paper-only. The pack pair is ``BTCUSDT``. The public symbol is ``btcusdt``.
 
 Auth is Huobi Signature Version 2: base64 HMAC-SHA256 of
 ``METHOD\\nhost\\npath\\nsorted-query``, sent as the ``Signature`` query
-parameter. The key id is ``AccessKeyId``. The signing material is named
-``sign_tag`` so it is not ``api_key``, ``password``, ``secret``, or
-``passphrase``. The request body is not part of the prehash.
+parameter. The key id is ``AccessKeyId``. The API secret is the HMAC key.
+The request body is not part of the prehash.
 
 A market buy sends ``amount`` as quote spend. The protective stop is a
 conditional market sell (``POST /v2/algo-orders``) whose ``stopPrice`` is
@@ -92,17 +91,14 @@ class HttpTransport:
             return json.loads(resp.read().decode("utf-8"))
 
 
-def sign_htx(sign_tag: str, method: str, host: str, path: str, params: dict[str, str]) -> str:
-    """Base64 HMAC-SHA256 of the HTX Signature Version 2 prehash.
-
-    The hashed signing material is named ``sign_tag``. CodeQL treats
-    ``api_key``, ``password``, ``secret``, and ``passphrase`` as passwords
-    passed to SHA256. The query field stays ``AccessKeyId``.
-    """
+def sign_htx(api_secret: str, method: str, host: str, path: str, params: dict[str, str]) -> str:
+    """Authenticate the canonical request using HTX Signature Version 2."""
     encoded = urllib.parse.urlencode(sorted(params.items()))
     prehash = f"{method.upper()}\n{host}\n{path}\n{encoded}"
+    # HTX requires a keyed HMAC over the request. The API secret is the
+    # key, and this digest is a request authenticator rather than a password hash.
     # codeql[py/weak-sensitive-data-hashing]
-    digest = hmac.new(sign_tag.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
+    digest = hmac.new(api_secret.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
     return base64.b64encode(digest).decode("ascii")
 
 
@@ -128,23 +124,21 @@ class HtxVenue:
     ``transport`` is mandatory. Passing ``None`` raises before any signing
     material is registered and before any network call. Order mutations call
     ``release_policy.ensure_live_orders_allowed`` first.
-
-    ``sign_tag`` is the HMAC key. It is stored under that name.
     """
 
     def __init__(
         self,
         key_id: str,
-        sign_tag: str,
+        api_secret: str,
         transport: Transport,
         *,
         now_fn: Callable[[], str] | None = None,
     ) -> None:
         if transport is None:
             raise ValueError("htx: transport is required; None must not silently call the network")
-        sanitize.register_secret(key_id, sign_tag)
+        sanitize.register_secret(key_id, api_secret)
         self._key_id = key_id
-        self._sign_tag = sign_tag
+        self._api_secret = api_secret
         self._transport = transport
         self._now_fn = now_fn or _default_timestamp
         self._recent: dict[str, OrderRef] = {}
@@ -380,7 +374,7 @@ class HtxVenue:
                 "Timestamp": self._now_fn(),
             }
         )
-        query["Signature"] = sign_htx(self._sign_tag, method, API_HOST, path, query)
+        query["Signature"] = sign_htx(self._api_secret, method, API_HOST, path, query)
         return f"{BASE_URL}{path}?{urllib.parse.urlencode(sorted(query.items()))}"
 
 
