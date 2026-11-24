@@ -37,6 +37,8 @@ DOCUMENTED_PACK_MARKET_VENUES = frozenset(
         "deepcoin",
         "lbank",
         "bitget",
+        "htx",
+        "btcc",
         "cryptocom",
     }
 )

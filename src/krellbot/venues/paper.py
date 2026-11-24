@@ -83,7 +83,6 @@ MEXC_TAKER_BPS = 5
 # fee notice keeps BTC/USDT at 0.10%. Pinned at 10 bps. Futures fees
 # are not used.
 DEEPCOIN_TAKER_BPS = 10
-
 # LBank's support article on spot fee vouchers states that BTC/USDT's
 # original maker and taker rate is 0.10%. Pinned at 10 bps. Futures
 # fees are not used.
@@ -95,6 +94,14 @@ LBANK_TAKER_BPS = 10
 # symbols payload publishes takerFeeRate 0.002; that field is not the
 # VIP 0 schedule rate and is not used. Futures fees are not used.
 BITGET_TAKER_BPS = 10
+# HTX's public fee page lists Prime0 spot maker and taker at 0.2000%.
+# Pinned at 20 bps. The 25% HTX-token discount is not applied. Futures
+# fees are not used. huobi is the same family, not a second id.
+HTX_TAKER_BPS = 20
+# BTCC's public spot schedule lists taker at 0.30% for every user.
+# The public BTCUSDT market record publishes taker_fee 0.0030.
+# Pinned at 30 bps. Futures VIP fees are not used.
+BTCC_TAKER_BPS = 30
 # Crypto.com Exchange lists Level 1 spot taker at 0.500% without a CRO
 # balance. Pinned at 50 bps. The CRO-balance discount is not applied.
 # Derivatives fees are not used.
@@ -135,6 +142,10 @@ def _fee_bps_for(venue: str) -> int:
         return LBANK_TAKER_BPS
     if venue == "bitget":
         return BITGET_TAKER_BPS
+    if venue == "htx":
+        return HTX_TAKER_BPS
+    if venue == "btcc":
+        return BTCC_TAKER_BPS
     if venue == "cryptocom":
         return CRYPTOCOM_TAKER_BPS
     return COINBASE_TAKER_BPS
@@ -143,7 +154,7 @@ def _fee_bps_for(venue: str) -> int:
 def _seed_quote_asset(venue: str) -> str:
     """Quote asset used when seeding paper starting cash for a venue.
 
-    Binance, Bybit, Ourbit, Toobit, XT, MEXC, and Bitget wave paper markets are USDT-quoted (``BTCUSDT``).
+    Binance, Bybit, Ourbit, Toobit, XT, MEXC, Bitget, HTX, and BTCC wave paper markets are USDT-quoted (``BTCUSDT``).
     Gate, Pionex, OKX, KuCoin, Deepcoin, LBank, and Crypto.com wave paper markets are USDT-quoted (``BTC-USDT``).
     Kraken and Coinbase wave paper markets seed ``USD``.
     """
@@ -161,6 +172,8 @@ def _seed_quote_asset(venue: str) -> str:
         "deepcoin",
         "lbank",
         "bitget",
+        "htx",
+        "btcc",
         "cryptocom",
     }:
         return "USDT"
