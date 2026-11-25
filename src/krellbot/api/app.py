@@ -2879,9 +2879,11 @@ def create_app(
             )
         events.sort(key=lambda event: event["ts"])
         os_name = platform.system()
+        version_info = release_channel.version_payload()
+        source_commit = version_info.pop("source_commit", None)
         body = {
             "schema_version": SCHEMA_VERSION,
-            "build": {**release_channel.version_payload(), "commit": None},
+            "build": {**version_info, "commit": source_commit},
             "os": os_name if os_name in {"Linux", "Darwin", "Windows"} else "other",
             "scheduler": scheduler_view,
             "events": events[-100:],
