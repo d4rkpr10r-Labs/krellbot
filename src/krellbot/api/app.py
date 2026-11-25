@@ -2818,7 +2818,11 @@ def create_app(
                 write_root=_scheduler_write_root(s),
                 supervisor=_scheduler_supervisor(s),
             )
-            scheduler_view = {"installed": scheduler["installed"], "enabled": scheduler["enabled"]}
+            scheduler_view = {
+                "installed": bool(scheduler["installed"]),
+                "enabled": bool(scheduler["enabled"]),
+                "has_error": bool(scheduler.get("last_error")),
+            }
         except Exception:  # noqa: BLE001 — diagnostics must survive an unavailable scheduler.
             scheduler_view = None
 
@@ -2831,20 +2835,13 @@ def create_app(
         }
         from krellbot import secrets as kb_secrets
 
-        try:
-            armed = kb_config.load_config(s.home).armed
-            paper_markets = {
-                (item.venue, item.pair, item.pack_id): item.armed_at_ts for item in armed if item.mode == "paper"
-            }
-        except (OSError, ValueError, TypeError, KeyError, ArithmeticError):
-            paper_markets = {}
         events = []
         for record in _read_journal_records(s.home):
             venue = record.get("venue")
             if record.get("kind") != "tick" or not isinstance(venue, str) or venue not in kb_secrets.VENUES:
                 continue
             detail = record.get("detail")
-            if not isinstance(detail, dict):
+            if not isinstance(detail, dict) or detail.get("mode") != "paper":
                 continue
             pair = detail.get("pair")
             ts = record.get("ts")
@@ -2852,19 +2849,31 @@ def create_app(
                 continue
             if type(ts) is not int or ts < 0:
                 continue
-            pack = record.get("pack")
-            if not isinstance(pack, str):
-                continue
-            armed_at = paper_markets.get((venue, pair, pack))
-            if armed_at is None or ts < armed_at:
-                continue
             code = _tick_refusal_code(record)
+            reason = detail.get("reason")
+            if detail.get("ensure_stop_failed") is True:
+                classification = "stop_repair_failed"
+            elif detail.get("kill_switch") is True:
+                classification = "kill_switch"
+            elif code:
+                classification = "refused"
+            elif reason in ("fetch_error", "no_candles"):
+                classification = reason
+            elif detail.get("entries_paused") is True:
+                classification = "paused"
+            elif detail.get("entries_blocked") is True:
+                classification = "entries_blocked"
+            elif reason in ("flat", "entry", "exit", "warmup"):
+                classification = reason
+            else:
+                classification = "other"
             events.append(
                 {
                     "ts": ts,
                     "venue": venue,
                     "pair": pair,
                     "source": "journal",
+                    "classification": classification,
                     "refusal_code": code if code in allowed_codes else ("other" if code else None),
                 }
             )

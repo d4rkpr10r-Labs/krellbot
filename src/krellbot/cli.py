@@ -1468,6 +1468,7 @@ def _record_fetch_error(*, venue: str, armed, exc_type_name: str) -> None:
                 "bar_ts": 0,
                 "detail": {
                     "reason": "fetch_error",
+                    "mode": armed.mode,
                     "exception": exc_type_name,
                     "pair": armed.pair,
                 },

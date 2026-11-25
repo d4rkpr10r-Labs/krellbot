@@ -513,6 +513,7 @@ def tick(
                     bar_ts=0,
                     detail={
                         "reason": "live_fenced",
+                        "mode": live_armed.mode,
                         "code": gate_result.code,
                         "pair": live_armed.pair,
                     },
@@ -528,6 +529,7 @@ def tick(
                 bar_ts=0,
                 detail={
                     "reason": "live_refused",
+                    "mode": live_armed.mode,
                     "code": gate_result.code,
                     "pair": live_armed.pair,
                 },
@@ -550,6 +552,7 @@ def tick(
                     bar_ts=0,
                     detail={
                         "reason": "store_refused",
+                        "mode": live_armed.mode,
                         "code": exc.code,
                         "intent_refused": exc.code,
                         "pair": live_armed.pair,
@@ -686,7 +689,12 @@ def tick(
                     venue=venue,
                     pack=armed.pack_id,
                     bar_ts=0,
-                    detail={"reason": "no_candles", "pair": armed.pair, "ensure_stop_failed": ensure_stop_failed},
+                    detail={
+                        "reason": "no_candles",
+                        "mode": armed.mode,
+                        "pair": armed.pair,
+                        "ensure_stop_failed": ensure_stop_failed,
+                    },
                 )
                 continue
 
@@ -873,6 +881,7 @@ def tick(
                 bar_ts=bar_ts,
                 detail={
                     "pair": armed.pair,
+                    "mode": armed.mode,
                     "reason": target.reason,
                     "entry_qty": str(entry_qty),
                     "exit_qty": str(exit_qty),

@@ -40,7 +40,7 @@ export function DiagnosticReport(): JSX.Element {
   return (
     <section className="kbot-diagnostic-report" aria-label="Diagnostic report" data-testid="diagnostic-report">
       <h3>Diagnostic report</h3>
-      <p>Preview your build, operating system, scheduler status and recent paper checks before saving a report.</p>
+      <p>Preview your build, operating system, scheduler status and recent paper checks recorded by this build before saving a report.</p>
       <button type="button" onClick={() => void prepare()} disabled={busy}>
         {busy ? "Preparing…" : "Prepare report"}
       </button>
