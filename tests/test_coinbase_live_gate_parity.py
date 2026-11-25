@@ -668,6 +668,87 @@ def test_coinbase_pack_never_touches_external_inventory(home, monkeypatch):
 
 
 @pytest.mark.usefixtures("live_capable_release")
+def test_coinbase_tick_protects_and_books_only_the_partial_fill(home, monkeypatch) -> None:
+    from krellbot.run import tick
+
+    _enable_live(home, monkeypatch)
+    pack_id = "cb-live-partial-fill"
+    _arm_live(home, _write_pack(home, pack_id=pack_id), pack_id=pack_id, starting_cash=Decimal(100))
+    entry = {
+        "success": True,
+        "success_response": {"order_id": "partial-entry", "status": "CANCELLED", "filled_size": "0.5"},
+    }
+    transport = _LiveCoinbaseTransport(post_responses=[entry, _accepted_order(order_id="partial-stop")])
+
+    assert tick(venue=VENUE, venue_obj=_coinbase_venue(transport), reader=lambda *_: _entry_candles(), home=home) == 0
+
+    buy, stop = [call.body for call in _order_posts(transport)]
+    assert buy is not None and stop is not None
+    assert (buy["side"], stop["side"]) == ("BUY", "SELL")
+    requested = buy["order_configuration"]["market_market_ioc"]["base_size"]
+    assert Decimal(requested) > Decimal("0.5")
+    protected = stop["order_configuration"]["stop_limit_stop_limit_gtc"]["base_size"]
+    assert Decimal(protected) == Decimal("0.5")
+    assert load_config(home).armed[0].owned_qty == Decimal("0.5")
+    ledger = OperationalStore(home / "ops.sqlite").read_ledger()
+    assert [json.loads(payload) for _, kind, payload in ledger if kind == "partial_fill"] == [
+        {"coid": buy["client_order_id"], "requested": requested, "filled": "0.5"}
+    ]
+
+
+@pytest.mark.usefixtures("live_capable_release")
+def test_coinbase_rejected_entry_stop_requires_reconcile_and_fences_a_new_buy(home, monkeypatch) -> None:
+    from krellbot.journal import read_records_lenient
+    from krellbot.run import tick
+
+    _enable_live(home, monkeypatch)
+    pack_id = "cb-live-stop-rejected"
+    _arm_live(home, _write_pack(home, pack_id=pack_id), pack_id=pack_id)
+    entry = {"success": True, "success_response": {"order_id": "filled-entry", "status": "FILLED"}}
+    transport = _LiveCoinbaseTransport(post_responses=[entry, _load_fixture("order_minimum_not_met")])
+
+    assert tick(venue=VENUE, venue_obj=_coinbase_venue(transport), reader=lambda *_: _entry_candles(), home=home) == 0
+
+    buy, stop = [call.body for call in _order_posts(transport)]
+    assert buy is not None and stop is not None
+    assert (buy["side"], stop["side"]) == ("BUY", "SELL")
+    store = OperationalStore(home / "ops.sqlite")
+    ledger = store.read_ledger()
+    assert [json.loads(payload)["coid"] for _, kind, payload in ledger if kind == "needs_reconcile"] == [
+        buy["client_order_id"]
+    ]
+    assert [json.loads(payload)["sent"] for _, kind, payload in ledger if kind == "outbox"] == [False]
+    assert read_records_lenient(home)[-1]["detail"]["ensure_stop_failed"] is True
+
+    # Restart with a new entry signal whose client order ID would also be new.
+    restarted = _LiveCoinbaseTransport(accounts=_accounts(btc="1"))
+    candles = [_candle(3_600_000, "10"), _candle(7_200_000, "10"), _candle(10_800_000, "12")]
+    assert tick(venue=VENUE, venue_obj=_coinbase_venue(restarted), reader=lambda *_: candles, home=home) == 0
+    assert _order_posts(restarted) == []
+
+
+@pytest.mark.usefixtures("live_capable_release")
+def test_coinbase_next_tick_reprobes_revoked_trade_permission(home, monkeypatch, fresh_keyring) -> None:
+    from krellbot.cli import cmd_tick
+
+    _enable_live(home, monkeypatch)
+    _store_coinbase_key(fresh_keyring)
+    pack_id = "cb-live-revoked-permission"
+    _arm_live(home, _write_pack(home, pack_id=pack_id), pack_id=pack_id)
+    permissions = {"can_view": True, "can_trade": True, "can_transfer": False}
+    transport = _LiveCoinbaseTransport(key_permissions=permissions)
+
+    assert cmd_tick(["--venue", VENUE], fetch=lambda *_: [], transport=transport) == 0
+    assert any(call.method == "GET" and call.url.endswith("/key_permissions") for call in transport.calls)
+    assert any(call.method == "GET" and call.url.endswith("/accounts") for call in transport.calls)
+    transport.calls.clear()
+
+    permissions["can_trade"] = False
+    assert cmd_tick(["--venue", VENUE], fetch=lambda *_: _entry_candles(), transport=transport) == 1
+    assert [(call.method, call.url.rsplit("/", 1)[-1]) for call in transport.calls] == [("GET", "key_permissions")]
+
+
+@pytest.mark.usefixtures("live_capable_release")
 def test_coinbase_unknown_outcome_reconciles_without_resubmit(home, monkeypatch):
     from krellbot.run import coid_for, tick
     from krellbot.storage.outbox import Outbox

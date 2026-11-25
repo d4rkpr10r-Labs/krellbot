@@ -29,7 +29,7 @@ from krellbot.doctor import TICK_STALE_SECONDS
 HOUR_SECONDS = 3600
 # "Gap over two hours" — strictly greater than the doctor stale threshold.
 MAX_GAP_SECONDS = TICK_STALE_SECONDS
-STALE_DATA_REASON = "stale_data"
+MARKET_DATA_FAILURES = frozenset({"stale_data", "fetch_error", "check_incomplete", "no_candles"})
 WAKE_GAP_EVENT = "wake_gap"
 OPS_DB_FILENAME = "ops.sqlite"
 # Pack-evaluator outcomes journalled on a successful tick (see pack.evaluate).
@@ -95,14 +95,8 @@ def _tick_timestamps(records: list[dict]) -> list[int]:
     return sorted(stamps)
 
 
-def _stale_alert_hours(records: list[dict], *, start: int, end: int) -> set[int]:
-    """Hours that carry a stale-data alert inside ``[start, end)``.
-
-    Sources (journal only):
-
-    * ``kind=tick`` with ``detail.reason == \"stale_data\"``
-    * ``kind=supervision`` with ``detail.event == \"wake_gap\"``
-    """
+def _market_data_failure_hours(records: list[dict], *, start: int, end: int) -> set[int]:
+    """Hours with an interrupted market check or scheduler wake gap."""
     hours: set[int] = set()
     for rec in records:
         kind = rec.get("kind")
@@ -118,7 +112,8 @@ def _stale_alert_hours(records: list[dict], *, start: int, end: int) -> set[int]
         hour = hour_floor(ts)
         if hour < start or hour >= end:
             continue
-        if (kind == "tick" and detail.get("reason") == STALE_DATA_REASON) or (
+        reason = detail.get("reason")
+        if (kind == "tick" and isinstance(reason, str) and reason in MARKET_DATA_FAILURES) or (
             kind == "supervision" and detail.get("event") == WAKE_GAP_EVENT
         ):
             hours.add(hour)
@@ -228,7 +223,7 @@ def failing_hours(
     if not _has_evaluated_entry_decision(records, start=start, end=end):
         failing.update(hour_starts)
 
-    failing.update(_stale_alert_hours(records, start=start, end=end))
+    failing.update(_market_data_failure_hours(records, start=start, end=end))
     return sorted(failing)
 
 
