@@ -441,3 +441,23 @@ def test_install_txt_documents_unsigned_and_launch_stop() -> None:
     assert "install-krellbot.sh" in low
     assert "python" in low  # used in the "you do NOT need Python" sense
     assert "no developer tools" in low or "development tooling" in low
+
+
+def test_linux_installer_retains_previous_program_for_rollback(tmp_path: Path) -> None:
+    _bash()
+    if not IS_LINUX:
+        pytest.skip("Linux installer rollback is Linux-only")
+    home = tmp_path / "home"
+    home.mkdir()
+    xdg_data = home / ".local" / "share"
+    payload = _make_payload(tmp_path / "source" / "krellbot")
+    installer = payload / "install-krellbot.sh"
+    first = _run_installer(installer, home=home, xdg_data=xdg_data, xdg_config=home / ".config")
+    assert first.returncode == 0, first.stderr
+    installed = xdg_data / "Krellbot"
+    assert not (xdg_data / "Krellbot.old").exists()
+    (payload / "_internal" / "runtime.marker").write_text("updated", encoding="utf-8")
+    second = _run_installer(installer, home=home, xdg_data=xdg_data, xdg_config=home / ".config")
+    assert second.returncode == 0, second.stderr
+    assert (installed / "_internal" / "runtime.marker").read_text(encoding="utf-8") == "updated"
+    assert (xdg_data / "Krellbot.old" / "_internal" / "runtime.marker").read_text(encoding="utf-8") == "payload\n"

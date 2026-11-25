@@ -111,7 +111,6 @@ fi
 # --- install -----------------------------------------------------------------
 
 printf 'Installing Krellbot to: %s\n' "$DEST"
-mkdir -p -- "$DEST" || fail "could not create '$DEST'."
 
 # Copy the full one-dir payload. -a preserves the executable bit on the
 # launcher; the temp-directory dance makes the replacement atomic-ish so
@@ -129,8 +128,6 @@ if ! mv -- "$tmp_dest" "$DEST"; then
     rm -rf -- "$tmp_dest"
     fail "installing the program files failed."
 fi
-rm -rf -- "$DEST.old"
-
 [ -x "$DEST/krellbot" ] || fail "the installed executable is missing after the copy."
 [ -d "$DEST/_internal" ] || fail "the installed runtime folder is missing after the copy."
 
