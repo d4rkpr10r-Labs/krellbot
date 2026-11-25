@@ -86,7 +86,7 @@ test("desktop first-run wizard stays roomy, hands off running paper strategy to 
     "krell_portrait.png",
   );
   await expect(page.getByTestId("first-run-wizard-sentence")).toHaveText(
-    "It’s running on this computer (paper only — not live trading).",
+    "Waiting for the first market check.",
   );
   await page.getByTestId("first-run-wizard-primary").click();
 
@@ -101,7 +101,7 @@ test("desktop first-run wizard stays roomy, hands off running paper strategy to 
     timeout: 15_000,
   });
   await expect(page.getByTestId("app-home-active-paper")).toContainText(
-    /Running: Dual moving average/i,
+    /Waiting: Dual moving average/i,
   );
   await expect(page.getByTestId("app-home-cta-paper")).toHaveText(
     "Open paper run",
@@ -172,7 +172,7 @@ test("mobile 390×844 keeps choose Skip setup inside viewport and renders clean 
   );
   await page.getByTestId("first-run-wizard-primary").click();
   await expect(page.getByTestId("first-run-wizard-sentence")).toHaveText(
-    "It’s running on this computer (paper only — not live trading).",
+    "Waiting for the first market check.",
   );
   await page.getByTestId("first-run-wizard-primary").click();
   await expect(page.getByTestId("first-run-wizard")).toHaveAttribute(

@@ -18,6 +18,7 @@ import {
   type JSX,
 } from "react";
 import type { PaperClient, PaperCommandResult, PaperStatus } from "../paper/client";
+import { paperHealthSentence, usePaperHealth } from "../paper/paperHealth";
 import type { StrategyClient } from "../strategies/client";
 import {
   CONSUMER_STARTER_CARD_ORDER,
@@ -296,6 +297,7 @@ export function FirstRunWizard({
     const index = stepIndexOf(steps, state.stepId);
     return steps[index] ?? steps[0]!;
   }, [steps, state.stepId]);
+  const health = usePaperHealth(activeStep.id === "status" ? paperClient : undefined);
 
   useEffect(() => {
     if (!visible) {
@@ -337,7 +339,7 @@ export function FirstRunWizard({
   const isWin = activeStep.id === "win";
   const statusWired = activeStep.id === "status" && paperClient !== undefined;
   const sentence = statusWired
-    ? honestWizardStatusSentence(statusPhase)
+    ? paperClient?.getHealth ? paperHealthSentence(health) : honestWizardStatusSentence(statusPhase)
     : activeStep.sentence;
   const statusLoading = statusWired && statusPhase.kind === "loading";
   const catalogueLoader = loadStarters ?? fetchStarters;
@@ -637,7 +639,7 @@ export function FirstRunWizard({
             <p
               className="kbot-first-run-wizard__chip"
               data-testid="first-run-wizard-status-chip"
-              data-paper-status={wizardStatusChipKind(statusPhase)}
+              data-paper-status={paperClient?.getHealth ? (health?.state === "checked" || health?.state === "filled" ? "running" : "waiting") : wizardStatusChipKind(statusPhase)}
             >
               {WIZARD_LIVE_TRADING_UNAVAILABLE}
             </p>

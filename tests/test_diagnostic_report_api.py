@@ -175,6 +175,7 @@ def test_stopped_paper_checks_keep_safe_classifications_and_exclude_live(home, m
     journal.mkdir(exist_ok=True)
     details = [
         {"reason": "fetch_error", "exception": "private exchange error"},
+        {"reason": "check_incomplete"},
         {"reason": "no_candles"},
         {"reason": "entry", "ensure_stop_failed": True},
         {"reason": "entry", "kill_switch": True},
@@ -220,6 +221,7 @@ def test_stopped_paper_checks_keep_safe_classifications_and_exclude_live(home, m
     assert report["scheduler"] == {"installed": True, "enabled": False, "has_error": True}
     assert [event["classification"] for event in report["events"]] == [
         "fetch_error",
+        "check_incomplete",
         "no_candles",
         "stop_repair_failed",
         "kill_switch",
@@ -228,7 +230,7 @@ def test_stopped_paper_checks_keep_safe_classifications_and_exclude_live(home, m
         "flat",
         "other",
     ]
-    assert [event["ts"] for event in report["events"]] == list(range(1, 9))
+    assert [event["ts"] for event in report["events"]] == list(range(1, 10))
 
 
 def test_engine_journal_records_distinguish_paper_and_live(home, fresh_keyring):

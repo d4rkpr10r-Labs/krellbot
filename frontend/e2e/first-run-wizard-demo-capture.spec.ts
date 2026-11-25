@@ -134,14 +134,14 @@ test("capture Krell first-run wizard demo frames", async ({ journey }) => {
     .toBe("status");
   await expectWizardOnly(page, "status");
   await expect(page.getByTestId("first-run-wizard-sentence")).toContainText(
-    /running on this computer/i,
+    /waiting for the first market check/i,
   );
   await expect(page.getByTestId("first-run-wizard-status-chip")).toContainText(
     /Live trading unavailable/i,
   );
   await expect(page.getByTestId("first-run-wizard-status-chip")).toHaveAttribute(
     "data-paper-status",
-    "running",
+    "waiting",
   );
   await expect(page.getByTestId("first-run-wizard-primary")).toHaveText(
     "Looks good",
