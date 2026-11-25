@@ -65,8 +65,10 @@ Installs never touch your Krellbot data (KRELLBOT_HOME / ~/.krellbot,
 packs, journal, settings). Upgrading by re-running the installer
 replaces the program files only. On Linux the previous program is
 retained beside the installation in a folder with the suffix `.old`.
-To roll back, close Krellbot and swap the installation folder with that
-previous folder. Your data folder is independent of both.
+Windows retains its previous installation as `Krellbot.old` beside
+`Krellbot` under `%LOCALAPPDATA%`. To roll back, close Krellbot and
+swap the installation folder with its previous folder. Your data folder
+is independent of both.
 
 Command-line use
 ----------------
