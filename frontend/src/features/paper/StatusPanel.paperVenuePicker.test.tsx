@@ -118,3 +118,21 @@ describe("paper venue picker includes binance", () => {
     );
   });
 });
+
+describe("paper market data guidance", () => {
+  it("shows replay instructions and prevents selecting a market absent from the draft", async () => {
+    const client = makeClient({
+      listOwnedDrafts: vi.fn().mockResolvedValue([{
+        revision_id: "rev-okx", strategy_id: "strat", state: "validated", runnable: true,
+        label: "BTC", pair: "BTC-USDT", timeframe: "1h", markets: [{ venue: "okx", pair: "BTC-USDT" }],
+      }]),
+    });
+    render(<StatusPanel client={client} />);
+    await waitFor(() => expect((screen.getByTestId("paper-arm-venue") as HTMLSelectElement).value).toBe("okx"));
+    expect(screen.getByTestId("paper-market-availability").textContent).toMatch(/offline candle replay/i);
+    expect(screen.getByRole("link", { name: /offline replay instructions/i })).toBeTruthy();
+    fireEvent.change(screen.getByTestId("paper-arm-venue"), {target: {value: "kraken"}});
+    expect(screen.getByTestId("paper-market-availability").textContent).toMatch(/no market on the selected exchange/i);
+    expect((screen.getByTestId("paper-arm-submit") as HTMLButtonElement).disabled).toBe(true);
+  });
+});

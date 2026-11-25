@@ -341,3 +341,18 @@
     transform: none;
   }
 }
+
+.kbot-first-run-wizard__market {
+  display: grid;
+  gap: 8px;
+  font-weight: 600;
+}
+.kbot-first-run-wizard__market select {
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--line, #22465d);
+  border-radius: var(--radius-control, 7px);
+  color: var(--text, #e9f0f5);
+  background: var(--navy, #0e1c29);
+  font: inherit;
+}

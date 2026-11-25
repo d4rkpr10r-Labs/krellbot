@@ -11,6 +11,8 @@ test("J5.1 I can arm a validated strategy in paper mode with a starting balance.
   await armPaper(page,"2500");
   await clickNav(page,"Workstation");
   await expect(page.getByTestId("paper-status-entries")).toContainText(/active/i);
+  await expect(page.getByTestId("paper-run-health")).toContainText("Waiting for the first market check.");
+  await expect(page.getByTestId("paper-run-health").getByRole("link", {name: "Review automatic checks"})).toBeVisible();
   await expandArmedRecords(page);
   const row = page.getByTestId("paper-armed-row").first();
   await expect(row).toBeVisible();
