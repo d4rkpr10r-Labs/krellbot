@@ -27,7 +27,7 @@ export function paperHealthSentence(health: PaperHealth | null): string {
     case "no_candles": return "No completed market candles are available yet.";
     case "stale_candles": return "Market data is out of date. Check the feed before relying on this run.";
     case "stale_check": return "The last market check is out of date. Check automatic scheduling.";
-    case "stale_rules": return "Market rules are out of date. Refresh the exchange connection.";
+    case "stale_rules": return "Market rules are out of date. Review automatic checks and retry.";
     case "refused": return "The market check needs attention. Review the run history.";
     default: return "Paper run status is unavailable.";
   }

@@ -128,3 +128,67 @@ def test_zero_quantity_is_not_reported_as_a_fill(armed_health):
     health, tick = armed_health
     tick(100001, "entry", entry_qty="0.00000000")
     assert health()["state"] == "checked"
+
+
+def test_malformed_tick_timestamps_are_ignored(home, armed_health):
+    health, tick = armed_health
+    for value in (float("nan"), float("inf"), True, 10**400):
+        tick(value)
+    assert health()["state"] == "waiting"
+
+
+def test_slow_scheduler_probe_does_not_block_status(home, armed_health, monkeypatch):
+    import asyncio
+    import threading
+
+    from krellbot.service import supervise
+
+    health, _ = armed_health
+    app = health.app
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_scheduler(*args, **kwargs):
+        started.set()
+        release.wait(5)
+        return {"installed": True, "enabled": True, "last_error": None}
+
+    monkeypatch.setattr(supervise, "scheduler_status", slow_scheduler)
+    session = next(iter(app.state.krellbot.sessions))
+
+    async def call(path):
+        response = []
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "server": ("127.0.0.1", 8080),
+            "client": ("127.0.0.1", 12345),
+            "headers": [(b"host", b"127.0.0.1:8080"), (b"cookie", f"krellbot_session={session}".encode())],
+            "root_path": "",
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            response.append(message)
+
+        await app(scope, receive, send)
+        return next(item["status"] for item in response if item["type"] == "http.response.start")
+
+    async def exercise():
+        task = asyncio.create_task(call("/api/v1/paper/health"))
+        try:
+            assert await asyncio.to_thread(started.wait, 2)
+            assert await asyncio.wait_for(call("/api/v1/paper/status"), timeout=1) == 200
+        finally:
+            release.set()
+            await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(exercise())

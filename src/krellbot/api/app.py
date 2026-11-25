@@ -2928,8 +2928,11 @@ def create_app(
                 {"schema_version": SCHEMA_VERSION, "armed": False}, headers={"Cache-Control": "no-store"}
             )
 
-        scheduler = kb_supervise.scheduler_status(
-            s.home, write_root=_scheduler_write_root(s), supervisor=_scheduler_supervisor(s)
+        scheduler = await asyncio.to_thread(
+            kb_supervise.scheduler_status,
+            s.home,
+            write_root=_scheduler_write_root(s),
+            supervisor=_scheduler_supervisor(s),
         )
         records = []
         for record in _read_journal_records(s.home):
@@ -2942,6 +2945,8 @@ def create_app(
                 and isinstance(detail, dict)
                 and detail.get("pair") == armed.pair
                 and isinstance(ts, (int, float))
+                and not isinstance(ts, bool)
+                and 0 < ts < 1_000_000_000_000
                 and ts > armed.armed_at_ts
             ):
                 records.append(record)
@@ -2962,6 +2967,8 @@ def create_app(
             return (
                 timeframe_seconds is not None
                 and isinstance(bar, (int, float))
+                and not isinstance(bar, bool)
+                and 0 <= bar < 1_000_000_000_000_000
                 and 0 <= rec["ts"] * 1000 - bar <= timeframe_seconds * 2000
             )
 
