@@ -96,6 +96,15 @@ paper); paid ads for signals; personalized advice; CLI user features.
 for qualifying a third live venue. The P0–P4 delivery gates and the paper-only
 release policy continue to apply.
 
+## Platform expansion proposal
+
+[M28](milestones/M28.md) proposes reproducible research (run identity,
+dataset manifests, risk metrics, complete sweep trial ledgers,
+walk-forward), verifiable pack evidence, one entitlement read path and
+headless alerts. All of it is local and free. Hosted services, tiers and
+pricing stay owner decisions; see
+[platform-initiative.md](platform-initiative.md) and ADRs 0002–0004.
+
 ## Preserved engineering requirements
 
 - One shared application/domain implementation for GUI and CLI plumbing;

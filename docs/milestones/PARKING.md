@@ -17,3 +17,8 @@ One line per item. Nothing here is work until the owner moves it into a mileston
 - Exchange-native free AI agent tooling parity race — spike only in M22.5; no cloud-key me-too product.
 - Multi-pack reservation / breaking one-pack-per-(venue,pair) before independent qualification (still true post-M16).
 - Learn top-nav / Learn view (Signal artboard) — still do not invent in cockpit.
+- `docs/telemetry.md` does not list the `backup_completed` event that `storage/backup.py` sends when telemetry is on.
+- `SECURITY.md` says the bootstrap token comes from `token_hex(32)`; `api/serve.py` uses `token_urlsafe(32)`.
+- `GET /api/v1/catalogue` returns 502 when the transport fails instead of serving the verified cached catalogue.
+- Canonical-JSON + sha256 is reimplemented in six modules (`backtest/receipt.py`, `packs/launch_family.py`, `strategy_ir/canonical.py`, `strategy_ir/identity.py`, `application/packs.py`, `api/jobs.py`).
+- Paper fee tables are duplicated (`application/paper.py` `_PAPER_TAKER_BPS`, `venues/paper.py` constants, `application/research.py` `_default_fee`).
