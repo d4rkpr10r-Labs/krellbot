@@ -1163,25 +1163,6 @@ def _default_transport():
     return HttpTransport()
 
 
-def _as_validate_transport(transport):
-    """Adapt a venue transport to the paper venue's validate POST protocol."""
-
-    class _Adapter:
-        def post(self, url: str, body: dict, headers: dict) -> dict:
-            return transport.post(url, body, headers)
-
-    return _Adapter()
-
-
-def _key_present(venue: str) -> bool:
-    """True when a key is stored. The key itself is never returned to the caller."""
-    try:
-        kb_secrets.get(venue)
-    except (FileNotFoundError, ValueError, PermissionError):
-        return False
-    return True
-
-
 def _build_paper_rules_provider(home, venue: str):
     """Build the rules provider for `PaperVenue` so a verified snapshot wins.
 
@@ -1391,15 +1372,12 @@ def venue_for_tick(home, armed_list, *, transport, fetch):
             keeps_forming=lambda: price_fetch.keeps_forming,
         )
         _ensure_paper_instrument_rules(home, armed_list, transport=transport)
-        has_key = _key_present(armed.venue)
         venue_obj = PaperVenue(
             armed.venue,
             rules_provider=_build_paper_rules_provider(home, armed.venue),
             candle_reader=price_reader,
             home=home,
             starting_cash=armed.starting_cash,
-            has_stored_key=has_key,
-            validate_transport=_as_validate_transport(transport) if has_key and armed.venue == "kraken" else None,
             clock=_run_now_seconds,
             timeframe_for_pair=_timeframe_for_armed(armed_list),
         )
@@ -1621,15 +1599,12 @@ def _tick_one_venue(
             # call `_ensure_paper_instrument_rules` via `venue_for_tick`.
             # Offline CSVs may include a forming tail; signal path drops it.
             reader = _closed_signal_reader(price_reader, armed_list, clock=_run_now_seconds)
-            has_key = _key_present(armed.venue)
             venue_obj = PaperVenue(
                 armed.venue,
                 rules_provider=_build_paper_rules_provider(home, armed.venue),
                 candle_reader=price_reader,
                 home=home,
                 starting_cash=armed.starting_cash,
-                has_stored_key=has_key,
-                validate_transport=_as_validate_transport(transport) if has_key and armed.venue == "kraken" else None,
                 clock=_run_now_seconds,
                 timeframe_for_pair=_timeframe_for_armed(armed_list),
             )
