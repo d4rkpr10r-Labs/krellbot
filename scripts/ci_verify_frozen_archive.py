@@ -88,9 +88,9 @@ def verify_native_archive(args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory(prefix="krellbot release ") as directory:
         scratch = Path(directory)
         extracted = scratch / "download"
-        if args.platform == "macos":
+        if args.platform == "macos" and signed:
             run("ditto", "-x", "-k", args.archive, extracted)
-        elif args.platform == "linux":
+        elif args.platform in {"linux", "macos"}:
             run("unzip", "-q", args.archive, "-d", extracted)
         else:
             shutil.unpack_archive(args.archive, extracted)

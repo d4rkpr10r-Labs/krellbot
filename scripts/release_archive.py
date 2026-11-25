@@ -313,7 +313,7 @@ def _write_zip(dist: Path, output: Path) -> None:
                 # itself, not by external_attr.
                 mode = 0o644
             else:
-                mode = src.stat().st_mode & 0o7777
+                mode = src.stat().st_mode
             info.external_attr = (mode & 0xFFFF) << 16
             zf.writestr(info, data)
 
@@ -376,7 +376,7 @@ def _write_zip_prefixed(root: Path, output: Path, *, archive_root_name: str) -> 
             if is_windows:
                 mode = 0o644
             else:
-                mode = src.stat().st_mode & 0o7777
+                mode = src.stat().st_mode
             info.external_attr = (mode & 0xFFFF) << 16
             zf.writestr(info, data)
 
