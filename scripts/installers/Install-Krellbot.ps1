@@ -20,7 +20,7 @@ $ErrorActionPreference = 'Stop'
 function Fail([string]$Message) {
     Write-Host ""
     Write-Host "Install refused: $Message"
-    Write-Host "Nothing has been changed."
+    Write-Host "Installation did not complete."
     exit 1
 }
 
@@ -83,8 +83,12 @@ if (Test-Path -LiteralPath $Destination) {
 Write-Host "Installing Krellbot to: $Destination"
 $Staging = "$Destination.updating.$PID"
 $Previous = "$Destination.old"
+$SavedPrevious = "$Destination.old.saved.$PID"
 if (Test-Path -LiteralPath $Staging) {
     Fail "temporary install folder already exists: $Staging"
+}
+if (Test-Path -LiteralPath $SavedPrevious) {
+    Fail "temporary previous installation folder already exists: $SavedPrevious"
 }
 if (Test-Path -LiteralPath $Previous) {
     $PreviousItem = Get-Item -LiteralPath $Previous -Force
@@ -114,7 +118,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $Staging 'krellbot.exe') -PathType L
 
 try {
     if (Test-Path -LiteralPath $Previous) {
-        Remove-Item -LiteralPath $Previous -Recurse -Force
+        Move-Item -LiteralPath $Previous -Destination $SavedPrevious
     }
     if (Test-Path -LiteralPath $Destination) {
         Move-Item -LiteralPath $Destination -Destination $Previous
@@ -122,12 +126,18 @@ try {
     Move-Item -LiteralPath $Staging -Destination $Destination
 } catch {
     if (-not (Test-Path -LiteralPath $Destination) -and (Test-Path -LiteralPath $Previous)) {
-        Move-Item -LiteralPath $Previous -Destination $Destination
+        try { Move-Item -LiteralPath $Previous -Destination $Destination } catch {}
+    }
+    if (-not (Test-Path -LiteralPath $Previous) -and (Test-Path -LiteralPath $SavedPrevious)) {
+        try { Move-Item -LiteralPath $SavedPrevious -Destination $Previous } catch {}
     }
     if (Test-Path -LiteralPath $Staging) {
         Remove-Item -LiteralPath $Staging -Recurse -Force
     }
-    Fail "could not replace the installed program."
+    Fail "could not replace the installed program; check the previous installation folders."
+}
+if (Test-Path -LiteralPath $SavedPrevious) {
+    Remove-Item -LiteralPath $SavedPrevious -Recurse -Force
 }
 
 $InstalledExe = Join-Path $Destination 'krellbot.exe'

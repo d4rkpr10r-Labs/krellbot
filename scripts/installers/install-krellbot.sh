@@ -24,7 +24,7 @@ set -u
 
 fail() {
     printf 'Install refused: %s\n' "$1" >&2
-    printf 'Nothing has been changed.\n' >&2
+    printf 'Installation did not complete.\n' >&2
     exit 1
 }
 
@@ -122,18 +122,32 @@ printf 'Installing Krellbot to: %s\n' "$DEST"
 # launcher; the temp-directory dance makes the replacement atomic-ish so
 # a failed copy cannot leave a half-replaced program behind.
 tmp_dest=$DEST.updating.$$
-rm -rf -- "$tmp_dest"
+saved_previous=$DEST.old.saved.$$
+if [ -e "$tmp_dest" ] || [ -L "$tmp_dest" ] || [ -e "$saved_previous" ] || [ -L "$saved_previous" ]; then
+    fail "temporary install paths already exist."
+fi
 if ! cp -a -- "$SOURCE/." "$tmp_dest"; then
     rm -rf -- "$tmp_dest"
     fail "copying the program files failed."
 fi
-rm -rf -- "$DEST.old"
-[ ! -d "$DEST" ] || mv -- "$DEST" "$DEST.old"
-if ! mv -- "$tmp_dest" "$DEST"; then
-    [ ! -d "$DEST.old" ] || mv -- "$DEST.old" "$DEST"
+if [ -d "$DEST.old" ] && ! mv -- "$DEST.old" "$saved_previous"; then
     rm -rf -- "$tmp_dest"
-    fail "installing the program files failed."
+    fail "could not preserve the previous installation."
 fi
+if [ -d "$DEST" ] && ! mv -- "$DEST" "$DEST.old"; then
+    [ ! -d "$saved_previous" ] || mv -- "$saved_previous" "$DEST.old" || true
+    rm -rf -- "$tmp_dest"
+    fail "could not move the current installation; check the previous installation folders."
+fi
+if ! mv -- "$tmp_dest" "$DEST"; then
+    [ ! -d "$DEST.old" ] || mv -- "$DEST.old" "$DEST" || true
+    if [ ! -e "$DEST.old" ] && [ -d "$saved_previous" ]; then
+        mv -- "$saved_previous" "$DEST.old" || true
+    fi
+    rm -rf -- "$tmp_dest"
+    fail "installing the program files failed; check the previous installation folders."
+fi
+rm -rf -- "$saved_previous"
 [ -x "$DEST/krellbot" ] || fail "the installed executable is missing after the copy."
 [ -d "$DEST/_internal" ] || fail "the installed runtime folder is missing after the copy."
 
