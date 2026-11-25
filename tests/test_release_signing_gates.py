@@ -169,3 +169,96 @@ def test_merge_group_candidates_never_enter_signing_or_release_steps() -> None:
         assert "github.event_name == 'merge_group'" in section, name
     assert "manifest.get('source_commit') != os.environ['CANDIDATE_SOURCE_SHA']" in text
     assert "if: startsWith(github.ref, 'refs/tags/v')" in text
+
+
+def test_missing_signing_inputs_fail_before_producing_evidence(tmp_path) -> None:
+    import subprocess
+    import sys
+
+    from scripts.ci_verify_frozen_archive import SIGNING_INPUTS
+
+    output = tmp_path / "signing-status.json"
+    for platform, names in SIGNING_INPUTS.items():
+        env = {names[0]: "fixture-secret-value"}
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts/ci_verify_frozen_archive.py"),
+                "--platform", platform,
+                "--require-signing-inputs",
+                "--output", str(output),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 1
+        assert "required secrets are missing" in result.stderr
+        assert all(name in result.stderr for name in names[1:])
+        assert names[0] not in result.stderr
+        assert "fixture-secret-value" not in result.stderr
+        assert not output.exists()
+
+
+def test_release_promotion_requires_exact_verified_archives(tmp_path) -> None:
+    import hashlib
+    import json
+
+    import pytest
+
+    from scripts.ci_release_notes_from_signing_status import build_notes
+    from scripts.ci_verify_frozen_archive import NATIVE_TARGETS, VERIFIED_SIGNATURE
+
+    commit = "a" * 40
+    for platform, (_, arch) in NATIVE_TARGETS.items():
+        target = f"{platform}-{arch}"
+        archive = tmp_path / f"krellbot-{target}.zip"
+        payload = target.encode()
+        archive.write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        manifest = {
+            "filename": archive.name,
+            "os": platform,
+            "arch": arch,
+            "size": len(payload),
+            "source_commit": commit,
+            "sha256": digest,
+        }
+        (tmp_path / f"manifest-{target}.json").write_text(json.dumps(manifest), encoding="utf-8")
+        marker = {
+            "platform": platform,
+            "arch": arch,
+            "sha": commit,
+            "sha256": digest,
+            "size": len(payload),
+            "install_smoke": "passed",
+            "signed": platform in VERIFIED_SIGNATURE,
+            "signing_requested": True,
+            "detail": VERIFIED_SIGNATURE.get(platform, "checksum_pinned_policy"),
+        }
+        (tmp_path / f"signing-status-{target}.json").write_text(json.dumps(marker), encoding="utf-8")
+
+    assert "notarized, stapled" in build_notes(root=tmp_path, sha=commit, verify_archives=True)
+    windows = tmp_path / "signing-status-windows-x86_64.json"
+    marker = json.loads(windows.read_text(encoding="utf-8"))
+    marker["signed"] = False
+    windows.write_text(json.dumps(marker), encoding="utf-8")
+    with pytest.raises(ValueError, match="Required platform signature"):
+        build_notes(root=tmp_path, sha=commit, verify_archives=True)
+    marker["signed"] = True
+    windows.write_text(json.dumps(marker), encoding="utf-8")
+    (tmp_path / "krellbot-windows-x86_64.zip").write_bytes(b"changed")
+    with pytest.raises(ValueError, match="Archive manifest mismatch"):
+        build_notes(root=tmp_path, sha=commit, verify_archives=True)
+
+
+def test_native_archive_signature_hooks_run_after_packaging() -> None:
+    text = _read_workflow()
+    assert text.index("- name: Build immutable archive and manifest") < text.index(
+        "- name: Write signing status marker"
+    )
+    assert "& $signtool verify /pa /all /tw" in text
+    assert "TimeStamperCertificate" in text
+    assert "--verify-archives" in text
+    assert "if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'" in text

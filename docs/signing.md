@@ -177,3 +177,12 @@ macOS continues to publish one-dir unsigned zips.
 5. Set variable `KRELLBOT_SIGN_RELEASE=true` when ready for signed tag builds.
 6. Cut a `v*` tag (or dispatch with `sign_release=true`) and confirm signing-status artifacts + staple.
 7. Only then consider flipping `ARTIFACTS_SIGNED` and M13.3 publication — not before.
+
+## Exact-archive qualification
+
+Pull requests and merge groups generate unsigned candidate archives and
+record native install evidence. A signed workflow dispatch can qualify
+the final archive shape in Actions without publishing a GitHub Release.
+A tag-push release job verifies that the native evidence matches each
+ZIP's SHA-256, size, target, and source commit before uploading. See
+[the native candidate and M19 checklist](v1/signed-distribution.md).

@@ -20,6 +20,7 @@ on:
       - "tests/test_frozen_main.py"
       - "tests/test_ci_smoke_frozen_paper.py"
       - "tests/test_release_signing_gates.py"
+      - "docs/v1/signed-distribution.md"
       - "tests/test_macos_app_bundle.py"
       - "scripts/macos_app_bundle.py"
       - "scripts/macos_entitlements.plist"
@@ -100,7 +101,7 @@ jobs:
         run: uv sync --group dev
 
       - name: Run unit tests
-        run: uv run pytest -q tests/test_release_archive.py tests/test_frozen_main.py tests/test_ci_smoke_frozen_paper.py
+        run: uv run pytest -q tests/test_release_archive.py tests/test_frozen_main.py tests/test_ci_smoke_frozen_paper.py tests/test_release_signing_gates.py tests/test_macos_app_bundle.py
         env:
           PYTHONUTF8: "1"
 
@@ -262,22 +263,6 @@ jobs:
         working-directory: frontend
         run: npx playwright install chromium
 
-      - name: Native Windows install, reinstall, no-argument launch and Signal navigation
-        if: matrix.os == 'windows-latest'
-        env:
-          KRELLBOT_ENABLE_LIVE: "0"
-          KRELLBOT_LIVE: "0"
-        run: node scripts/ci_smoke_installed_preview.mjs dist/krellbot "${{ runner.temp }}/installed-preview-evidence"
-
-      - name: Preserve native Windows installed-app evidence
-        if: always() && matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-installed-preview-evidence
-          path: ${{ runner.temp }}/installed-preview-evidence/
-          if-no-files-found: ignore
-          retention-days: 7
-
       # ------------------------------------------------------------------
       # Platform signing (secrets-gated). PR CI always stays unsigned.
       # Tag / workflow_dispatch builds sign only when signing is requested
@@ -328,25 +313,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          missing=()
-          for name in \
-            APPLE_DEVELOPER_ID_P12_BASE64 \
-            APPLE_DEVELOPER_ID_P12_PASSWORD \
-            APPLE_CODESIGN_IDENTITY \
-            APPLE_TEAM_ID \
-            APPLE_API_KEY_P8_BASE64 \
-            APPLE_API_KEY_ID \
-            APPLE_API_ISSUER_ID
-          do
-            if [ -z "${!name:-}" ]; then
-              missing+=("$name")
-            fi
-          done
-          if [ "${#missing[@]}" -ne 0 ]; then
-            echo "::error::macOS signing requested but required secrets are missing: ${missing[*]}"
-            echo "Configure the secret names listed in docs/signing.md, then re-run."
-            exit 1
-          fi
+          # Reports "required secrets are missing" with names only.
+          uv run python scripts/ci_verify_frozen_archive.py --platform macos --require-signing-inputs
 
           APP_VERSION="${KRELLBOT_VERSION}"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
@@ -363,8 +331,14 @@ jobs:
           KEYCHAIN_PATH="${RUNNER_TEMP}/krellbot-signing.keychain-db"
           P12_PATH="${RUNNER_TEMP}/developer-id.p12"
           P8_PATH="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY_ID}.p8"
+          umask 077
           NOTARIZE_ZIP="${RUNNER_TEMP}/krellbot-macos-notarize.zip"
           ENTITLEMENTS="scripts/macos_entitlements.plist"
+          cleanup_signing() {
+            rm -f "${P12_PATH}" "${P8_PATH}" "${NOTARIZE_ZIP}"
+            security delete-keychain "${KEYCHAIN_PATH}" || true
+          }
+          trap cleanup_signing EXIT
 
           security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
           security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
@@ -404,8 +378,6 @@ jobs:
           xcrun stapler staple "dist/Krellbot.app"
           xcrun stapler validate "dist/Krellbot.app"
 
-          echo "signed=true" >> "$GITHUB_OUTPUT"
-          echo "app=dist/Krellbot.app" >> "$GITHUB_OUTPUT"
           echo "macos Developer ID + notarization + staple completed"
 
       - name: Sign Windows Authenticode
@@ -422,15 +394,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $missing = @()
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CODESIGN_P12_BASE64)) { $missing += "WINDOWS_CODESIGN_P12_BASE64" }
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CODESIGN_P12_PASSWORD)) { $missing += "WINDOWS_CODESIGN_P12_PASSWORD" }
-          if ($missing.Count -gt 0) {
-            Write-Error "Windows signing requested but required secrets are missing: $($missing -join ', '). See docs/signing.md."
-          }
+          uv run python scripts/ci_verify_frozen_archive.py --platform windows --require-signing-inputs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          $pfxPath = Join-Path $env:RUNNER_TEMP "krellbot-codesign.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_P12_BASE64))
           $timestamp = $env:WINDOWS_CODESIGN_TIMESTAMP_URL
           if ([string]::IsNullOrWhiteSpace($timestamp)) {
             $timestamp = "http://timestamp.digicert.com"
@@ -448,16 +414,29 @@ jobs:
           Write-Host "Using signtool: $signtool"
 
           $targets = Get-ChildItem -Path "dist\krellbot" -Recurse -Include *.exe,*.dll
-          foreach ($target in $targets) {
-            Write-Host "signtool: $($target.FullName)"
-            & $signtool sign /f $pfxPath /p $env:WINDOWS_CODESIGN_P12_PASSWORD `
-              /fd SHA256 /td SHA256 /tr $timestamp $target.FullName
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "signtool failed for $($target.FullName)"
+          $pfxPath = Join-Path $env:RUNNER_TEMP "krellbot-codesign.pfx"
+          try {
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_P12_BASE64))
+            foreach ($target in $targets) {
+              Write-Host "signtool: $($target.FullName)"
+              & $signtool sign /f $pfxPath /p $env:WINDOWS_CODESIGN_P12_PASSWORD `
+                /fd SHA256 /td SHA256 /tr $timestamp $target.FullName
+              if ($LASTEXITCODE -ne 0) {
+                Write-Error "signtool failed for $($target.FullName)"
+              }
+              & $signtool verify /pa /all /tw $target.FullName
+              if ($LASTEXITCODE -ne 0) {
+                Write-Error "Authenticode verification failed for $($target.FullName)"
+              }
+              $signature = Get-AuthenticodeSignature -LiteralPath $target.FullName
+              if ($signature.Status -ne 'Valid' -or -not $signature.TimeStamperCertificate) {
+                Write-Error "Trusted timestamp missing for $($target.FullName)"
+              }
             }
+          } finally {
+            Remove-Item -Force $pfxPath
           }
-          Remove-Item -Force $pfxPath
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "signed=true"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "signtool=$signtool"
           Write-Host "windows Authenticode signing completed"
 
       - name: Record Linux checksum-pinned signing policy
@@ -475,47 +454,8 @@ jobs:
           echo "policy=checksum_pinned" >> "$GITHUB_OUTPUT"
           echo "Linux release artifacts stay checksum-pinned (no platform code signature)."
 
-      - name: Write signing status marker
-        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        shell: bash
-        env:
-          SIGNING_REQUESTED: ${{ steps.signing.outputs.requested }}
-          MACOS_SIGNED: ${{ steps.macos_sign.outputs.signed }}
-          WINDOWS_SIGNED: ${{ steps.windows_sign.outputs.signed }}
-          LINUX_POLICY: ${{ steps.linux_sign.outputs.policy }}
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          platform="${{ matrix.platform_tag }}"
-          arch="${{ matrix.arch }}"
-          signed="false"
-          detail="unsigned"
-          if [ "${SIGNING_REQUESTED}" != "true" ]; then
-            detail="unsigned_signing_not_requested"
-          elif [ "${platform}" = "macos" ] && [ "${MACOS_SIGNED}" = "true" ]; then
-            signed="true"
-            detail="developer_id_notarized_stapled_app"
-          elif [ "${platform}" = "windows" ] && [ "${WINDOWS_SIGNED}" = "true" ]; then
-            signed="true"
-            detail="authenticode"
-          elif [ "${platform}" = "linux" ]; then
-            detail="checksum_pinned_policy"
-          fi
-          cat > "artifacts/signing-status-${platform}-${arch}.json" <<EOF
-          {
-            "platform": "${platform}",
-            "arch": "${arch}",
-            "signing_requested": ${SIGNING_REQUESTED:-false},
-            "signed": ${signed},
-            "detail": "${detail}",
-            "sha": "${GITHUB_SHA}"
-          }
-          EOF
-          # Normalize JSON whitespace for humans reading the artifact.
-          uv run python -c "import json,pathlib; p=pathlib.Path('artifacts/signing-status-${platform}-${arch}.json'); p.write_text(json.dumps(json.loads(p.read_text()), indent=2, sort_keys=True)+'\n')"
-
       - name: "Verify immutable release base URL is configured"
-        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        if: github.event_name == 'push' || (github.event_name != 'pull_request' && github.event_name != 'merge_group' && env.KRELLBOT_RELEASE_BASE_URL != '')
         # The manifest URL is built from $KRELLBOT_RELEASE_BASE_URL +
         # version + archive_name. CI fails closed if the base URL is
         # missing or doesn't end with a slash; release automation must
@@ -542,32 +482,35 @@ jobs:
         shell: bash
         env:
           KRELLBOT_VERSION: ${{ env.KRELLBOT_VERSION }}
-          KRELLBOT_RELEASE_BASE_URL: ${{ steps.release_base.outputs.release_base }}
+          KRELLBOT_RELEASE_BASE_URL: ${{ steps.release_base.outputs.release_base || 'https://example.invalid/' }}
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          ARCHIVE="artifacts/${{ matrix.archive_name }}"
+          export RELEASE_FILENAME="${{ matrix.archive_name }}"
+          export RELEASE_PLATFORM="${{ matrix.platform_tag }}"
+          export RELEASE_ARCH="${{ matrix.arch }}"
           # A v* tag publishes to GitHub Releases. The download path is
           # {base}{tag}/{archive}, so the manifest version is the tag,
           # not the package version string.
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             KRELLBOT_VERSION="${GITHUB_REF_NAME}"
           fi
-          URL="${KRELLBOT_RELEASE_BASE_URL}${KRELLBOT_VERSION}/${{ matrix.archive_name }}"
+          export KRELLBOT_VERSION
+          export RELEASE_URL="${KRELLBOT_RELEASE_BASE_URL}${KRELLBOT_VERSION}/${RELEASE_FILENAME}"
           # Signed macOS ships a stapled Krellbot.app zip. Unsigned macOS
           # (and all other platforms) keep the one-dir archive contract.
           uv run python -c "
-          import json
+          import json, os
           from pathlib import Path
           from scripts.release_archive import build_archive, build_macos_app_archive
-          archive = Path('${ARCHIVE}')
-          version = '${KRELLBOT_VERSION}'
-          arch = '${{ matrix.arch }}'
-          platform = '${{ matrix.platform_tag }}'
-          url = '${URL}'
+          archive = Path('artifacts') / os.environ['RELEASE_FILENAME']
+          version = os.environ['KRELLBOT_VERSION']
+          arch = os.environ['RELEASE_ARCH']
+          platform = os.environ['RELEASE_PLATFORM']
+          url = os.environ['RELEASE_URL']
           app = Path('dist/Krellbot.app')
           if platform == 'macos' and app.is_dir():
-              m = build_macos_app_archive(app, archive, version=version, arch=arch, url=url)
+              m = build_macos_app_archive(app, archive, version=version, arch=arch, url=url, preserve_platform_metadata=True)
           else:
               m = build_archive(
                   Path('dist/krellbot'),
@@ -580,6 +523,28 @@ jobs:
           print(json.dumps(m, indent=2, sort_keys=True))
           " | tee "artifacts/manifest-${{ matrix.platform_tag }}-${{ matrix.arch }}.json"
 
+      - name: Write signing status marker
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        shell: bash
+        env:
+          SIGNING_REQUESTED: ${{ steps.signing.outputs.requested }}
+          SIGNTOOL: ${{ steps.windows_sign.outputs.signtool }}
+          VERIFY_PLATFORM: ${{ matrix.platform_tag }}
+          VERIFY_ARCH: ${{ matrix.arch }}
+          VERIFY_ARCHIVE: ${{ matrix.archive_name }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "${SIGNING_REQUESTED}" = true ]; then
+            args+=(--sign-requested)
+          fi
+          uv run python scripts/ci_verify_frozen_archive.py \
+            --platform "$VERIFY_PLATFORM" --sha "$GITHUB_SHA" \
+            --archive "artifacts/$VERIFY_ARCHIVE" \
+            --manifest "artifacts/manifest-$VERIFY_PLATFORM-$VERIFY_ARCH.json" \
+            --output "artifacts/signing-status-$VERIFY_PLATFORM-$VERIFY_ARCH.json" \
+            --signtool "$SIGNTOOL" "${args[@]}"
+
       - name: Upload archive and manifest
         if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@v4
@@ -589,10 +554,11 @@ jobs:
             artifacts/${{ matrix.archive_name }}
             artifacts/manifest-${{ matrix.platform_tag }}-${{ matrix.arch }}.json
             artifacts/signing-status-${{ matrix.platform_tag }}-${{ matrix.arch }}.json
+            artifacts/signing-status-${{ matrix.platform_tag }}-${{ matrix.arch }}.log
           if-no-files-found: error
 
       - name: Archive unsigned merge-group candidate
-        if: github.event_name == 'merge_group'
+        if: github.event_name == 'merge_group' || github.event_name == 'pull_request'
         shell: bash
         env:
           CANDIDATE_SOURCE_SHA: ${{ github.sha }}
@@ -625,8 +591,22 @@ jobs:
           )
           "
 
+      - name: Verify the exact unsigned candidate on the native platform
+        if: github.event_name == 'merge_group' || github.event_name == 'pull_request'
+        shell: bash
+        env:
+          VERIFY_PLATFORM: ${{ matrix.platform_tag }}
+          VERIFY_ARCHIVE: ${{ matrix.archive_name }}
+        run: |
+          set -euo pipefail
+          uv run python scripts/ci_verify_frozen_archive.py \
+            --platform "$VERIFY_PLATFORM" --sha "$GITHUB_SHA" \
+            --archive "candidate-artifacts/$VERIFY_ARCHIVE" \
+            --manifest "candidate-artifacts/$VERIFY_ARCHIVE.json" \
+            --output "candidate-artifacts/native-install.json"
+
       - name: Upload unsigned merge-group candidate
-        if: github.event_name == 'merge_group'
+        if: github.event_name == 'merge_group' || github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: paper-candidate-${{ matrix.platform_tag }}-${{ matrix.arch }}
@@ -634,10 +614,21 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Preserve native Windows installed-app evidence
+        if: always() && matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installed-preview-evidence
+          path: |
+            ${{ runner.temp }}/installed-preview-evidence/installed-preview.json
+            ${{ runner.temp }}/installed-preview-evidence/*.png
+          if-no-files-found: ignore
+          retention-days: 7
+
   publish:
     name: publish GitHub release assets
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -663,13 +654,9 @@ jobs:
           # notarized / Authenticode unless the platform markers say so.
           # Channel stays --prerelease until owner flips ARTIFACTS_SIGNED
           # (M12.2 / M13.3) — this job does not promote to GA.
-          # Fallback keeps the historical Unsigned / Not notarized phrasing
-          # when the helper or markers are absent.
-          if [ -f scripts/ci_release_notes_from_signing_status.py ]; then
-            NOTES="$(python3 scripts/ci_release_notes_from_signing_status.py --root release-assets --sha "${GITHUB_SHA}")"
-          else
-            NOTES="Unsigned checksum-pinned build from ${GITHUB_SHA}. Not notarized. Not Authenticode-signed. SHA-256 is the integrity check."
-          fi
+          # Unsigned candidates retain the "Not notarized" and
+          # "Not Authenticode-signed" notes when verification passes.
+          NOTES="$(python3 scripts/ci_release_notes_from_signing_status.py --root release-assets --sha "${GITHUB_SHA}" --verify-archives)"
 
           if ! gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release create "${GITHUB_REF_NAME}" \
