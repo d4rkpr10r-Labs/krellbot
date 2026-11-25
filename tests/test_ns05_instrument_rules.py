@@ -767,7 +767,7 @@ def test_paper_tick_protective_stop_still_runs_when_metadata_refuses_entry(home,
             "venue": "kraken",
             "pack": "ns05-tick-c",
             "bar_ts": 1,
-            "detail": {"pair": "FIXUSD", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
+            "detail": {"pair": "FIXUSD", "mode": "paper", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
         }
     )
     config = load_config(home)

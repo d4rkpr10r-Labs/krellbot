@@ -249,6 +249,7 @@ def _seed_journal_owned(home: Path, *, pack_id: str, owned_qty: Decimal, pair: s
             "bar_ts": 0,
             "detail": {
                 "pair": pair,
+                "mode": "live",
                 "entry_qty": str(owned_qty),
                 "exit_qty": "0",
                 "stop_qty": "0",

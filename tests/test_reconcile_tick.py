@@ -188,7 +188,7 @@ def test_position_without_stop_gets_stop_next_tick(home):
             "venue": "kraken",
             "pack": "sma-cross",
             "bar_ts": 1,
-            "detail": {"pair": "SUIUSD", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
+            "detail": {"pair": "SUIUSD", "mode": "paper", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
         }
     )
 
@@ -229,7 +229,7 @@ def test_stop_placement_failure_exits_position(home):
             "venue": "kraken",
             "pack": "sma-cross",
             "bar_ts": 1,
-            "detail": {"pair": "SUIUSD", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
+            "detail": {"pair": "SUIUSD", "mode": "paper", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
         }
     )
 
@@ -319,7 +319,7 @@ def test_pending_version_adopted_only_when_flat(home):
             "venue": "kraken",
             "pack": "v1",
             "bar_ts": 1,
-            "detail": {"pair": "SUIUSD", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
+            "detail": {"pair": "SUIUSD", "mode": "paper", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
         }
     )
 
@@ -367,7 +367,7 @@ def test_pending_version_adopted_only_when_flat(home):
             "venue": "kraken",
             "pack": "v1",
             "bar_ts": 2,
-            "detail": {"pair": "SUIUSD", "entry_qty": "0", "exit_qty": "5", "stop_qty": "0"},
+            "detail": {"pair": "SUIUSD", "mode": "paper", "entry_qty": "0", "exit_qty": "5", "stop_qty": "0"},
         }
     )
 

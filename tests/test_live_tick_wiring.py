@@ -395,7 +395,7 @@ def test_lapsed_license_blocks_entry_but_allows_exit(home, fresh_keyring, monkey
             "venue": "kraken",
             "pack": "lw-lapsed",
             "bar_ts": 0,
-            "detail": {"pair": "SUIUSD", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
+            "detail": {"pair": "SUIUSD", "mode": "live", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
         }
     )
     config = Config(

@@ -17,3 +17,6 @@ One line per item. Nothing here is work until the owner moves it into a mileston
 - Exchange-native free AI agent tooling parity race — spike only in M22.5; no cloud-key me-too product.
 - Multi-pack reservation / breaking one-pack-per-(venue,pair) before independent qualification (still true post-M16).
 - Learn top-nav / Learn view (Signal artboard) — still do not invent in cockpit.
+- Paper stop-outs are not journaled as decreases (`run.tick` writes `"stop_qty": "0"`), so journal ownership still counts a stopped-out position; with other base-asset inventory on that venue the next tick protects it as strategy inventory (reproduced on 794089c).
+- `run._recognized_open_qty` counts an open order's requested qty as owned and sums every matching entry/stop order; it is not proof of executed inventory.
+- `run.tick(home=X)` appends the journal under `$KRELLBOT_HOME` but reads ownership from `X/journal`; harmless while both are the same directory.
