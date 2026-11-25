@@ -2947,6 +2947,7 @@ def create_app(
                 and isinstance(ts, (int, float))
                 and not isinstance(ts, bool)
                 and 0 < ts < 1_000_000_000_000
+                and armed.armed_at_ts > 0
                 and ts > armed.armed_at_ts
             ):
                 records.append(record)
@@ -2990,6 +2991,8 @@ def create_app(
             has_fill = False
         if armed.entries_paused:
             state = "paused"
+        elif armed.armed_at_ts <= 0:
+            state = "unavailable"
         elif detail.get("kill_switch") or detail.get("ensure_stop_failed") or detail.get("entries_blocked"):
             state = "blocked"
         elif reason == "fetch_error":

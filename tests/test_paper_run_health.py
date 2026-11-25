@@ -130,6 +130,16 @@ def test_zero_quantity_is_not_reported_as_a_fill(armed_health):
     assert health()["state"] == "checked"
 
 
+def test_legacy_arm_without_start_time_does_not_claim_prior_health(home, armed_health):
+    health, tick = armed_health
+    tick(100001)
+    saved = config.load_config(home)
+    saved.armed[0].armed_at_ts = 0
+    config.save_config(home, saved)
+    assert health()["state"] == "unavailable"
+    assert health()["last_success"] is None
+
+
 def test_malformed_tick_timestamps_are_ignored(home, armed_health):
     health, tick = armed_health
     for value in (float("nan"), float("inf"), True, 10**400):
