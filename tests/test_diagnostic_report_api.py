@@ -93,3 +93,68 @@ def test_unavailable_scheduler_and_malformed_files_do_not_break_report(home, mon
     assert status == 200
     assert b"sensitive-error" not in body
     assert json.loads(body)["scheduler"] is None
+
+
+def test_scheduler_probe_does_not_block_other_requests(home, monkeypatch):
+    import asyncio
+    import threading
+    import time
+
+    from krellbot.service import supervise
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_scheduler(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=5)
+        return {"installed": True, "enabled": True}
+
+    monkeypatch.setattr(supervise, "scheduler_status", slow_scheduler)
+    app = _build_app(home)
+    headers = [("Host", f"127.0.0.1:{TEST_PORT}"), *_auth(*_bootstrap(app))]
+
+    async def get(path):
+        sent = False
+        response = {"status": None}
+
+        async def receive():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] == "http.response.start":
+                response["status"] = message["status"]
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "server": ("127.0.0.1", TEST_PORT),
+            "client": ("127.0.0.1", 12345),
+            "headers": [(key.lower().encode(), value.encode()) for key, value in headers],
+            "root_path": "",
+        }
+        await app(scope, receive, send)
+        return response["status"]
+
+    async def exercise():
+        task = asyncio.create_task(get("/api/v1/diagnostics/report"))
+        started = time.monotonic()
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            assert await get("/api/v1/version") == 200
+            assert time.monotonic() - started < 2
+        finally:
+            release.set()
+            assert await task == 200
+
+    asyncio.run(exercise())

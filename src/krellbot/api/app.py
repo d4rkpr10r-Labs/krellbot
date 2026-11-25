@@ -2812,8 +2812,11 @@ def create_app(
         if denied is not None:
             return denied
         try:
-            scheduler = kb_supervise.scheduler_status(
-                s.home, write_root=_scheduler_write_root(s), supervisor=_scheduler_supervisor(s)
+            scheduler = await asyncio.to_thread(
+                kb_supervise.scheduler_status,
+                s.home,
+                write_root=_scheduler_write_root(s),
+                supervisor=_scheduler_supervisor(s),
             )
             scheduler_view = {"installed": scheduler["installed"], "enabled": scheduler["enabled"]}
         except Exception:  # noqa: BLE001 — diagnostics must survive an unavailable scheduler.
