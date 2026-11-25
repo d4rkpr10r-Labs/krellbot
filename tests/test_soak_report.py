@@ -13,6 +13,8 @@ import datetime
 import json
 from pathlib import Path
 
+import pytest
+
 from krellbot.storage.database import OperationalStore
 from krellbot.storage.outbox import audit_needs_reconcile
 from scripts.soak_report import (
@@ -102,6 +104,14 @@ def test_full_hourly_coverage_prints_pass(home: Path) -> None:
     _seed_hourly_ticks(home, days=1, now=NOW)
     assert evaluate(home, days=1, now=NOW) == "PASS"
     assert failing_hours(home, days=1, now=NOW) == []
+
+
+@pytest.mark.parametrize("reason", ["fetch_error", "check_incomplete", "no_candles"])
+def test_market_data_failure_fails_a_covered_hour(home: Path, reason: str) -> None:
+    hours = _seed_hourly_ticks(home, days=1)
+    _write_tick(home, hours[3] + 120, reason=reason)
+
+    assert failing_hours(home, days=1, now=NOW) == [hours[3]]
 
 
 def test_coverage_only_journal_without_entry_evaluation_fails(home: Path) -> None:

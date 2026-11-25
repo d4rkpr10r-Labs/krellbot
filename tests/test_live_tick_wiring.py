@@ -257,6 +257,35 @@ def test_live_arm_with_trade_only_key_places_entry_and_dedupes(home, fresh_keyri
     assert len(adds_after) == 1, f"second tick must not place another order; got {len(adds_after)}"
 
 
+def test_kraken_next_tick_refuses_revoked_trade_permission(home, fresh_keyring, monkeypatch):
+    """A prior successful tick and its existing grant do not extend key permissions."""
+    from fakes.live_grant import write_grant
+
+    from krellbot.cli import cmd_tick
+
+    monkeypatch.setenv("KRELLBOT_ENABLE_LIVE", "1")
+    write_grant(home, venue="kraken", pair="SUIUSD")
+    _arm(home, _write_pack(home), mode="live")
+    _store_kraken_key(fresh_keyring)
+    transport = _FundedKrakenTransport(
+        responses=[{"result": {"txid": ["TX-entry"]}}],
+        asset_pairs=_asset_pairs_for("SUIUSD"),
+        api_key_info={"permissions": ["query-funds", "query-open-trades", "modify-trades", "close-trades"]},
+    )
+    candles = [_candle(0, "10"), _candle(3_600_000, "10"), _candle(7_200_000, "12")]
+    assert cmd_tick(["--venue", "kraken"], fetch=_fake_fetch(candles), transport=transport) == 0
+    assert len([call for call in transport.calls if call.url.endswith("/AddOrder")]) == 1
+
+    revoked = _FundedKrakenTransport(api_key_info={"permissions": ["query-funds", "query-open-trades"]})
+
+    def unexpected_fetch(*_args):
+        pytest.fail("A revoked key must be refused before fetching the next candle")
+
+    assert cmd_tick(["--venue", "kraken"], fetch=unexpected_fetch, transport=revoked) == 1
+    assert any(call.url.endswith("/GetApiKeyInfo") for call in revoked.calls)
+    assert not any(call.url.endswith(("/AddOrder", "/CancelOrder", "/EditOrder")) for call in revoked.calls)
+
+
 def test_paper_arm_with_env_1_passes_paper_venue_to_run_tick(home, fresh_keyring, monkeypatch):
     """Paper arm, env=1: the object passed to `run.tick` is a PaperVenue.
 
