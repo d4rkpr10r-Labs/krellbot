@@ -23,6 +23,15 @@ function fakeClient(over: Partial<VersionClient> = {}): VersionClient {
 }
 
 describe("AboutPanel version honesty", () => {
+  it("shows the source commit from the packaged build", async () => {
+    const commit = "a".repeat(40);
+    const client = fakeClient({
+      getVersion: vi.fn().mockResolvedValue({ ...PREVIEW, source_commit: commit }),
+    });
+    render(<AboutPanel client={client} />);
+    expect((await screen.findByTestId("app-home-about-source-commit")).textContent).toBe(commit);
+  });
+
   it("surfaces version, prerelease channel, and unsigned signing state", async () => {
     render(<AboutPanel client={fakeClient()} />);
 
