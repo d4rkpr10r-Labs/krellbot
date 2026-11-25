@@ -171,7 +171,9 @@ macOS continues to publish one-dir unsigned zips.
 ## Operator checklist (owner)
 
 1. Create Apple Developer ID Application cert + App Store Connect API key; export `.p12` / `.p8`.
-2. Obtain Windows Authenticode certificate; export `.pfx`.
+2. Confirm the Windows signing identity supports this workflow's PFX
+   import. A hardware-backed or remote signing identity needs a runner
+   or signing service that can use its private key in place.
 3. Paste **only** into GitHub → Settings → Secrets and variables → Actions using the names above.
 4. Update `krellbot-cloud` to accept stapled `Krellbot.app` zips (see caveat above).
 5. Set variable `KRELLBOT_SIGN_RELEASE=true` when ready for signed tag builds.
