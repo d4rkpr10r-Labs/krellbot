@@ -43,7 +43,7 @@ const VENUE_COPY: Record<KeysVenue, VenueCopy> = {
   },
 };
 
-const STORE_LABEL = "Probe and store";
+const STORE_LABEL = "Check and save key";
 const REMOVE_LABEL = "Remove key";
 const REFRESH_LABEL = "Refresh";
 const PAPER_ONLY_NOTE =
