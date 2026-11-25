@@ -1,6 +1,7 @@
 name: release-frozen
 
 on:
+  merge_group:
   workflow_dispatch:
     inputs:
       sign_release:
@@ -286,7 +287,7 @@ jobs:
       # cert material.
       # ------------------------------------------------------------------
       - name: Resolve whether platform signing is requested
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         id: signing
         shell: bash
         env:
@@ -312,6 +313,7 @@ jobs:
         if: >-
           matrix.os == 'macos-latest'
           && github.event_name != 'pull_request'
+          && github.event_name != 'merge_group'
           && steps.signing.outputs.requested == 'true'
         id: macos_sign
         env:
@@ -410,6 +412,7 @@ jobs:
         if: >-
           matrix.os == 'windows-latest'
           && github.event_name != 'pull_request'
+          && github.event_name != 'merge_group'
           && steps.signing.outputs.requested == 'true'
         id: windows_sign
         env:
@@ -461,6 +464,7 @@ jobs:
         if: >-
           matrix.os == 'ubuntu-latest'
           && github.event_name != 'pull_request'
+          && github.event_name != 'merge_group'
         id: linux_sign
         shell: bash
         run: |
@@ -472,7 +476,7 @@ jobs:
           echo "Linux release artifacts stay checksum-pinned (no platform code signature)."
 
       - name: Write signing status marker
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         shell: bash
         env:
           SIGNING_REQUESTED: ${{ steps.signing.outputs.requested }}
@@ -511,7 +515,7 @@ jobs:
           uv run python -c "import json,pathlib; p=pathlib.Path('artifacts/signing-status-${platform}-${arch}.json'); p.write_text(json.dumps(json.loads(p.read_text()), indent=2, sort_keys=True)+'\n')"
 
       - name: "Verify immutable release base URL is configured"
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         # The manifest URL is built from $KRELLBOT_RELEASE_BASE_URL +
         # version + archive_name. CI fails closed if the base URL is
         # missing or doesn't end with a slash; release automation must
@@ -534,7 +538,7 @@ jobs:
           echo "release_base=$KRELLBOT_RELEASE_BASE_URL" >> "$GITHUB_OUTPUT"
 
       - name: Build immutable archive and manifest
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         shell: bash
         env:
           KRELLBOT_VERSION: ${{ env.KRELLBOT_VERSION }}
@@ -577,7 +581,7 @@ jobs:
           " | tee "artifacts/manifest-${{ matrix.platform_tag }}-${{ matrix.arch }}.json"
 
       - name: Upload archive and manifest
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@v4
         with:
           name: krellbot-${{ matrix.platform_tag }}-${{ matrix.arch }}
@@ -586,6 +590,49 @@ jobs:
             artifacts/manifest-${{ matrix.platform_tag }}-${{ matrix.arch }}.json
             artifacts/signing-status-${{ matrix.platform_tag }}-${{ matrix.arch }}.json
           if-no-files-found: error
+
+      - name: Archive unsigned merge-group candidate
+        if: github.event_name == 'merge_group'
+        shell: bash
+        env:
+          CANDIDATE_SOURCE_SHA: ${{ github.sha }}
+          CANDIDATE_OS: ${{ matrix.platform_tag }}
+          CANDIDATE_ARCH: ${{ matrix.arch }}
+          CANDIDATE_FILENAME: ${{ matrix.archive_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p candidate-artifacts
+          uv run python -c "
+          import json, os
+          from pathlib import Path
+          from krellbot import __version__
+          from scripts.release_archive import build_archive
+          name = os.environ['CANDIDATE_FILENAME']
+          archive = Path('candidate-artifacts') / name
+          manifest = build_archive(
+              Path('dist/krellbot'), archive, version=__version__,
+              platform_tag=os.environ['CANDIDATE_OS'],
+              arch=os.environ['CANDIDATE_ARCH'],
+              url='https://example.invalid/' + name,
+          )
+          if manifest.get('source_commit') != os.environ['CANDIDATE_SOURCE_SHA']:
+              raise SystemExit('frozen source commit does not match merge-group commit')
+          manifest.pop('url')
+          manifest['delivery'] = 'GitHub Actions artifact'
+          manifest['signed'] = False
+          (archive.parent / (name + '.json')).write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + '\\n', encoding='utf-8'
+          )
+          "
+
+      - name: Upload unsigned merge-group candidate
+        if: github.event_name == 'merge_group'
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-candidate-${{ matrix.platform_tag }}-${{ matrix.arch }}
+          path: candidate-artifacts/
+          if-no-files-found: error
+          retention-days: 7
 
   publish:
     name: publish GitHub release assets
