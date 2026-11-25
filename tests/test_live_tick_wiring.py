@@ -291,13 +291,20 @@ def test_paper_arm_with_env_1_passes_paper_venue_to_run_tick(home, fresh_keyring
     assert transport.calls == []
 
 
-def test_paper_tick_with_a_stored_key_posts_validate_true(home, fresh_keyring, monkeypatch):
-    """A paper entry with a stored Kraken key posts validate=true and does not treat it as a fill."""
+@pytest.mark.parametrize("offline", [False, True], ids=["scheduled", "offline"])
+def test_paper_tick_with_a_stored_key_never_touches_private_api(home, fresh_keyring, monkeypatch, offline):
+    """A stored key cannot change the local paper fill or cause an authenticated request."""
+    from krellbot import secrets
     from krellbot.cli import cmd_tick
 
-    pack_path = _write_pack(home, pack_id="paper-validate")
-    _arm(home, pack_path, mode="paper", pack_id="paper-validate")
+    pack_path = _write_pack(home, pack_id="paper-with-key")
+    _arm(home, pack_path, mode="paper", pack_id="paper-with-key")
     _store_kraken_key(fresh_keyring)
+
+    def unexpected_key_read(venue):
+        pytest.fail(f"Paper tick attempted to read credentials for {venue}")
+
+    monkeypatch.setattr(secrets, "get", unexpected_key_read)
     candles = [
         _candle(0, "10"),
         _candle(3_600_000, "10"),
@@ -305,13 +312,21 @@ def test_paper_tick_with_a_stored_key_posts_validate_true(home, fresh_keyring, m
     ]
     transport = FakeKrakenTransport(asset_pairs=_asset_pairs_for("SUIUSD"))
 
-    rc = cmd_tick(["--venue", "kraken"], fetch=_fake_fetch(candles), transport=transport)
+    args = ["--venue", "kraken"]
+    if offline:
+        csv_path = home / "candles.csv"
+        csv_path.write_text(
+            "ts_ms,open,high,low,close,volume\n0,10,11,10,10,100\n3600000,10,11,10,10,100\n7200000,12,13,12,12,100\n",
+            encoding="utf-8",
+        )
+        args.extend(["--offline-candles", str(csv_path)])
 
-    assert rc == 0
-    validates = [c for c in transport.calls if c.form.get("validate") == "true"]
-    assert len(validates) == 1
-    assert validates[0].form["pair"] == "SUIUSD"
-    assert all(c.form.get("validate") == "true" for c in transport.calls if c.url.endswith("/AddOrder"))
+    assert cmd_tick(args, fetch=_fake_fetch(candles), transport=transport) == 0
+    assert not any("/private/" in call.url for call in transport.calls)
+    state = json.loads((home / "run" / "paper-kraken.json").read_text(encoding="utf-8"))
+    [fill] = state["recent_fills"]
+    assert fill["pair"] == "SUIUSD"
+    assert fill["side"] == "buy"
 
 
 def test_lapsed_license_blocks_entry_but_allows_exit(home, fresh_keyring, monkeypatch):

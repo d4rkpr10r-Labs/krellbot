@@ -105,11 +105,11 @@ and never leaves a stray `.tmp` sibling.
 
 ## Kraken validate-only
 
-When a Kraken key is stored in the OS keychain AND a validate transport
-is injected, the paper venue additionally POSTs `AddOrder` with
-`validate=true` and the same fields as the real call. That POST never
-records a fill. With no key stored, or no transport injected, zero
-validate calls happen.
+Paper ticks use public market data or a local replay. They simulate fills
+without reading exchange credentials or calling a private exchange API.
+The separate Kraken validate-only smoke in [the live qualification
+milestone](milestones/M10.md#owner-gates) checks a signed request with
+`validate=true` without submitting an order.
 
 ## Inspect
 
@@ -147,7 +147,5 @@ above the current stop — the engine never lowers a stop.
 
 - Does not place a real order. Paper only.
 - Does not require a license for fixture or community packs.
-- Does not place a validate POST when no key is stored or no transport
-  is injected.
 - Does not lower a stop.
 - Does not sell more base than this pack's journal says it filled.
