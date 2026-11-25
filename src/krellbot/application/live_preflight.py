@@ -338,13 +338,13 @@ class VenueBackedPreflightTransport:
 
     def permissions(self) -> PreflightPermissions:
         from krellbot.venues.base import (
-            KrakenKeyUnknownPermissionError,
+            KeyUnknownPermissionError,
             WithdrawCapableError,
         )
 
         try:
             perms = self._venue.check_key()
-        except KrakenKeyUnknownPermissionError:
+        except KeyUnknownPermissionError:
             raise PreflightBlockedError(
                 "key grants unrecognized permission; live preflight refused",
                 code=CODE_KEY_UNKNOWN_PERMISSION,
