@@ -78,8 +78,9 @@ retained by default.
 | Launcher | `~/.local/bin/krellbot` | `%LOCALAPPDATA%\Krellbot\bin\krellbot.cmd` |
 | Prior launcher (after update) | `~/.local/bin/krellbot.prior` | `%LOCALAPPDATA%\Krellbot\bin\krellbot.prior.cmd` |
 
-`$KRELLBOT_HOME` is independent of the install path and is the only
-place keys, paper state, the journal, and receipts live.
+`$KRELLBOT_HOME` is independent of the install path and stores paper
+state, the journal, and receipts. Keys connected through the workstation
+are stored in the operating system's keychain.
 
 ## Arm your first paper strategy
 

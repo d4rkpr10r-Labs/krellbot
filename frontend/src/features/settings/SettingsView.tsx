@@ -14,6 +14,7 @@ import type { View } from "../../shell/Navigation";
 import { ReconnectQr } from "../../shell/ReconnectQr";
 import type { SettingsSection } from "../../shell/route";
 import { DemoFixturePanel } from "../demo/DemoFixturePanel";
+import { DiagnosticReport } from "../diagnostics/DiagnosticReport";
 import { KeysOnboardingPanel } from "../keys/KeysOnboardingPanel";
 import { createKeysHttpClient, type KeysClient } from "../keys/client";
 import { LiveWizardPanel } from "../onboarding/LiveWizardPanel";
@@ -485,6 +486,10 @@ export function SettingsView({
                 local demo fixtures.
               </p>
             </header>
+
+            <div className="kbot-settings__card">
+              <DiagnosticReport />
+            </div>
 
             <div
               className="kbot-settings__card"

@@ -11,6 +11,12 @@ afterEach(() => {
 });
 
 describe("adaptVersionInfo", () => {
+  it("accepts a full source commit and ignores invalid identity", () => {
+    const commit = "a".repeat(40);
+    expect(adaptVersionInfo({ source_commit: commit }).source_commit).toBe(commit);
+    expect(adaptVersionInfo({ source_commit: "invalid" }).source_commit).toBeUndefined();
+  });
+
   it("adapts a closed version payload", () => {
     expect(
       adaptVersionInfo({

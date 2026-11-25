@@ -18,6 +18,8 @@ import {
   type JSX,
 } from "react";
 import type { PaperClient, PaperCommandResult, PaperStatus } from "../paper/client";
+import { paperMarketAvailability } from "../paper/marketAvailability";
+import { paperHealthSentence, usePaperHealth } from "../paper/paperHealth";
 import type { StrategyClient } from "../strategies/client";
 import {
   CONSUMER_STARTER_CARD_ORDER,
@@ -79,7 +81,7 @@ export const DEFAULT_FIRST_RUN_WIZARD_STEPS: ReadonlyArray<FirstRunWizardStep> =
   ];
 
 /** Same initial paper-arm defaults as the Run panel. Paper mode only. */
-const WIZARD_PAPER_VENUE = "kraken";
+const WIZARD_MARKETS = { kraken: "XXBTZUSD", coinbase: "BTC-USD" } as const;
 const WIZARD_PAPER_BALANCE = "1000";
 
 export const WIZARD_LIVE_TRADING_UNAVAILABLE = "Live trading unavailable";
@@ -210,6 +212,7 @@ async function validateStarter(
   strategyClient: StrategyClient,
   loadStarters: () => Promise<StarterCatalogue>,
   starterId: string,
+  venue: keyof typeof WIZARD_MARKETS,
 ): Promise<{ revisionId: string } | { message: string }> {
   let catalogue: StarterCatalogue;
   try {
@@ -224,7 +227,10 @@ async function validateStarter(
     return { message: "That free strategy is not available." };
   }
   try {
-    const created = await strategyClient.create(example.pack);
+    const created = await strategyClient.create({
+      ...example.pack,
+      markets: [{ venue, pair: WIZARD_MARKETS[venue] }],
+    });
     const validated = await strategyClient.validate(created.revision_id);
     if (validated.state !== "validated" && validated.state !== "deployed") {
       const detail =
@@ -282,11 +288,12 @@ export function FirstRunWizard({
 
   const persist = useCallback(
     (next: FirstRunWizardPersisted) => {
-      writeFirstRunWizardState(next, storageKey);
-      setState(next);
+      const saved = { ...next, marketVenue: next.marketVenue ?? state.marketVenue };
+      writeFirstRunWizardState(saved, storageKey);
+      setState(saved);
       setEnterKey((key) => key + 1);
     },
-    [storageKey],
+    [storageKey, state.marketVenue],
   );
 
   const dismissed = isFirstRunWizardDismissed(state);
@@ -296,6 +303,7 @@ export function FirstRunWizard({
     const index = stepIndexOf(steps, state.stepId);
     return steps[index] ?? steps[0]!;
   }, [steps, state.stepId]);
+  const health = usePaperHealth(activeStep.id === "status" ? paperClient : undefined);
 
   useEffect(() => {
     if (!visible) {
@@ -337,7 +345,7 @@ export function FirstRunWizard({
   const isWin = activeStep.id === "win";
   const statusWired = activeStep.id === "status" && paperClient !== undefined;
   const sentence = statusWired
-    ? honestWizardStatusSentence(statusPhase)
+    ? paperClient?.getHealth ? paperHealthSentence(health) : honestWizardStatusSentence(statusPhase)
     : activeStep.sentence;
   const statusLoading = statusWired && statusPhase.kind === "loading";
   const catalogueLoader = loadStarters ?? fetchStarters;
@@ -394,6 +402,7 @@ export function FirstRunWizard({
         strategyClient,
         catalogueLoader,
         starterId,
+        state.marketVenue ?? "kraken",
       );
       if (dismissedNow()) {
         return;
@@ -402,7 +411,7 @@ export function FirstRunWizard({
         setChooseError(saved.message);
         return;
       }
-      persist(persisted("active", "start_paper", starterId, saved.revisionId));
+      persist({ ...persisted("active", "start_paper", starterId, saved.revisionId), marketVenue: state.marketVenue ?? "kraken" });
     } finally {
       inFlight.current = false;
       setChooseBusyId(null);
@@ -431,6 +440,7 @@ export function FirstRunWizard({
           strategyClient,
           catalogueLoader,
           starterId,
+          state.marketVenue ?? "kraken",
         );
         if (dismissedNow()) {
           return;
@@ -458,7 +468,7 @@ export function FirstRunWizard({
       try {
         result = await arm.call(paperClient, {
           revision_id: revisionId,
-          venue: WIZARD_PAPER_VENUE,
+          venue: state.marketVenue ?? "kraken",
           mode: "paper",
           paper_balance: WIZARD_PAPER_BALANCE,
         });
@@ -637,7 +647,7 @@ export function FirstRunWizard({
             <p
               className="kbot-first-run-wizard__chip"
               data-testid="first-run-wizard-status-chip"
-              data-paper-status={wizardStatusChipKind(statusPhase)}
+              data-paper-status={paperClient?.getHealth ? (health?.state === "checked" || health?.state === "filled" ? "running" : "waiting") : wizardStatusChipKind(statusPhase)}
             >
               {WIZARD_LIVE_TRADING_UNAVAILABLE}
             </p>
@@ -645,6 +655,18 @@ export function FirstRunWizard({
 
           {activeStep.id === "choose" ? (
             <>
+              <label className="kbot-first-run-wizard__market" htmlFor="wizard-market">
+                Exchange for BTC/USD
+                <select id="wizard-market" data-testid="first-run-wizard-market"
+                  value={state.marketVenue ?? "kraken"} disabled={chooseBusyId !== null}
+                  onChange={(event) => {
+                    const marketVenue = event.target.value === "coinbase" ? "coinbase" : "kraken";
+                    persist({ ...state, marketVenue });
+                  }}>
+                  <option value="kraken">Kraken · BTC/USD</option>
+                  <option value="coinbase">Coinbase · BTC/USD</option>
+                </select>
+              </label>
               <ul
                 className="kbot-first-run-wizard__tiles"
                 data-testid="first-run-wizard-tiles"
@@ -700,6 +722,12 @@ export function FirstRunWizard({
             </button>
           )}
 
+          {activeStep.id === "start_paper" && state.marketVenue ? (
+            <p data-testid="first-run-wizard-market-summary">
+              {state.marketVenue === "kraken" ? "Kraken" : "Coinbase"} · BTC/USD · 1 hour · 1,000 USD paper balance.
+              {" "}{paperMarketAvailability(state.marketVenue, WIZARD_MARKETS[state.marketVenue], "1h")}
+            </p>
+          ) : null}
           {activeStep.id === "start_paper" && armError !== null ? (
             <p
               className="kbot-first-run-wizard__alert"
