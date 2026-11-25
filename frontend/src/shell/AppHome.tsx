@@ -3,6 +3,8 @@ import { BrandMark } from "../components/brand/BrandMark";
 import type { DeploymentRow } from "../features/operations/client";
 import { PaperStarterChooser } from "../features/onboarding/PaperStarterChooser";
 import type { StrategyClient } from "../features/strategies/client";
+import type { PaperClient } from "../features/paper/client";
+import { paperHealthSentence, usePaperHealth } from "../features/paper/paperHealth";
 import { CONSUMER_STARTER_CARDS } from "../features/strategies/consumerStarterCopy";
 import type { StarterCatalogue } from "../features/strategies/StarterPicker.client";
 import type { View } from "./Navigation";
@@ -41,6 +43,7 @@ type AppHomeProps = {
   onStarterReady?: (ready: { revisionId: string; label: string }) => void;
   /** Real armed paper runs reported by /api/v1/operations (empty when none). */
   armedPaperRuns?: ReadonlyArray<DeploymentRow>;
+  paperClient?: PaperClient;
   /** Replay the post-wizard setup tour. Absent in tests that render home alone. */
   onReplaySetupTour?: () => void;
 };
@@ -59,6 +62,7 @@ export function AppHome({
   loadStarters,
   onStarterReady,
   armedPaperRuns = [],
+  paperClient,
   onReplaySetupTour,
 }: AppHomeProps): JSX.Element {
   const [chooserOpen, setChooserOpen] = useState(false);
@@ -105,6 +109,10 @@ export function AppHome({
   }
 
   const primaryPaperRun = armedPaperRuns[0] ?? null;
+  const health = usePaperHealth(primaryPaperRun ? paperClient : undefined, primaryPaperRun ? {
+    venue: primaryPaperRun.venue,
+    pair: primaryPaperRun.pair,
+  } : undefined, primaryPaperRun);
   const hasPaperRun = primaryPaperRun !== null;
   const primaryPaperTitle = primaryPaperRun
     ? friendlyPaperRunName(primaryPaperRun.pack_id)
@@ -133,13 +141,13 @@ export function AppHome({
                 className="app-home__active-paper"
                 data-testid="app-home-active-paper"
                 data-paper-state={
-                  primaryPaperRun.entries_paused ? "waiting" : "running"
+                  health?.state === "checked" || health?.state === "filled" ? "running" : "waiting"
                 }
                 role="status"
               >
                 <span
                   className={
-                    primaryPaperRun.entries_paused
+                    health?.state !== "checked" && health?.state !== "filled"
                       ? "app-home__active-paper-dot app-home__active-paper-dot--waiting"
                       : "app-home__active-paper-dot"
                   }
@@ -147,14 +155,14 @@ export function AppHome({
                 />
                 <div className="app-home__active-paper-copy">
                   <p className="app-home__active-paper-title">
-                    {primaryPaperRun.entries_paused ? "Waiting" : "Running"}:{" "}
+                    {health?.state === "checked" || health?.state === "filled" ? "Running" : "Waiting"}:{" "}
                     {primaryPaperTitle}
                     {extraPaperRunCount > 0
                       ? ` (+${extraPaperRunCount} more)`
                       : ""}
                   </p>
                   <p className="app-home__active-paper-note">
-                    Paper only on this computer — pretend money, no real orders.
+                    {paperClient?.getHealth ? paperHealthSentence(health) : "Paper only on this computer — pretend money, no real orders."}
                   </p>
                 </div>
               </div>

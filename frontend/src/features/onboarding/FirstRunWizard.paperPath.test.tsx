@@ -537,6 +537,9 @@ describe("App wizard paper path opens the shell after Looks good", () => {
         if (url.endsWith("/api/v1/commands")) {
           return Response.json({ ok: true, code: "armed", message: "armed" });
         }
+        if (url.includes("/api/v1/paper/health")) {
+          return Response.json({ armed: true, state: "waiting" });
+        }
         if (url.includes("/api/v1/paper/status")) {
           return Response.json({
             schema_version: "1",
@@ -576,7 +579,7 @@ describe("App wizard paper path opens the shell after Looks good", () => {
     fireEvent.click(screen.getByTestId("first-run-wizard-primary"));
     await waitFor(() => {
       expect(screen.getByTestId("first-run-wizard-sentence").textContent).toBe(
-        "It’s running on this computer (paper only — not live trading).",
+        "Waiting for the first market check.",
       );
     });
     expect(screen.getByTestId("first-run-wizard-status-chip").textContent).toBe(
