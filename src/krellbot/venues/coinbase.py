@@ -34,6 +34,7 @@ from krellbot.venues.base import (
     OpenOrder,
     OrderRef,
     PairRules,
+    ProtectiveStopRejectedError,
     Truth,
     WithdrawCapableError,
 )
@@ -406,7 +407,8 @@ class CoinbaseVenue:
                 },
             },
         )
-        if not _entry_filled(entry):
+        filled_qty = _entry_filled_qty(entry, requested=lot)
+        if filled_qty is None:
             raise RuntimeError("coinbase entry was not filled; stop not placed")
 
         stop_body = {
@@ -418,13 +420,13 @@ class CoinbaseVenue:
                     "stop_price": format(price_stop, "f"),
                     "limit_price": format(limit_price, "f"),
                     "stop_direction": "STOP_DIRECTION_STOP_DOWN",
-                    "base_size": format(lot, "f"),
+                    "base_size": format(filled_qty, "f"),
                 },
             },
         }
         stop_resp = self._post("/api/v3/brokerage/orders", stop_body)
         if not _order_ok(stop_resp):
-            raise RuntimeError("coinbase stop was not accepted")
+            raise ProtectiveStopRejectedError("coinbase stop was not accepted")
         stop_id = _extract_order_id(stop_resp)
         ref = OrderRef(
             id=_extract_order_id(entry) or stop_id,
@@ -432,7 +434,7 @@ class CoinbaseVenue:
             pair=product,
             side="buy",
             qty=lot,
-            filled_qty=lot,
+            filled_qty=filled_qty,
             stop_price=price_stop,
         )
         self._recent[coid] = ref
@@ -662,22 +664,20 @@ def _optional_decimal(raw: Any) -> Decimal | None:
         return None
 
 
-def _entry_filled(resp: Any) -> bool:
-    """True only when the create-order body says the IOC actually filled."""
+def _entry_filled_qty(resp: Any, *, requested: Decimal) -> Decimal | None:
+    """Read the confirmed IOC fill, using FILLED only when size is omitted."""
     if not isinstance(resp, dict) or resp.get("success") is not True:
-        return False
+        return None
     box = resp.get("success_response")
     if not isinstance(box, dict):
-        return False
-    if str(box.get("status", "")).upper() == "FILLED":
-        return True
+        return None
     raw = box.get("filled_size")
     if raw in (None, ""):
-        return False
-    try:
-        return Decimal(str(raw)) > 0
-    except (ValueError, ArithmeticError):
-        return False
+        return requested if str(box.get("status", "")).upper() == "FILLED" else None
+    filled = _optional_decimal(raw)
+    if filled is None or not filled.is_finite() or not Decimal(0) < filled <= requested:
+        return None
+    return filled
 
 
 def _order_ok(resp: Any) -> bool:

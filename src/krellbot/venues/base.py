@@ -200,6 +200,10 @@ class KeyProbeResult:
         return KeyPerms(can_trade=False, can_withdraw=False)
 
 
+class ProtectiveStopRejectedError(RuntimeError):
+    """The venue filled an entry and refused the protective stop."""
+
+
 class WithdrawCapableError(RuntimeError):
     """Raised when `check_key` finds the key can withdraw. Engine refuses it.
 

@@ -58,7 +58,7 @@ from krellbot.storage.outbox import (
     audited_coids,
     dispatched_coids,
 )
-from krellbot.venues.base import OrderRef, PairRules
+from krellbot.venues.base import OrderRef, PairRules, ProtectiveStopRejectedError
 from krellbot.venues.paper import SLIPPAGE_BPS
 
 from .lock import TickLock
@@ -411,7 +411,11 @@ def _dispatch_place(
             )
 
     store = OperationalStore(home / "ops.sqlite")
-    state = Outbox(store).dispatch(coid, body, _send, mode=mode, venue=venue)
+    try:
+        state = Outbox(store).dispatch(coid, body, _send, mode=mode, venue=venue)
+    except ProtectiveStopRejectedError:
+        audit_needs_reconcile(store, coid=coid)
+        raise
     if state == "needs_reconcile":
         audit_needs_reconcile(store, coid=coid)
     return state, captured[0]
@@ -822,6 +826,9 @@ def tick(
                                 any_refused = True
                                 print(f"intent refused: {exc.code}", flush=True)
                                 entry_qty = Decimal(0)
+                            except ProtectiveStopRejectedError:
+                                ensure_stop_failed = True
+                                print("entry protective stop rejected; reconciliation required", flush=True)
                             except (RuntimeError, ValueError):
                                 entry_qty = Decimal(0)
             elif target.reason == "exit" and owned > Decimal(0):
