@@ -42,6 +42,9 @@ SUI/USD strategies remain available. The Run form indicates whether the
 selected market has scheduled candles, needs offline replay, or has not yet
 been verified. Scheduled coverage in this interface currently names Kraken
 BTC/USD and SUI/USD, Coinbase BTC/USD, and Binance BTC/USDT at 1h, 4h, and 1d.
+Kraken ETH/USD (`ETHUSD`) and Coinbase ETH/USD (`ETH-USD`) have fixture
+coverage at 1h, including public response parsing, instrument minimums and
+increments, the venue fee model, simulated fills, and metadata refusals.
 
 The paper acceptance suite exercises one spot market per registered venue
 using pinned candles and instrument rules. For each market it validates and

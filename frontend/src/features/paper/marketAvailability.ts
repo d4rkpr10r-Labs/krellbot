@@ -1,6 +1,6 @@
 /** Known paper markets with scheduled candles or verified offline replay. */
 const scheduledMarkets: Record<string, readonly string[]> = {
-  kraken: ["XXBTZUSD", "SUIUSD"], coinbase: ["BTC-USD"], binance: ["BTCUSDT"],
+  kraken: ["XXBTZUSD", "SUIUSD", "ETHUSD"], coinbase: ["BTC-USD", "ETH-USD"], binance: ["BTCUSDT"],
 };
 const replayMarkets: Record<string, string> = {
   gate: "BTC-USDT", pionex: "BTC-USDT", okx: "BTC-USDT", bybit: "BTCUSDT",
@@ -9,7 +9,8 @@ const replayMarkets: Record<string, string> = {
   htx: "BTCUSDT", btcc: "BTCUSDT", cryptocom: "BTC-USDT",
 };
 export function paperMarketAvailability(venue: string, pair: string, timeframe: string): string {
-  if (scheduledMarkets[venue]?.includes(pair) && ["1h", "4h", "1d"].includes(timeframe)) {
+  if (scheduledMarkets[venue]?.includes(pair) &&
+      ((pair === "ETHUSD" || pair === "ETH-USD") ? timeframe === "1h" : ["1h", "4h", "1d"].includes(timeframe))) {
     return "Scheduled public prices are available for this market.";
   }
   if (replayMarkets[venue] === pair) {
