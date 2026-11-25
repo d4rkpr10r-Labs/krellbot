@@ -190,9 +190,8 @@ def verify_native_archive(args: argparse.Namespace) -> None:
             if log.exists():
                 shutil.copyfile(log, args.output.with_suffix(".log"))
 
-        if args.platform == "windows":
-            evidence_dir = Path(os.environ["RUNNER_TEMP"]) / "installed-preview-evidence"
-            run("node", ROOT / "scripts/ci_smoke_installed_preview.mjs", extracted, evidence_dir)
+        if args.browser_evidence:
+            run("node", ROOT / "scripts/ci_smoke_installed_preview.mjs", extracted, args.browser_evidence)
 
     args.output.write_text(
         json.dumps(
@@ -206,6 +205,7 @@ def verify_native_archive(args: argparse.Namespace) -> None:
                 "signing_requested": args.sign_requested,
                 "detail": detail,
                 "install_smoke": "passed",
+                "browser_smoke": "passed" if args.browser_evidence else "not_run",
                 "warning_behavior": "manual_native_check_required",
                 "install_method": install_method,
                 "executable_sha256": binary_digest,
@@ -228,6 +228,7 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--sha")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--browser-evidence", type=Path)
     args = parser.parse_args()
     try:
         if args.require_signing_inputs:

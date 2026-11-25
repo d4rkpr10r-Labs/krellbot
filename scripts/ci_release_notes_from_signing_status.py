@@ -34,6 +34,7 @@ def verified_markers(root: Path, sha: str) -> list[dict]:
             or marker.get("sha256") != digest
             or marker.get("size") != manifest["size"]
             or marker.get("install_smoke") != "passed"
+            or (target != "macos" and marker.get("browser_smoke") != "passed")
             or type(marker.get("signing_requested")) is not bool
             or type(marker.get("signed")) is not bool
         ):

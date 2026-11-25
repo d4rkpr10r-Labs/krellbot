@@ -29,10 +29,12 @@ or `signing-status-<os>-<arch>.json` (dispatch/tag). These reports come
 from verifying and opening the exact archive on its native runner. The
 CI paper smoke exercises the installed runtime, workstation shell, and
 example pack with an isolated profile. Its upgrade check replaces an
-existing same-version program and restores its prior files. Windows
-also records the bundled installer, Start-menu shortcut, and
-no-argument launch in `windows-installed-preview-evidence`. The macOS
-archive smoke stages the extracted bundle or one-dir payload.
+existing same-version program and restores its prior files. Linux and
+Windows also exercise the bundled installer, desktop entry or
+Start-menu shortcut, no-argument launch, and onboarding in Chromium.
+See `linux-installed-preview-evidence` and
+`windows-installed-preview-evidence`. The macOS archive smoke stages the
+extracted bundle or one-dir payload.
 
 For the M19 outsider check, use a clean account and then an account with
 a previous supported release. Record the exact digest and OS version,

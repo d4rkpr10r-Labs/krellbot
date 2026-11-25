@@ -237,6 +237,7 @@ def test_release_promotion_requires_exact_verified_archives(tmp_path) -> None:
             "sha256": digest,
             "size": len(payload),
             "install_smoke": "passed",
+            "browser_smoke": "not_run" if platform == "macos" else "passed",
             "signed": platform in VERIFIED_SIGNATURE,
             "signing_requested": True,
             "detail": VERIFIED_SIGNATURE.get(platform, "checksum_pinned_policy"),

@@ -44,19 +44,23 @@ jobs:
           - os: macos-latest
             arch: arm64
             platform_tag: macos
+            browser: false
             archive_name: krellbot-macos-arm64.zip
           - os: ubuntu-latest
             arch: x86_64
             platform_tag: linux
+            browser: true
             archive_name: krellbot-linux-x86_64.zip
           - os: windows-latest
             arch: x86_64
             platform_tag: windows
+            browser: true
             archive_name: krellbot-windows-x86_64.zip
     runs-on: ${{ matrix.os }}
     env:
       PYTHON_KEYRING_BACKEND: keyring.backends.fail.Keyring
       KRELLBOT_VERSION: "0.9.7"
+      VERIFY_BROWSER: ${{ matrix.browser }}
       # Pass the immutable release base URL through from the repo
       # variable explicitly so the fail-closed verification step
       # always has the variable available. If the repo variable is
@@ -258,10 +262,17 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Install Chromium for native Windows installed-app qualification
-        if: matrix.os == 'windows-latest'
+      - name: Install Chromium for native installed-app qualification
+        if: matrix.browser
         working-directory: frontend
-        run: npx playwright install chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Linux ]; then
+            npx playwright install --with-deps chromium
+          else
+            npx playwright install chromium
+          fi
 
       # ------------------------------------------------------------------
       # Platform signing (secrets-gated). PR CI always stays unsigned.
@@ -538,6 +549,9 @@ jobs:
           if [ "${SIGNING_REQUESTED}" = true ]; then
             args+=(--sign-requested)
           fi
+          if [ "$VERIFY_BROWSER" = true ]; then
+            args+=(--browser-evidence "$RUNNER_TEMP/installed-preview-evidence")
+          fi
           uv run python scripts/ci_verify_frozen_archive.py \
             --platform "$VERIFY_PLATFORM" --sha "$GITHUB_SHA" \
             --archive "artifacts/$VERIFY_ARCHIVE" \
@@ -599,11 +613,15 @@ jobs:
           VERIFY_ARCHIVE: ${{ matrix.archive_name }}
         run: |
           set -euo pipefail
+          args=()
+          if [ "$VERIFY_BROWSER" = true ]; then
+            args+=(--browser-evidence "$RUNNER_TEMP/installed-preview-evidence")
+          fi
           uv run python scripts/ci_verify_frozen_archive.py \
             --platform "$VERIFY_PLATFORM" --sha "$GITHUB_SHA" \
             --archive "candidate-artifacts/$VERIFY_ARCHIVE" \
             --manifest "candidate-artifacts/$VERIFY_ARCHIVE.json" \
-            --output "candidate-artifacts/native-install.json"
+            --output "candidate-artifacts/native-install.json" "${args[@]}"
 
       - name: Upload unsigned merge-group candidate
         if: github.event_name == 'merge_group' || github.event_name == 'pull_request'
@@ -614,11 +632,11 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Preserve native Windows installed-app evidence
-        if: always() && matrix.os == 'windows-latest'
+      - name: Preserve native installed-app evidence
+        if: always() && matrix.browser
         uses: actions/upload-artifact@v4
         with:
-          name: windows-installed-preview-evidence
+          name: ${{ matrix.platform_tag }}-installed-preview-evidence
           path: |
             ${{ runner.temp }}/installed-preview-evidence/installed-preview.json
             ${{ runner.temp }}/installed-preview-evidence/*.png
