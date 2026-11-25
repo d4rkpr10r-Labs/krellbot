@@ -152,7 +152,7 @@ export function PaperPnlPositionChart({
         <>
           <SeriesChart
             title="P&L"
-            source="paper fills · cash + qty×mark − starting_cash"
+            source="Simulated fills · cash and holdings minus starting balance"
             testId="paper-pnl-chart"
             series={pnlValues.length > 0 ? pnlValues : null}
             formatTick={formatCashTick}
@@ -162,8 +162,8 @@ export function PaperPnlPositionChart({
             title={secondaryKind === "position" ? "Position" : "Marks"}
             source={
               secondaryKind === "position"
-                ? "journal.owned_qty_after · base qty over time"
-                : "paper fills · mark price series"
+                ? "Simulated asset holdings over time"
+                : "Market prices recorded at simulated fills"
             }
             testId={
               secondaryKind === "position"

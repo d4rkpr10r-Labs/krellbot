@@ -131,18 +131,27 @@ try {
   // Readiness/meta/bootstrap/CSRF/Host/origin are never mocked or bypassed.
   const response = await page.goto(url);
   check('Installed shell serves HTML, not shell_not_built', response.status() === 200);
-  // A fresh install mounts only the first-run wizard. Skip it, then require home.
   const wizard = page.getByTestId('first-run-wizard');
-  if (await wizard.count()) {
-    const skip = page.getByTestId('first-run-wizard-skip');
-    const primary = page.getByTestId('first-run-wizard-primary');
-    if ((await skip.count()) === 0 && (await primary.count()) > 0) {
-      await primary.click();
-      await expect(skip).toBeVisible();
-    }
-    await skip.click();
-    await expect(wizard).toHaveCount(0);
-  }
+  await expect(wizard).toHaveAttribute('data-wizard-step', 'welcome');
+  const primary = page.getByTestId('first-run-wizard-primary');
+  await expect(wizard.getByTestId('first-run-wizard-sentence')).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(primary).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(wizard).toHaveAttribute('data-wizard-step', 'choose');
+  const useStarter = page.getByTestId('first-run-wizard-use-starter-dual-ma-crossover');
+  await useStarter.click();
+  await expect(wizard).toHaveAttribute('data-wizard-step', 'start_paper');
+  await page.reload();
+  await expect(wizard).toHaveAttribute('data-wizard-step', 'start_paper');
+  await wizard.getByRole('button', {name: 'Back to strategies'}).click();
+  await useStarter.click();
+  await primary.click();
+  await expect(wizard.getByTestId('first-run-wizard-sentence')).toContainText('Waiting for the first market check');
+  await primary.click();
+  await primary.click();
+  await expect(wizard).toHaveCount(0);
+  check('Keyboard onboarding, reload recovery and real paper arm', true);
   const workspace = page.getByTestId('app-home');
   await expect(workspace).toBeVisible();
   // Skipping the wizard arms the setup tour. Dismiss it, then require home.
@@ -163,6 +172,10 @@ try {
     await expect(navigation.getByRole('button', {name: label, exact: true})).toHaveAttribute('aria-pressed', 'true');
     check(`${label} navigation reachable`, true);
   }
+  await navigation.getByRole('button', {name: 'Run', exact: true}).click();
+  await page.getByRole('button', {name: 'Stop paper run', exact: true}).click();
+  await expect(page.getByTestId('paper-status-empty')).toBeVisible();
+  check('Stop updates the real paper run state', true);
   await navigation.getByTestId('kbot-nav-more-toggle').click();
   await expect(navigation.getByTestId('kbot-nav-more')).toBeVisible();
   for (const [view, label] of [
@@ -190,7 +203,7 @@ try {
   await page.screenshot({path: path.join(evidence, 'installed-home-mobile.png'), fullPage: true});
   report.screenshots.push('installed-home-mobile.png');
   check('No uncaught JavaScript errors', report.pageErrors.length === 0);
-  check('No product commands or external requests', report.requests.every(request => request.path === '/api/v1/session/bootstrap' || request.method === 'GET'));
+  check('Writes are limited to session, starter, and paper commands', report.requests.every(request => request.method === 'GET' || /^\/api\/v1\/(session\/bootstrap|strategies\/drafts(?:\/[^/]+\/validate)?|commands)$/.test(request.path)));
   await context.close();
   await browser.close();
   browser = null;
