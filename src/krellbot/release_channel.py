@@ -10,6 +10,10 @@ when secrets are present; that alone does not flip this module.
 
 from __future__ import annotations
 
+import json
+import re
+import sys
+from pathlib import Path
 from typing import Literal
 
 CHANNEL_PRERELEASE = "prerelease"
@@ -70,9 +74,18 @@ def version_payload() -> dict[str, object]:
     from krellbot import __version__
 
     ensure_channel_honesty()
-    return {
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "version": __version__,
         "channel": RELEASE_CHANNEL,
         "artifacts_signed": ARTIFACTS_SIGNED,
     }
+    if getattr(sys, "frozen", False):
+        try:
+            identity = json.loads((Path(sys._MEIPASS) / "krellbot-build.json").read_text(encoding="utf-8"))
+            commit = identity.get("source_commit")
+            if isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit):
+                payload["source_commit"] = commit
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+    return payload

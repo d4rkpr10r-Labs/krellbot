@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -104,6 +105,15 @@ _HASH_CHUNK = 1 << 20  # 1 MiB
 _URL_SCHEMES = frozenset({"http", "https"})
 
 
+def _source_commit(bundle: Path) -> str | None:
+    try:
+        data = json.loads((bundle / "_internal" / "krellbot-build.json").read_text(encoding="utf-8"))
+        commit = data.get("source_commit")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    return commit if isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit) else None
+
+
 def _validate_dist(dist: Path, *, os_tag: str) -> None:
     """Raise if `dist` doesn't look like a usable one-dir build.
 
@@ -132,9 +142,7 @@ def _validate_dist(dist: Path, *, os_tag: str) -> None:
     exe_name = _EXE_WINDOWS if os_tag == "windows" else _EXE_POSIX
     exe = dist / exe_name
     if not exe.is_file():
-        raise FileNotFoundError(
-            f"required executable not found in dist: {exe_name} (os={os_tag})"
-        )
+        raise FileNotFoundError(f"required executable not found in dist: {exe_name} (os={os_tag})")
 
     # The UI payload must live somewhere under the dist tree. Look at
     # the dist root first, then the `_internal/frontend/dist/...` layout
@@ -148,10 +156,7 @@ def _validate_dist(dist: Path, *, os_tag: str) -> None:
     ]
     if not any(p.is_file() for p in candidates):
         searched = ", ".join(str(p.relative_to(dist)) for p in candidates)
-        raise FileNotFoundError(
-            f"required payload missing: {_STATIC_REL.as_posix()} "
-            f"(looked under: {searched})"
-        )
+        raise FileNotFoundError(f"required payload missing: {_STATIC_REL.as_posix()} (looked under: {searched})")
 
     # The pack schema is loaded at runtime through importlib.resources.
     # A one-dir bundle without it fails every lint/arm with
@@ -166,15 +171,13 @@ def _validate_dist(dist: Path, *, os_tag: str) -> None:
     if schema is None:
         searched = ", ".join(str(p.relative_to(dist)) for p in schema_candidates)
         raise FileNotFoundError(
-            f"required runtime data missing: {_PACK_SCHEMA_REL.as_posix()} "
-            f"(looked under: {searched})"
+            f"required runtime data missing: {_PACK_SCHEMA_REL.as_posix()} (looked under: {searched})"
         )
     try:
         json.loads(schema.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(
-            f"required runtime data is not valid JSON: {schema.relative_to(dist)}: "
-            f"{type(exc).__name__}"
+            f"required runtime data is not valid JSON: {schema.relative_to(dist)}: {type(exc).__name__}"
         ) from exc
 
     resolved_dist = dist.resolve()
@@ -194,9 +197,7 @@ def _validate_dist(dist: Path, *, os_tag: str) -> None:
                 # the same as a broken link for safety.
                 raise ValueError(f"dangling symlink in dist: {member.relative_to(dist)}")
             if not target.is_relative_to(resolved_dist):
-                raise ValueError(
-                    f"escaping symlink: {member.relative_to(dist)} -> {target}"
-                )
+                raise ValueError(f"escaping symlink: {member.relative_to(dist)} -> {target}")
 
         # Absolute or traversal paths must never reach the zip member list.
         try:
@@ -210,13 +211,9 @@ def _validate_dist(dist: Path, *, os_tag: str) -> None:
 
 def _validate_tags(*, os_tag: str, arch: str) -> None:
     if os_tag not in _OS_TAGS:
-        raise ValueError(
-            f"unknown os tag {os_tag!r}; expected one of {sorted(_OS_TAGS)}"
-        )
+        raise ValueError(f"unknown os tag {os_tag!r}; expected one of {sorted(_OS_TAGS)}")
     if arch not in _ARCH_TAGS:
-        raise ValueError(
-            f"unknown arch tag {arch!r}; expected one of {sorted(_ARCH_TAGS)}"
-        )
+        raise ValueError(f"unknown arch tag {arch!r}; expected one of {sorted(_ARCH_TAGS)}")
 
 
 def _validate_url(url: str, *, filename: str) -> None:
@@ -229,21 +226,16 @@ def _validate_url(url: str, *, filename: str) -> None:
     misconfigured CDN serve the wrong artifact under the right URL.
     """
     if not url or not url.strip():
-        raise ValueError(
-            "manifest url is empty; release automation must pin a configured release base URL"
-        )
+        raise ValueError("manifest url is empty; release automation must pin a configured release base URL")
     parsed = urlparse(url)
     if parsed.scheme.lower() not in _URL_SCHEMES:
-        raise ValueError(
-            f"manifest url has invalid scheme {parsed.scheme!r}; expected one of {sorted(_URL_SCHEMES)}"
-        )
+        raise ValueError(f"manifest url has invalid scheme {parsed.scheme!r}; expected one of {sorted(_URL_SCHEMES)}")
     if not parsed.netloc:
         raise ValueError(f"manifest url is missing a host: {url!r}")
     url_basename = Path(parsed.path).name
     if url_basename != filename:
         raise ValueError(
-            f"manifest url basename {url_basename!r} does not match archive "
-            f"filename {filename!r}; refusing"
+            f"manifest url basename {url_basename!r} does not match archive filename {filename!r}; refusing"
         )
 
 
@@ -402,6 +394,9 @@ def build_archive(
         "version": version,
         "sha256": "",  # placeholder; overwritten after hashing
     }
+    commit = _source_commit(dist)
+    if commit is not None:
+        manifest["source_commit"] = commit
 
     _write_zip(dist, output)
 
@@ -443,6 +438,9 @@ def build_macos_app_archive(
         "version": version,
         "sha256": "",
     }
+    commit = _source_commit(app / "Contents" / "MacOS")
+    if commit is not None:
+        manifest["source_commit"] = commit
     _write_zip_prefixed(app, output, archive_root_name=app.name)
     digest = _sha256_of(output)
     size = output.stat().st_size
