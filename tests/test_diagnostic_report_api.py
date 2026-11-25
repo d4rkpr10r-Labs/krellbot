@@ -73,7 +73,7 @@ def test_report_bounds_and_allowlists_evidence(home):
     report = json.loads(body)
     assert len(report["events"]) == 100
     assert report["events"][0]["ts"] == armed.armed_at_ts + 6
-    assert report["events"][-1]["refusal_code"] is None
+    assert report["events"][-1]["refusal_code"] == "other"
     assert report["events"][-2]["refusal_code"] == "metadata_stale"
     assert all(set(event) == {"ts", "venue", "pair", "source", "refusal_code"} for event in report["events"])
 

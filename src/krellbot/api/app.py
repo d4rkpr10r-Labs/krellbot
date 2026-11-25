@@ -2833,7 +2833,7 @@ def create_app(
             paper_markets = {
                 (item.venue, item.pair, item.pack_id): item.armed_at_ts for item in armed if item.mode == "paper"
             }
-        except (OSError, ValueError, TypeError, KeyError):
+        except (OSError, ValueError, TypeError, KeyError, ArithmeticError):
             paper_markets = {}
         events = []
         for record in _read_journal_records(s.home):
@@ -2862,7 +2862,7 @@ def create_app(
                     "venue": venue,
                     "pair": pair,
                     "source": "journal",
-                    "refusal_code": code if code in allowed_codes else None,
+                    "refusal_code": code if code in allowed_codes else ("other" if code else None),
                 }
             )
         events.sort(key=lambda event: event["ts"])
