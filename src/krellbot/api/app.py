@@ -2591,7 +2591,17 @@ def create_app(
         if denied is not None:
             return denied
 
-        rows = operations_view_app.list_unresolved_orders(s.home, now=_now_seconds())
+        from krellbot.execution.obligations import ObligationsUnavailable
+
+        try:
+            rows = operations_view_app.list_unresolved_orders(s.home, now=_now_seconds())
+        except ObligationsUnavailable as exc:
+            # Unknown is not empty: say so instead of showing a clean list.
+            return JSONResponse(
+                {"schema_version": SCHEMA_VERSION, "error": "obligations_unavailable", "code": exc.code},
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
         return JSONResponse(
             {"schema_version": SCHEMA_VERSION, "orders": rows},
             status_code=200,

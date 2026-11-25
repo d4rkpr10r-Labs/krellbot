@@ -43,7 +43,7 @@ from krellbot import secrets as kb_secrets
 from krellbot.application import live_gate
 from krellbot.data.instruments import InstrumentMetadataError
 from krellbot.domain import trace as kb_trace
-from krellbot.execution import reservations as kb_reservations
+from krellbot.execution import obligations as kb_obligations
 from krellbot.pack import evaluate as kb_evaluate
 from krellbot.pack import lint as kb_pack_lint
 from krellbot.pack.model import Candle as Candle
@@ -59,13 +59,16 @@ from krellbot.storage.outbox import (
     audited_coids,
     dispatched_coids,
 )
-from krellbot.venues.base import OrderRef, PairRules, ProtectiveStopRejectedError
+from krellbot.venues.base import OrderOutcome, OrderRef, PairRules, ProtectiveStopRejectedError
 from krellbot.venues.paper import SLIPPAGE_BPS
 
 from .lock import TickLock
 
 # Tick ``intent_refused`` code when journal history for an arm cannot be attributed.
 OWNERSHIP_AMBIGUOUS = "ownership_ambiguous"
+# Journal ``reason`` for a record that accounts a reconciled intent's outcome.
+RECONCILED_REASON = "reconciled"
+_QTY_FIELD_FOR_INTENT = {"entry": "entry_qty", "exit": "exit_qty", "stop": "stop_qty"}
 
 
 # ---- coid ----------------------------------------------------------------
@@ -382,6 +385,7 @@ def _dispatch_place(
     coid: str,
     body: str,
     venue_obj: Any,
+    identity: dict | None = None,
 ) -> tuple[str, OrderRef | None]:
     """Commit-before-send dispatch for every ``place_*`` call.
 
@@ -415,6 +419,10 @@ def _dispatch_place(
                 pair=str(payload["pair"]),
             )
 
+    if identity:
+        # Owner context travels in the committed intent itself, durable before
+        # any send, so a later process can attribute the outcome.
+        body = json.dumps({**json.loads(body), **identity}, separators=(",", ":"), sort_keys=True)
     store = OperationalStore(home / "ops.sqlite")
     try:
         state = Outbox(store).dispatch(coid, body, _send, mode=mode, venue=venue)
@@ -573,6 +581,11 @@ def tick(
         cache = kb_license.read_cache(home)
 
         snap = venue_obj.snapshot()
+        # Settle durable intents from venue evidence before any new decision,
+        # independent of signals, bars or which packs are armed now.
+        _resolve_obligations(home, venue=venue, venue_obj=venue_obj, snap=snap, journal=journal, now=now)
+        snap = venue_obj.snapshot()
+        obligations_view = kb_obligations.read_obligations(home)
         snap_balances = _snapshot_balances(snap)
         snap_orders = _snapshot_orders(snap)
         fills_before = {f.coid for f in (snap.recent_fills or [])}
@@ -649,6 +662,7 @@ def tick(
                         home=home,
                         mode=armed.mode,
                         venue=venue,
+                        identity=_intent_identity(armed, bar_ts),
                         coid=stop_coid,
                         body=stop_body,
                         venue_obj=venue_obj,
@@ -690,6 +704,7 @@ def tick(
                             home=home,
                             mode=armed.mode,
                             venue=venue,
+                            identity=_intent_identity(armed, bar_ts),
                             coid=exit_coid,
                             body=exit_body,
                             venue_obj=venue_obj,
@@ -742,10 +757,10 @@ def tick(
             entry_coid_for_signal = ""
             kill_engaged = live_gate.kill_state(home).engaged
             entries_suppressed = armed.entries_paused or kill_engaged
-            try:
-                reconcile_blocked = kb_reservations.should_block_for_reconcile(home)
-            except StoreError:
-                reconcile_blocked = True
+            # Unresolved intents on this venue and mode (or of unknown scope),
+            # or an unreadable store, hold new entries. Exits and protection
+            # are not gated here.
+            reconcile_blocked = obligations_view.blocks_entries(venue=venue, mode=armed.mode)
             metadata_refusal: str | None = None
             rules: PairRules | None = None
             try:
@@ -804,6 +819,7 @@ def tick(
                                     home=home,
                                     mode=armed.mode,
                                     venue=venue,
+                                    identity=_intent_identity(armed, bar_ts),
                                     coid=entry_coid_for_signal,
                                     body=entry_body,
                                     venue_obj=venue_obj,
@@ -837,12 +853,11 @@ def tick(
                                         (f for f in (snap_dedup.recent_fills or []) if f.coid == entry_coid_for_signal),
                                         None,
                                     )
+                                    # A prior process sent this coid. Credit only a fill the
+                                    # venue reports; never invent the requested quantity.
                                     if dedup_fill is not None:
                                         owned = Decimal(str(dedup_fill.qty))
                                         entry_qty = Decimal(str(dedup_fill.qty))
-                                    else:
-                                        owned = qty
-                                        entry_qty = qty
                             except StoreError as exc:
                                 pack_intent_refused[armed.pack_id] = exc.code
                                 any_refused = True
@@ -877,6 +892,7 @@ def tick(
                         home=home,
                         mode=armed.mode,
                         venue=venue,
+                        identity=_intent_identity(armed, bar_ts),
                         coid=exit_coid,
                         body=exit_body,
                         venue_obj=venue_obj,
@@ -1026,6 +1042,159 @@ def journal_tail(n: int = 5, *, home: Path | None = None) -> int:
 
 
 # ---- internals ------------------------------------------------------------
+
+
+def reconcile_intents(*, venue: str, venue_obj: Any, home: Path | None = None, clock=None) -> str:
+    """Settle unresolved intents for ``venue`` from venue evidence, now.
+
+    Takes the same per-venue lock as ``tick`` so an explicit request and a
+    scheduled tick cannot account the same outcome twice. Returns ``"busy"``
+    when a tick holds the lock, otherwise ``"done"``. It never sends orders.
+    """
+    home = Path(home) if home is not None else kb_paths.home()
+    lock = TickLock(home, venue)
+    if not lock.acquire():
+        return "busy"
+    try:
+        now = clock() if clock is not None else _now_seconds()
+        _resolve_obligations(
+            home, venue=venue, venue_obj=venue_obj, snap=venue_obj.snapshot(), journal=kb_journal.append, now=now
+        )
+        return "done"
+    finally:
+        lock.release()
+
+
+def _resolve_obligations(home: Path, *, venue: str, venue_obj: Any, snap: Any, journal, now: float) -> None:
+    """Record evidence for each unresolved intent on ``venue`` and retire what it settles.
+
+    Order of durable writes per intent: observation row, then journal
+    accounting (idempotent by ``resolved_coid``), then the resolution row.
+    An interruption anywhere leaves a state the next call converges from
+    without double counting. Nothing is resubmitted.
+    """
+    view = kb_obligations.read_obligations(home)
+    if not view.available:
+        return
+    lookup = getattr(venue_obj, "order_outcome", None)
+    store = OperationalStore(home / "ops.sqlite")
+    for intent in view.unresolved:
+        if intent.venue != venue or intent.pair is None:
+            continue
+        outcome: OrderOutcome | None = None
+        if lookup is not None:
+            try:
+                outcome = lookup(intent.coid, pair=intent.pair)
+            except (InstrumentMetadataError, RuntimeError, ValueError, OSError):
+                outcome = None
+        if not isinstance(outcome, OrderOutcome) or outcome.status == "unknown":
+            # The outcome cannot be established: keep the intent unresolved and
+            # make sure it is audited for reconcile (critical alert), once.
+            if not intent.marked:
+                audit_needs_reconcile(store, coid=intent.coid)
+            continue
+        kb_obligations.record_observation(
+            store,
+            coid=intent.coid,
+            status=outcome.status,
+            filled_qty=outcome.filled_qty,
+            previous=intent.last_observation,
+        )
+        needs_accounting = outcome.status in ("filled", "partial") or (
+            outcome.status == "open" and intent.kind == "stop"
+        )
+        if needs_accounting and not _account_intent(home, intent, outcome, venue=venue, journal=journal, now=now):
+            continue  # no durable owner context: never assign it to whoever is armed now
+        if outcome.status == "absent" and outcome.authoritative:
+            kb_obligations.record_resolution(
+                store, coid=intent.coid, outcome="absent", filled_qty=Decimal(0), evidence="venue_record_complete"
+            )
+        elif outcome.status == "open" and intent.kind == "stop":
+            kb_obligations.record_resolution(
+                store, coid=intent.coid, outcome="open", filled_qty=Decimal(0), evidence="protective_stop_resting"
+            )
+        elif outcome.status == "filled" and outcome.authoritative:
+            if intent.kind == "entry" and not _protected_or_flat(home, intent, venue=venue, snap=snap):
+                continue  # executed but unprotected: the arm's ensure-stop path must act first
+            kb_obligations.record_resolution(
+                store, coid=intent.coid, outcome="filled", filled_qty=outcome.filled_qty, evidence="venue_fill"
+            )
+
+
+def _account_intent(home: Path, intent, outcome: OrderOutcome, *, venue: str, journal, now: float) -> bool:
+    """Journal the executed quantity of ``intent`` once; False without owner context."""
+    field = _QTY_FIELD_FOR_INTENT.get(intent.kind or "")
+    if field is None or intent.pack_id is None or intent.mode is None:
+        return False
+    already = Decimal(0)
+    already_ids: set[str] = set()
+    for rec in kb_journal.read_records_lenient(home):
+        detail = rec.get("detail") if isinstance(rec, dict) else None
+        if rec.get("kind") != "tick" or not isinstance(detail, dict) or detail.get("resolved_coid") != intent.coid:
+            continue
+        try:
+            already += Decimal(str(detail.get(field) or "0"))
+        except (ArithmeticError, ValueError):
+            pass
+        ids = detail.get("stop_fill_ids")
+        if isinstance(ids, list):
+            already_ids.update(i for i in ids if isinstance(i, str))
+    has_record = already > 0 or bool(already_ids) or _has_resolved_record(home, intent.coid)
+    delta = outcome.filled_qty - already
+    if delta <= 0 and has_record:
+        return True
+    detail: dict = {
+        "pair": intent.pair,
+        "mode": intent.mode,
+        "reason": RECONCILED_REASON,
+        "resolved_coid": intent.coid,
+        "entry_qty": "0",
+        "exit_qty": "0",
+        "stop_qty": "0",
+    }
+    if delta > 0:
+        detail[field] = str(delta)
+    if intent.kind in ("entry", "stop"):
+        # Entry and repaired-stop coids own their protective stop's later fill.
+        detail["entry_coid"] = intent.coid
+    if intent.kind == "stop":
+        new_ids = [i for i in outcome.fill_ids if i and i not in already_ids]
+        if new_ids:
+            detail["stop_fill_ids"] = new_ids
+    journal(
+        {
+            "ts": int(now),
+            "kind": "tick",
+            "venue": venue,
+            "pack": intent.pack_id,
+            "bar_ts": int(intent.bar_ts or 0),
+            "detail": detail,
+        }
+    )
+    return True
+
+
+def _has_resolved_record(home: Path, coid: str) -> bool:
+    return any(
+        rec.get("kind") == "tick" and isinstance(rec.get("detail"), dict) and rec["detail"].get("resolved_coid") == coid
+        for rec in kb_journal.read_records_lenient(home)
+    )
+
+
+def _protected_or_flat(home: Path, intent, *, venue: str, snap: Any) -> bool:
+    """True when a stop rests on the pair or the intent's identity owns nothing."""
+    if any(
+        getattr(o, "pair", None) == intent.pair and getattr(o, "stop_price", None) is not None
+        for o in (getattr(snap, "open_orders", None) or [])
+    ):
+        return True
+    identity = OwnershipIdentity(pack_id=intent.pack_id, venue=venue, pair=intent.pair, mode=intent.mode)
+    return project_ownership(home, identity).attributable_qty == 0
+
+
+def _intent_identity(armed: kb_config.ArmedPack, bar_ts: int) -> dict:
+    """Durable owner context stored with an Outbox intent before it is sent."""
+    return {"pack_id": armed.pack_id, "pack_version": armed.pack_version, "bar_ts": int(bar_ts)}
 
 
 def _ownership_identity(armed: kb_config.ArmedPack, venue: str) -> OwnershipIdentity:
@@ -1301,6 +1470,8 @@ def _already_journaled(home: Path, pack_id: str, bar_ts: int, *, venue: str, pai
             if rec.get("kind") == "tick" and rec.get("pack") == pack_id and int(rec.get("bar_ts", 0)) == int(bar_ts):
                 recorded_venue = rec.get("venue")
                 detail = rec.get("detail")
+                if isinstance(detail, dict) and detail.get("reason") == RECONCILED_REASON:
+                    continue
                 recorded_pair = detail.get("pair") if isinstance(detail, dict) else None
                 # Ambiguous legacy dimensions remain conservative wildcards.
                 if isinstance(recorded_venue, str) and recorded_venue.strip() and recorded_venue != venue:
