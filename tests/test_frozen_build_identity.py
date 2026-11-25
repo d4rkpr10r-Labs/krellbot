@@ -48,3 +48,30 @@ def test_malformed_build_identity_is_ignored(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
     assert "source_commit" not in version_payload()
+
+
+def test_archive_manifest_identity_matches_bundled_metadata(tmp_path):
+    import zipfile
+
+    from scripts.release_archive import build_archive
+
+    bundle = tmp_path / "bundle"
+    (bundle / "_internal" / "krellbot" / "pack").mkdir(parents=True)
+    (bundle / "_internal" / "frontend" / "dist").mkdir(parents=True)
+    (bundle / "krellbot").write_text("executable", encoding="utf-8")
+    (bundle / "_internal" / "krellbot" / "pack" / "schema.json").write_text("{}", encoding="utf-8")
+    (bundle / "_internal" / "frontend" / "dist" / "index.html").write_text("app", encoding="utf-8")
+    commit = "a" * 40
+    (bundle / "_internal" / "krellbot-build.json").write_text(json.dumps({"source_commit": commit}), encoding="utf-8")
+    archive = tmp_path / "candidate.zip"
+    manifest = build_archive(
+        bundle,
+        archive,
+        version="0.9.7",
+        platform_tag="linux",
+        arch="x86_64",
+        url="https://example.invalid/candidate.zip",
+    )
+    with zipfile.ZipFile(archive) as payload:
+        identity = json.loads(payload.read("_internal/krellbot-build.json"))
+    assert manifest["source_commit"] == identity["source_commit"] == commit
