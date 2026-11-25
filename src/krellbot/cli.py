@@ -1108,7 +1108,7 @@ def _default_fetch(venue: str, pair: str, tf: str, transport, *, include_forming
     """Dispatch to the real public fetch for `venue`.
 
     `transport` is unused for Kraken (its public fetch talks urllib directly);
-    it is required for Coinbase and Binance. Tests inject their own `fetch` so the real
+    it is required for Coinbase, Binance, and MEXC. Tests inject their own `fetch` so the real
     HTTP functions are never called from the test suite.
 
     ``include_forming`` keeps the in-progress bar for paper fill pricing; the
@@ -1129,6 +1129,10 @@ def _default_fetch(venue: str, pair: str, tf: str, transport, *, include_forming
         from krellbot.data.binance_public import fetch_binance_candles
 
         return fetch_binance_candles(pair, tf, transport, include_forming=include_forming)
+    if venue == "mexc":
+        from krellbot.data.mexc_public import fetch_mexc_candles
+
+        return fetch_mexc_candles(pair, tf, transport, include_forming=include_forming)
     raise ValueError(f"unsupported venue for fetch: {venue!r}")
 
 
