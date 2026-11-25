@@ -207,7 +207,7 @@ describe.each([
     });
     render(<KeysOnboardingPanel client={client} venue={venue} />);
     expect((await screen.findByTestId(`keys-error-${venue}`)).textContent).toMatch(
-      /csrf required/,
+      /Unable to read key status/,
     );
     expect(screen.queryByTestId(`keys-balances-${venue}`)).toBeNull();
     expect(screen.queryByTestId(`keys-stored-${venue}`)).toBeNull();
@@ -218,6 +218,46 @@ describe.each([
     render(<KeysOnboardingPanel client={client} venue={venue} enabled={false} />);
     expect(screen.getByTestId(`keys-waiting-session-${venue}`)).toBeTruthy();
     expect(client.getStatus).not.toHaveBeenCalled();
+  });
+});
+
+describe.each(["kraken", "coinbase"] as const)("key replacement (%s)", (venue) => {
+  it("keeps the stored key on a refused replacement and lets the user cancel", async () => {
+    const client = makeClient({
+      getStatus: vi.fn().mockResolvedValue(present(venue, [])),
+      probeAndStore: vi.fn().mockResolvedValue({
+        ...KEYRING_REFUSED,
+        venue,
+        status: "refused_withdraw",
+        message: "key has withdraw rights; refused",
+      }),
+    });
+    render(<KeysOnboardingPanel client={client} venue={venue} />);
+    await screen.findByTestId(`keys-stored-${venue}`);
+    expect(screen.getByText(/paper trading balance is separate/i)).toBeTruthy();
+    fireEvent.click(screen.getByTestId(`keys-replace-${venue}`));
+    fireEvent.change(screen.getByTestId(`keys-public-${venue}`), { target: { value: "replacement-key" } });
+    fireEvent.change(screen.getByTestId(`keys-private-${venue}`), { target: { value: "replacement-secret" } });
+    fireEvent.click(screen.getByTestId(`keys-store-${venue}`));
+    expect((await screen.findByTestId(`keys-feedback-${venue}`)).textContent).toMatch(/Turn off withdrawals/);
+    expect(screen.getByTestId(`keys-stored-${venue}`)).toBeTruthy();
+    fireEvent.click(screen.getByTestId(`keys-cancel-replace-${venue}`));
+    expect(screen.queryByTestId(`keys-form-${venue}`)).toBeNull();
+    expect(client.remove).not.toHaveBeenCalled();
+  });
+
+  it("does not expose credential text from failed requests", async () => {
+    const client = makeClient({
+      getStatus: vi.fn().mockResolvedValue(absent(venue)),
+      probeAndStore: vi.fn().mockRejectedValue(new Error("replacement-secret")),
+    });
+    render(<KeysOnboardingPanel client={client} venue={venue} />);
+    await screen.findByTestId(`keys-form-${venue}`);
+    fireEvent.change(screen.getByTestId(`keys-public-${venue}`), { target: { value: "replacement-key" } });
+    fireEvent.change(screen.getByTestId(`keys-private-${venue}`), { target: { value: "replacement-secret" } });
+    fireEvent.click(screen.getByTestId(`keys-store-${venue}`));
+    const feedback = await screen.findByTestId(`keys-feedback-${venue}`);
+    expect(feedback.textContent).not.toContain("replacement-secret");
   });
 });
 
