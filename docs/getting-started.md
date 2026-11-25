@@ -23,7 +23,10 @@ stays unavailable in this release.
 
 ## What an API key is
 
-An API key is a password your exchange gives to a program. Krellbot uses it to ask Kraken what to do. The key stays in a file on your machine. krellbot.dev never receives it.
+An API key lets Krellbot connect to your exchange. When you connect Kraken
+or Coinbase through **Settings → Exchange keys**, the workstation stores
+the credential in your operating system’s keychain. krellbot.dev never
+receives it. You can run paper trading without connecting an exchange.
 
 ## Turn trade on. Turn withdraw off.
 
