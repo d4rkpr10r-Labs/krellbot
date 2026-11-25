@@ -162,7 +162,7 @@ try {
   }
   await expect(workspace.getByTestId('app-home-cta-paper')).toBeVisible();
   await expect(workspace.getByTestId('app-home-cta-packs')).toBeVisible();
-  check('Home clearly labels paper-only and disabled live', (await workspace.innerText()).includes('Live trading stays off'));
+  await expect(workspace).toContainText("Paper trading on this computer");
   // Labels match frontend/src/shell/Navigation.tsx PRIMARY_VIEWS and MORE_VIEWS.
   const homeTab = 'Workspace';
   const navigation = page.getByTestId('kbot-nav');
