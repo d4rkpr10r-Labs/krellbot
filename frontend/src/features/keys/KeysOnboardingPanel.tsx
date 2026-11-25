@@ -18,7 +18,7 @@ const VENUE_COPY: Record<KeysVenue, VenueCopy> = {
   kraken: {
     title: "Kraken exchange key",
     helper:
-      "Probe a trade-only Kraken key (withdraw off; unknown permissions fail closed), store it in this machine’s OS keychain, then review stored status and free holdings. Status here is not a live connection claim. Live order send stays disabled in this paper-only release.",
+      "Enter the API key and private key from Kraken. Allow trading and disable withdrawals. Krellbot checks these permissions before saving the key in your operating system’s keychain.",
     loading: "Reading Kraken key status…",
     loadErrorPrefix:
       "Could not read Kraken key status — check the workstation is running.",
@@ -31,7 +31,7 @@ const VENUE_COPY: Record<KeysVenue, VenueCopy> = {
   coinbase: {
     title: "Coinbase exchange key",
     helper:
-      "Probe a trade-only Coinbase Advanced Trade key (withdraw/transfer off), store it in this machine’s OS keychain, then review stored status and free holdings. Status here is not a live connection claim. Live order send stays disabled in this paper-only release.",
+      "Enter your Coinbase Advanced Trade API key name and PEM private key. Allow trading and disable withdrawals and transfers. Krellbot checks these permissions before saving the key in your operating system’s keychain.",
     loading: "Reading Coinbase key status…",
     loadErrorPrefix:
       "Could not read Coinbase key status — check the workstation is running.",
@@ -43,11 +43,41 @@ const VENUE_COPY: Record<KeysVenue, VenueCopy> = {
   },
 };
 
-const STORE_LABEL = "Probe and store";
+const STORE_LABEL = "Check and save key";
 const REMOVE_LABEL = "Remove key";
 const REFRESH_LABEL = "Refresh";
 const PAPER_ONLY_NOTE =
-  "Storing a key does not enable live trading in this paper-only release.";
+  "Paper trading needs no exchange key. Storing a key does not enable live trading in this paper-only release.";
+
+const RECOVERY: Record<string, string> = {
+  refused_withdraw: "Turn off withdrawals and transfers for this key at your exchange, then try again.",
+  refused_unknown_permission: "Use a key whose permissions can be verified, then try again.",
+  refused_trade_off: "Enable trading permission at your exchange, then try again.",
+  refused_invalid: "Check the key and its permissions at your exchange, then try again.",
+  refused_malformed: "Check the key format and try again. If this continues, check exchange availability.",
+  refused_unreachable: "Check your connection and exchange availability, then try again.",
+  unsupported_backend: "Unlock or set up your operating system’s keychain, then try again.",
+  invalid_argument: "Check both key fields and try again.",
+};
+
+const SAFE_FEEDBACK = new Set([
+  "stored in native OS keychain",
+  "key has withdraw rights; refused",
+  "key grants unrecognized permission; refused",
+  "key lacks required trade permission; refused",
+  "key cannot be verified (invalid or permission denied); refused",
+  "venue response shape unknown; refused",
+  "venue unreachable; cannot verify",
+  "keyring backend is not a native OS keychain; refused",
+  "input rejected; refused",
+  "keyring write failed and rollback is uncertain",
+  "keyring write failed; prior pair restored",
+  "keyring write failed; no prior pair was present",
+  "prior keyring state could not be read; nothing was written",
+  "removed from keychain",
+  "no key was stored",
+  "keyring remove failed and outcome is uncertain",
+]);
 
 export type KeysOnboardingPanelProps = {
   client: KeysClient;
@@ -64,7 +94,10 @@ function describeStatus(status: KeysStatus): string {
   if (!status.present) {
     return status.message || "no key stored";
   }
-  return status.message || "key present";
+  if (status.balances_available) {
+    return "key present · exchange holdings available";
+  }
+  return "key present · exchange holdings unavailable";
 }
 
 export function KeysOnboardingPanel({
@@ -80,6 +113,7 @@ export function KeysOnboardingPanel({
   const [secret, setSecret] = useState("");
   const [pending, setPending] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [replacing, setReplacing] = useState(false);
   const requestRef = useRef(0);
   const inFlight = useRef(false);
 
@@ -101,11 +135,12 @@ export function KeysOnboardingPanel({
         return;
       }
       setStatus(next);
-    } catch (err) {
+    } catch {
       if (requestId !== requestRef.current) {
         return;
       }
-      setError(err instanceof Error ? err.message : String(err));
+      setStatus(null);
+      setError("Unable to read key status. Check the local session and try again.");
     } finally {
       if (requestId === requestRef.current) {
         setLoading(false);
@@ -136,16 +171,18 @@ export function KeysOnboardingPanel({
     setFeedback(null);
     try {
       const result = await client.probeAndStore(trimmedKey, trimmedSecret, venue);
-      setFeedback(result.message);
+      const message = SAFE_FEEDBACK.has(result.message)
+        ? result.message
+        : "Key operation could not be completed.";
+      setFeedback([message, RECOVERY[result.status]].filter(Boolean).join(" "));
       if (result.ok) {
         setKey("");
         setSecret("");
+        setReplacing(false);
       }
       await load();
-    } catch (err) {
-      setFeedback(
-        `Probe and store failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+    } catch {
+      setFeedback("Could not check and save the key. Check the local session and try again.");
     } finally {
       inFlight.current = false;
       setPending(false);
@@ -161,10 +198,17 @@ export function KeysOnboardingPanel({
     setFeedback(null);
     try {
       const result = await client.remove(venue);
-      setFeedback(result.message);
+      setFeedback(
+        SAFE_FEEDBACK.has(result.message) ? result.message : "Key operation could not be completed.",
+      );
+      if (result.ok) {
+        setKey("");
+        setSecret("");
+        setReplacing(false);
+      }
       await load();
-    } catch (err) {
-      setFeedback(`Remove failed: ${err instanceof Error ? err.message : String(err)}`);
+    } catch {
+      setFeedback("Could not remove the key. Refresh its status before trying again.");
     } finally {
       inFlight.current = false;
       setPending(false);
@@ -237,7 +281,8 @@ export function KeysOnboardingPanel({
             <div className="kbot-keys__stored" data-testid={`keys-stored-${venue}`}>
               {status.balances_available && status.balances !== null ? (
                 <div data-testid={`keys-balances-${venue}`}>
-                  <h3 className="kbot-keys__balances-title">Free holdings</h3>
+                  <h3 className="kbot-keys__balances-title">Exchange account free holdings</h3>
+                  <p>These are exchange balances. Your paper trading balance is separate.</p>
                   {status.balances.length === 0 ? (
                     <p
                       className="kbot-keys__status"
@@ -265,7 +310,7 @@ export function KeysOnboardingPanel({
                   className="kbot-keys__status"
                   data-testid={`keys-balances-unavailable-${venue}`}
                 >
-                  Holdings are unavailable right now.
+                  Key stored, but exchange holdings could not be checked. The exchange may be unavailable or the key may have been revoked. Check the key and refresh.
                 </p>
               )}
               <button
@@ -280,11 +325,29 @@ export function KeysOnboardingPanel({
               >
                 {REMOVE_LABEL}
               </button>
+              {!replacing ? (
+                <button
+                  type="button"
+                  className="kbot-keys__remove"
+                  disabled={controlsDisabled}
+                  data-testid={`keys-replace-${venue}`}
+                  onClick={() => setReplacing(true)}
+                >
+                  Replace key
+                </button>
+              ) : null}
             </div>
-          ) : (
+          ) : null}
+          {!present || replacing ? (
             <div className="kbot-keys__form" data-testid={`keys-form-${venue}`}>
               <p className="kbot-keys__absent" data-testid={`keys-absent-${venue}`}>
-                {copy.absent}
+                {replacing
+                  ? "Krellbot checks the new key before replacing the existing key."
+                  : status.message === "keyring state could not be read"
+                    ? "Unlock your keychain and refresh before adding a key."
+                    : status.corrupt
+                      ? "The stored key is incomplete. Check your keychain before adding a key."
+                      : copy.absent}
               </p>
               <div className="kbot-keys__row">
                 <label className="kbot-keys__label" htmlFor={publicId}>
@@ -342,8 +405,24 @@ export function KeysOnboardingPanel({
               >
                 {STORE_LABEL}
               </button>
+              {replacing ? (
+                <button
+                  type="button"
+                  className="kbot-keys__remove"
+                  disabled={controlsDisabled}
+                  data-testid={`keys-cancel-replace-${venue}`}
+                  onClick={() => {
+                    setKey("");
+                    setSecret("");
+                    setReplacing(false);
+                    setFeedback(null);
+                  }}
+                >
+                  Cancel
+                </button>
+              ) : null}
             </div>
-          )}
+          ) : null}
         </>
       ) : null}
 
