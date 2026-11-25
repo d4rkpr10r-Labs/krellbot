@@ -545,7 +545,7 @@ jobs:
           VERIFY_ARCHIVE: ${{ matrix.archive_name }}
         run: |
           set -euo pipefail
-          args=()
+          args=(--platform "$VERIFY_PLATFORM")
           if [ "${SIGNING_REQUESTED}" = true ]; then
             args+=(--sign-requested)
           fi
@@ -553,7 +553,7 @@ jobs:
             args+=(--browser-evidence "$RUNNER_TEMP/installed-preview-evidence")
           fi
           uv run python scripts/ci_verify_frozen_archive.py \
-            --platform "$VERIFY_PLATFORM" --sha "$GITHUB_SHA" \
+            --sha "$GITHUB_SHA" \
             --archive "artifacts/$VERIFY_ARCHIVE" \
             --manifest "artifacts/manifest-$VERIFY_PLATFORM-$VERIFY_ARCH.json" \
             --output "artifacts/signing-status-$VERIFY_PLATFORM-$VERIFY_ARCH.json" \
@@ -613,12 +613,12 @@ jobs:
           VERIFY_ARCHIVE: ${{ matrix.archive_name }}
         run: |
           set -euo pipefail
-          args=()
+          args=(--platform "$VERIFY_PLATFORM")
           if [ "$VERIFY_BROWSER" = true ]; then
             args+=(--browser-evidence "$RUNNER_TEMP/installed-preview-evidence")
           fi
           uv run python scripts/ci_verify_frozen_archive.py \
-            --platform "$VERIFY_PLATFORM" --sha "$GITHUB_SHA" \
+            --sha "$GITHUB_SHA" \
             --archive "candidate-artifacts/$VERIFY_ARCHIVE" \
             --manifest "candidate-artifacts/$VERIFY_ARCHIVE.json" \
             --output "candidate-artifacts/native-install.json" "${args[@]}"
