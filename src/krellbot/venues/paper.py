@@ -38,6 +38,7 @@ from krellbot.venues.base import (
     Fill,
     KeyPerms,
     OpenOrder,
+    OrderOutcome,
     OrderRef,
     PairRules,
     Truth,
@@ -540,6 +541,29 @@ class PaperVenue:
         """Return the base balance for the pair."""
         base, _ = _base_quote(pair)
         return Decimal(str(self._state["balances"].get(base, Decimal(0))))
+
+    def order_outcome(self, coid: str, *, pair: str) -> OrderOutcome:
+        """Report what the paper ledger holds for ``coid``; authoritative.
+
+        The paper venue's state is the complete record of paper execution:
+        every fill is kept and every resting order is listed. A fill whose
+        ``coid`` matches is an executed entry or exit; a stop fill whose
+        ``order_coid`` matches is an executed stop; a resting order with the
+        coid is open; nothing at all is a proven absence.
+        """
+        self._apply_triggered_stops()
+        direct = [f for f in self._state.get("recent_fills", []) if f.get("coid") == coid and f.get("pair") == pair]
+        stop_fills = [
+            f for f in self._state.get("recent_fills", []) if f.get("order_coid") == coid and f.get("pair") == pair
+        ]
+        fills = direct or stop_fills
+        if fills:
+            qty = sum((Decimal(str(f.get("qty", "0"))) for f in fills), Decimal(0))
+            ids = tuple(str(f.get("id", "")) for f in fills)
+            return OrderOutcome(status="filled", filled_qty=qty, fill_ids=ids, authoritative=True)
+        if any(o.get("coid") == coid and o.get("pair") == pair for o in self._state.get("open_orders", [])):
+            return OrderOutcome(status="open", authoritative=True)
+        return OrderOutcome(status="absent", authoritative=True)
 
     def resting_stop(self, pair: str) -> Decimal | None:
         """Return the stop price resting on this pair, or None."""

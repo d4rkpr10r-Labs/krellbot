@@ -291,8 +291,12 @@ def list_unresolved_orders(home: Path, *, now: int) -> list[dict]:
     row still marked ``sent: false`` (committed, ack unknown). Each row
     carries ``client_order_id``, ``age_seconds`` (null when no stamp is
     available), and ``last_lookup_result`` (``filled`` / ``open`` /
-    ``absent`` / ``none``). The home directory is read, never created
-    or written. Rows are oldest-first; ids with unknown age sort last.
+    ``absent`` / ``none``). An order with an ``intent_resolved`` row is
+    settled and not listed. The home directory is read, never created or
+    written. Rows are oldest-first; ids with unknown age sort last.
+
+    Raises :class:`~krellbot.execution.obligations.ObligationsUnavailable`
+    when the store cannot be read: an empty list would wrongly look clean.
     """
 
     home = Path(home)
@@ -300,6 +304,7 @@ def list_unresolved_orders(home: Path, *, now: int) -> list[dict]:
     if not path.exists():
         return []
 
+    from krellbot.execution.obligations import RESOLVED_KIND, ObligationsUnavailable
     from krellbot.storage.database import (
         OperationalStore,
         StoreBusy,
@@ -310,8 +315,9 @@ def list_unresolved_orders(home: Path, *, now: int) -> list[dict]:
     store = OperationalStore(path)
     try:
         rows = store.read_ledger()
-    except (StoreBusy, StoreCorrupt, StoreError, OSError):
-        return []
+    except (StoreBusy, StoreCorrupt, StoreError, OSError) as exc:
+        code = getattr(exc, "code", None)
+        raise ObligationsUnavailable(code if isinstance(code, str) else "store_error") from None
 
     awaiting: dict[str, int | None] = {}
     last_lookup: dict[str, str] = {}
@@ -334,6 +340,19 @@ def list_unresolved_orders(home: Path, *, now: int) -> list[dict]:
                 awaiting[coid] = stamp
         elif kind in _LOOKUP_KINDS:
             last_lookup[coid] = _LOOKUP_KIND_TO_RESULT[kind]
+
+    resolved: set[str] = set()
+    for _row_id, kind, payload_raw in rows:
+        if kind != RESOLVED_KIND:
+            continue
+        try:
+            coid = _payload_coid(json.loads(payload_raw))
+        except json.JSONDecodeError:
+            continue
+        if coid is not None:
+            resolved.add(coid)
+    for coid in resolved:
+        awaiting.pop(coid, None)
 
     if not awaiting:
         return []

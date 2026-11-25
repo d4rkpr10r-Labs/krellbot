@@ -199,6 +199,19 @@ def _collect_needs_reconcile(home: Path) -> list[Alert]:
             )
         ]
 
+    from krellbot.execution.obligations import RESOLVED_KIND
+
+    resolved: set[str] = set()
+    for _id, kind, payload in rows:
+        if kind != RESOLVED_KIND:
+            continue
+        try:
+            record = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict) and isinstance(record.get("coid"), str):
+            resolved.add(record["coid"])
+
     out: list[Alert] = []
     for _id, kind, payload in rows:
         if kind != "needs_reconcile":
@@ -210,7 +223,7 @@ def _collect_needs_reconcile(home: Path) -> list[Alert]:
         if not isinstance(record, dict):
             continue
         coid = record.get("coid")
-        if not isinstance(coid, str) or not coid:
+        if not isinstance(coid, str) or not coid or coid in resolved:
             continue
         out.append(
             Alert(
@@ -485,8 +498,12 @@ def _collect_unresolved_order_aging(home: Path, *, now: int) -> list[Alert]:
     """Warn for each unresolved order whose age meets the aging threshold."""
 
     from krellbot.application import operations as operations_view_app
+    from krellbot.execution.obligations import ObligationsUnavailable
 
-    rows = operations_view_app.list_unresolved_orders(home, now=now)
+    try:
+        rows = operations_view_app.list_unresolved_orders(home, now=now)
+    except ObligationsUnavailable:
+        return []  # the store_fault alert from _collect_needs_reconcile covers it
     out: list[Alert] = []
     for row in rows:
         age = row.get("age_seconds")

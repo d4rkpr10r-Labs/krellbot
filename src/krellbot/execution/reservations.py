@@ -38,7 +38,6 @@ from decimal import Decimal
 from pathlib import Path
 
 from krellbot import config as kb_config
-from krellbot.storage.database import OperationalStore
 
 # ---- Result codes ---------------------------------------------------------
 
@@ -120,21 +119,18 @@ def would_over_reserve(
 
 
 def should_block_for_reconcile(home: Path) -> bool:
-    """Return True if any ``needs_reconcile`` ledger row exists.
+    """Return True if any intent anywhere is unresolved, or the store is unreadable.
 
-    The Outbox audits a ``needs_reconcile`` row when a paper send was
-    committed but the venue call did not complete (return state
-    ``"needs_reconcile"``). Until an operator reconciles from the
-    venue snapshot, tick must not submit a new entry on the same
-    venue. The block affects entries only — exits, ensure-stop, and
-    paid-expiry exits continue to run. The check reads the store, not
-    the legacy journal.
+    This is the home-wide view. The tick gates each arm with the scoped
+    ``ObligationsView.blocks_entries(venue=..., mode=...)`` from
+    :mod:`krellbot.execution.obligations`; both read the same durable
+    interpretation: ``sent: false`` Outbox intents and ``needs_reconcile``
+    markers without an ``intent_resolved`` row. Exits are never gated.
     """
-    store = OperationalStore(home / "ops.sqlite")
-    for _row_id, kind, _payload in store.read_ledger():
-        if kind == "needs_reconcile":
-            return True
-    return False
+    from krellbot.execution.obligations import read_obligations
+
+    view = read_obligations(home)
+    return not view.available or bool(view.unresolved)
 
 
 # ---- Flatten ownership rule -----------------------------------------------
