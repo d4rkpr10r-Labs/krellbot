@@ -176,6 +176,37 @@ def project_ownership(home: Path, identity: OwnershipIdentity) -> OwnershipProje
     return OwnershipProjection(attributable_qty=bound, ambiguous_records=ambiguous_records)
 
 
+def stop_fill_history(home: Path, identity: OwnershipIdentity) -> tuple[set[str], set[str]]:
+    """Return the order coids ``identity`` journaled and the fill ids it accounted.
+
+    Only records whose identity is established count. Order coids come from
+    ``detail.entry_coid`` (the entry order, whose protective stop shares its
+    coid on the paper venue, or a repaired stop's coid). Accounted fill ids
+    come from ``detail.stop_fill_ids``, which the tick writes in the same
+    record as the ``stop_qty`` they explain, so a fill is counted at most once.
+    Fill ids are scoped to the identity because they are only unique per venue.
+    """
+    order_coids: set[str] = set()
+    accounted: set[str] = set()
+    expected = (identity.venue, identity.pair, identity.mode)
+    for rec in _tick_records(home):
+        if rec.get("pack") != identity.pack_id:
+            continue
+        detail = rec.get("detail")
+        if not isinstance(detail, dict):
+            continue
+        recorded = (_text(rec.get("venue")), _text(detail.get("pair")), _record_mode(detail))
+        if recorded != expected:
+            continue
+        coid = _text(detail.get("entry_coid"))
+        if coid is not None:
+            order_coids.add(coid)
+        ids = detail.get("stop_fill_ids")
+        if isinstance(ids, list):
+            accounted.update(i for i in ids if isinstance(i, str) and i)
+    return order_coids, accounted
+
+
 def reconcile_owned_qty(
     home: Path,
     identity: OwnershipIdentity,

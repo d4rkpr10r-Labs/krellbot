@@ -486,10 +486,19 @@ class PaperVenue:
 
     # ---- paper-specific helpers (used by the engine) ----------------------
 
-    def record_stop_fill(self, coid: str, qty: Decimal, price: Decimal, *, pair: str) -> None:
+    def record_stop_fill(
+        self,
+        coid: str,
+        qty: Decimal,
+        price: Decimal,
+        *,
+        pair: str,
+        order_coid: str | None = None,
+    ) -> None:
         """Land a stop fill at the given price. Removes the resting stop.
 
-        Called by the engine after it computes the stop price from the bar.
+        ``order_coid`` is the client order id of the resting stop that fired,
+        so the engine can attribute the fill to the strategy that placed it.
         """
         rules = self.rules(pair)
         q = _quantize(qty, rules.lot_decimals)
@@ -514,6 +523,7 @@ class PaperVenue:
                 "price": p,
                 "ts_ms": ts_ms,
                 "kind": "stop",
+                **({"order_coid": order_coid} if order_coid else {}),
             }
         )
         # Drop the resting stop for this pair.
@@ -601,34 +611,30 @@ class PaperVenue:
                 stop = self.resting_stop(pair)
                 if stop is None or Decimal(str(candle.low)) > stop:
                     continue
-                qty = next(
-                    (
-                        Decimal(str(o.get("qty", "0")))
-                        for o in self._state["open_orders"]
-                        if o.get("pair") == pair and o.get("stop_price") is not None
-                    ),
-                    Decimal(0),
-                )
+                qty, order_coid = self._resting_stop_order(pair)
                 fill = min(stop, Decimal(str(candle.open))) * (Decimal(1) - self._slip)
-                self.record_stop_fill(f"stop-{pair}-{candle.ts_ms}", qty, fill, pair=pair)
+                self.record_stop_fill(f"stop-{pair}-{candle.ts_ms}", qty, fill, pair=pair, order_coid=order_coid)
             if self.resting_stop(pair) is not None and forming:
                 candle = forming[-1]
                 if int(candle.ts_ms) > last_applied:
                     stop = self.resting_stop(pair)
                     if stop is not None and Decimal(str(candle.low)) <= stop:
-                        qty = next(
-                            (
-                                Decimal(str(o.get("qty", "0")))
-                                for o in self._state["open_orders"]
-                                if o.get("pair") == pair and o.get("stop_price") is not None
-                            ),
-                            Decimal(0),
-                        )
+                        qty, order_coid = self._resting_stop_order(pair)
                         fill = min(stop, Decimal(str(candle.open))) * (Decimal(1) - self._slip)
-                        self.record_stop_fill(f"stop-{pair}-{candle.ts_ms}", qty, fill, pair=pair)
+                        self.record_stop_fill(
+                            f"stop-{pair}-{candle.ts_ms}", qty, fill, pair=pair, order_coid=order_coid
+                        )
                         changed = True
         if changed:
             self._persist()
+
+    def _resting_stop_order(self, pair: str) -> tuple[Decimal, str | None]:
+        """Quantity and client order id of the resting stop on ``pair``."""
+        for o in self._state["open_orders"]:
+            if o.get("pair") == pair and o.get("stop_price") is not None:
+                coid = o.get("coid")
+                return Decimal(str(o.get("qty", "0"))), (str(coid) if coid else None)
+        return Decimal(0), None
 
     def _last_close_for(self, pair: str) -> Decimal | None:
         candles = self._reader(self.venue, pair) or []
@@ -739,6 +745,7 @@ def _to_truth(state: dict) -> Truth:
                 qty=Decimal(str(f.get("qty", "0"))),
                 price=Decimal(str(f.get("price", "0"))),
                 ts_ms=int(f.get("ts_ms", 0)),
+                order_coid=(str(f["order_coid"]) if f.get("order_coid") else None),
             )
         )
     return Truth(balances=balances, open_orders=orders, recent_fills=fills)
