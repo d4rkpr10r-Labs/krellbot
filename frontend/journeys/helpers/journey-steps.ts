@@ -223,7 +223,7 @@ export async function walkFirstRunWizardToWin(page: Page): Promise<void> {
     )
     .toBe("status");
   await expect(page.getByTestId("first-run-wizard-sentence")).toContainText(
-    /running on this computer/i,
+    /waiting for the first market check/i,
   );
   await expect(page.getByTestId("first-run-wizard-status-chip")).toContainText(
     /Live trading unavailable/i,

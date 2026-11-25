@@ -35,6 +35,17 @@ instrument rules separately. Order simulation remains local. For paper
 venues without a scheduled candle reader, the pinned CSV path is the
 verified end-to-end tick path.
 
+The first-run wizard can save a BTC/USD strategy for Kraken (`XXBTZUSD`)
+or Coinbase (`BTC-USD`). It shows the exchange, market, one-hour timeframe,
+and simulated USD starting balance before the run is armed. Existing saved
+SUI/USD strategies remain available. The Run form indicates whether the
+selected market has scheduled candles, needs offline replay, or has not yet
+been verified. Scheduled coverage in this interface currently names Kraken
+BTC/USD and SUI/USD, Coinbase BTC/USD, and Binance BTC/USDT at 1h, 4h, and 1d.
+Kraken ETH/USD (`ETHUSD`) and Coinbase ETH/USD (`ETH-USD`) have fixture
+coverage at 1h, including public response parsing, instrument minimums and
+increments, the venue fee model, simulated fills, and metadata refusals.
+
 The paper acceptance suite exercises one spot market per registered venue
 using pinned candles and instrument rules. For each market it validates and
 arms a strategy, checks the simulated fill and balance in the workstation,
@@ -105,11 +116,11 @@ and never leaves a stray `.tmp` sibling.
 
 ## Kraken validate-only
 
-When a Kraken key is stored in the OS keychain AND a validate transport
-is injected, the paper venue additionally POSTs `AddOrder` with
-`validate=true` and the same fields as the real call. That POST never
-records a fill. With no key stored, or no transport injected, zero
-validate calls happen.
+Paper ticks use public market data or a local replay. They simulate fills
+without reading exchange credentials or calling a private exchange API.
+The separate Kraken validate-only smoke in [the live qualification
+milestone](milestones/M10.md#owner-gates) checks a signed request with
+`validate=true` without submitting an order.
 
 ## Inspect
 
@@ -147,7 +158,5 @@ above the current stop — the engine never lowers a stop.
 
 - Does not place a real order. Paper only.
 - Does not require a license for fixture or community packs.
-- Does not place a validate POST when no key is stored or no transport
-  is injected.
 - Does not lower a stop.
 - Does not sell more base than this pack's journal says it filled.

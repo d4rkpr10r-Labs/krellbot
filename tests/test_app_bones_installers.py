@@ -354,7 +354,7 @@ def test_linux_installer_help_flag_is_usage(tmp_path: Path) -> None:
         # refusal instead of requiring Linux behaviour on another host.
         assert proc.returncode == 1, proc.stdout + proc.stderr
         assert "this installer is for Linux" in proc.stderr
-        assert "Nothing has been changed" in proc.stderr
+        assert "Installation did not complete" in proc.stderr
         assert not (home / ".local" / "share" / "Krellbot").exists()
 
 
@@ -441,3 +441,75 @@ def test_install_txt_documents_unsigned_and_launch_stop() -> None:
     assert "install-krellbot.sh" in low
     assert "python" in low  # used in the "you do NOT need Python" sense
     assert "no developer tools" in low or "development tooling" in low
+
+
+def test_linux_installer_retains_previous_program_for_rollback(tmp_path: Path) -> None:
+    _bash()
+    if not IS_LINUX:
+        pytest.skip("Linux installer rollback is Linux-only")
+    home = tmp_path / "home"
+    home.mkdir()
+    xdg_data = home / ".local" / "share"
+    payload = _make_payload(tmp_path / "source" / "krellbot")
+    installer = payload / "install-krellbot.sh"
+    first = _run_installer(installer, home=home, xdg_data=xdg_data, xdg_config=home / ".config")
+    assert first.returncode == 0, first.stderr
+    installed = xdg_data / "Krellbot"
+    assert not (xdg_data / "Krellbot.old").exists()
+    (payload / "_internal" / "runtime.marker").write_text("updated", encoding="utf-8")
+    second = _run_installer(installer, home=home, xdg_data=xdg_data, xdg_config=home / ".config")
+    assert second.returncode == 0, second.stderr
+    assert (installed / "_internal" / "runtime.marker").read_text(encoding="utf-8") == "updated"
+    assert (xdg_data / "Krellbot.old" / "_internal" / "runtime.marker").read_text(encoding="utf-8") == "payload\n"
+
+
+def test_linux_installer_preserves_previous_when_current_is_missing(tmp_path: Path) -> None:
+    _bash()
+    if not IS_LINUX:
+        pytest.skip("Linux installer rollback is Linux-only")
+    home = tmp_path / "home"
+    home.mkdir()
+    xdg_data = home / ".local" / "share"
+    previous = xdg_data / "Krellbot.old"
+    previous.mkdir(parents=True)
+    sentinel = previous / "previous-program"
+    sentinel.write_text("keep", encoding="utf-8")
+    payload = _make_payload(tmp_path / "source" / "krellbot")
+    result = _run_installer(payload / "install-krellbot.sh", home=home, xdg_data=xdg_data, xdg_config=home / ".config")
+    assert result.returncode != 0
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not (xdg_data / "Krellbot").exists()
+
+
+def test_linux_failed_current_move_preserves_both_installations(tmp_path: Path, monkeypatch) -> None:
+    _bash()
+    if not IS_LINUX:
+        pytest.skip("Linux installer rollback is Linux-only")
+    home = tmp_path / "home"
+    home.mkdir()
+    xdg_data = home / ".local" / "share"
+    payload = _make_payload(tmp_path / "source" / "krellbot")
+    installer = payload / "install-krellbot.sh"
+    first = _run_installer(installer, home=home, xdg_data=xdg_data, xdg_config=home / ".config")
+    assert first.returncode == 0, first.stderr
+    installed = xdg_data / "Krellbot"
+    previous = xdg_data / "Krellbot.old"
+    previous.mkdir()
+    (previous / "previous-marker").write_text("previous", encoding="utf-8")
+    (installed / "current-marker").write_text("current", encoding="utf-8")
+    real_mv = shutil.which("mv")
+    assert real_mv
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_mv = fake_bin / "mv"
+    fake_mv.write_text(
+        '#!/bin/sh\nif [ "$2" = "' + str(installed) + '" ]; then exit 1; fi\nexec "' + real_mv + '" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_mv.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin) + os.pathsep + os.environ.get("PATH", ""))
+    result = _run_installer(installer, home=home, xdg_data=xdg_data, xdg_config=home / ".config")
+    assert result.returncode != 0
+    assert (installed / "current-marker").read_text(encoding="utf-8") == "current"
+    assert (previous / "previous-marker").read_text(encoding="utf-8") == "previous"
+    assert not list(xdg_data.glob("Krellbot.updating.*"))

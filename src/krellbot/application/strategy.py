@@ -477,6 +477,15 @@ class StrategyDraftService:
                         "id": pack.get("id") if isinstance(pack.get("id"), str) else "",
                         "label": (pack.get("label") if isinstance(pack.get("label"), str) else ""),
                         "pair": pair,
+                        "markets": [
+                            {"venue": market["venue"], "pair": market["pair"]}
+                            for market in markets
+                            if isinstance(market, dict)
+                            and isinstance(market.get("venue"), str)
+                            and isinstance(market.get("pair"), str)
+                        ]
+                        if isinstance(markets, list)
+                        else [],
                         "timeframe": (pack.get("timeframe") if isinstance(pack.get("timeframe"), str) else ""),
                     }
                 )

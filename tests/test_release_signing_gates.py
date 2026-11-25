@@ -146,3 +146,26 @@ def test_release_notes_helper_unsigned_and_signed_paths() -> None:
         assert "Authenticode-signed" in signed
         assert "prerelease" in signed.lower()
         assert "Unsigned" not in signed
+
+
+def test_merge_group_candidates_never_enter_signing_or_release_steps() -> None:
+    text = _read_workflow()
+    assert "  merge_group:\n" in text
+    names = [
+        "Resolve whether platform signing is requested",
+        "Sign macOS Developer ID Application, notarize, and staple",
+        "Sign Windows Authenticode",
+        "Record Linux checksum-pinned signing policy",
+        "Write signing status marker",
+        '"Verify immutable release base URL is configured"',
+        "Build immutable archive and manifest",
+        "Upload archive and manifest",
+    ]
+    for name in names:
+        section = text.split(f"- name: {name}", 1)[1].split("\n      - name:", 1)[0]
+        assert "github.event_name != 'merge_group'" in section, name
+    for name in ("Archive unsigned merge-group candidate", "Upload unsigned merge-group candidate"):
+        section = text.split(f"- name: {name}", 1)[1].split("\n      - name:", 1)[0]
+        assert "github.event_name == 'merge_group'" in section, name
+    assert "manifest.get('source_commit') != os.environ['CANDIDATE_SOURCE_SHA']" in text
+    assert "if: startsWith(github.ref, 'refs/tags/v')" in text

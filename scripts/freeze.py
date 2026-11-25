@@ -32,6 +32,8 @@ Why a dedicated `scripts/frozen_main.py`?
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import shutil
 import subprocess
 import sys
@@ -107,11 +109,7 @@ def _build_args(*, entry: Path, dist_root: Path, work_root: Path, spec_root: Pat
         # the starter catalogue JSONs, the pack schema, and the
         # rehearsal fixtures. These must resolve from the installed
         # bundle, never from a source checkout.
-        *[
-            flag
-            for package in _RUNTIME_DATA_PACKAGES
-            for flag in ("--collect-data", package)
-        ],
+        *[flag for package in _RUNTIME_DATA_PACKAGES for flag in ("--collect-data", package)],
         # The frozen entry point.
         str(entry.resolve()),
     ]
@@ -167,8 +165,7 @@ def _stage_installers(bundle: Path, *, repo_root: Path) -> Path:
     missing = [name for name in _INSTALLER_FILES if not (source_dir / name).is_file()]
     if missing:
         raise SystemExit(
-            "installer helpers missing from scripts/installers: "
-            f"{', '.join(missing)} (looked under {source_dir})"
+            f"installer helpers missing from scripts/installers: {', '.join(missing)} (looked under {source_dir})"
         )
     for name in _INSTALLER_FILES:
         target = bundle / name
@@ -176,6 +173,35 @@ def _stage_installers(bundle: Path, *, repo_root: Path) -> Path:
         if name.endswith(".sh"):
             target.chmod(0o755)
     return bundle
+
+
+def _clean_source_commit(repo_root: Path) -> str | None:
+    """Return the commit only for a clean checkout."""
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo_root, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    if dirty or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        return None
+    return commit
+
+
+def _stage_build_identity(bundle: Path, *, repo_root: Path, expected_commit: str | None) -> None:
+    """Claim a commit only if the checkout stayed clean throughout the build."""
+    if expected_commit is None or _clean_source_commit(repo_root) != expected_commit:
+        return
+    path = bundle / "_internal" / "krellbot-build.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"source_commit": expected_commit}) + "\n", encoding="utf-8")
 
 
 def freeze(*, repo_root: Path | None = None) -> Path:
@@ -207,6 +233,21 @@ def freeze(*, repo_root: Path | None = None) -> Path:
             "before `uv run python scripts/freeze.py`."
         )
 
+    # The ignored frontend/dist directory may belong to another commit.
+    # Rebuild it from this clean checkout before claiming source identity.
+    source_commit = _clean_source_commit(repo_root)
+    if source_commit is not None:
+        try:
+            subprocess.run(
+                ["npm.cmd" if sys.platform == "win32" else "npm", "run", "build"],
+                cwd=repo_root / "frontend",
+                check=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise SystemExit("frontend rebuild failed; cannot make a source-identified bundle") from exc
+        if _clean_source_commit(repo_root) != source_commit:
+            raise SystemExit("source checkout changed during frontend build")
+
     # Clean previous build artifacts so the run is reproducible.
     # We deliberately do NOT touch ``frontend/dist`` — the Vite
     # artefact is the source of truth for the bundle and must
@@ -237,6 +278,7 @@ def freeze(*, repo_root: Path | None = None) -> Path:
     # Stage the local-install helpers beside the executable so the
     # extracted archive is installable without any developer tooling.
     _stage_installers(bundle, repo_root=repo_root)
+    _stage_build_identity(bundle, repo_root=repo_root, expected_commit=source_commit)
 
     return bundle
 

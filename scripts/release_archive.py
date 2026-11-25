@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -102,6 +103,15 @@ _HASH_CHUNK = 1 << 20  # 1 MiB
 # Accepted URL schemes for `manifest['url']`. Anything else is refused
 # — the site installer only fetches over http(s).
 _URL_SCHEMES = frozenset({"http", "https"})
+
+
+def _source_commit(bundle: Path) -> str | None:
+    try:
+        data = json.loads((bundle / "_internal" / "krellbot-build.json").read_text(encoding="utf-8"))
+        commit = data.get("source_commit")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    return commit if isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit) else None
 
 
 def _validate_dist(dist: Path, *, os_tag: str) -> None:
@@ -403,6 +413,10 @@ def build_archive(
         "sha256": "",  # placeholder; overwritten after hashing
     }
 
+    commit = _source_commit(dist)
+    if commit is not None:
+        manifest["source_commit"] = commit
+
     _write_zip(dist, output)
 
     # Hash the bytes that actually landed on disk, after the zip is closed.
@@ -443,6 +457,9 @@ def build_macos_app_archive(
         "version": version,
         "sha256": "",
     }
+    commit = _source_commit(app / "Contents" / "MacOS")
+    if commit is not None:
+        manifest["source_commit"] = commit
     _write_zip_prefixed(app, output, archive_root_name=app.name)
     digest = _sha256_of(output)
     size = output.stat().st_size

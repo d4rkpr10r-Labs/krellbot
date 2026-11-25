@@ -3,7 +3,7 @@
 import { chromium, expect } from '../frontend/node_modules/@playwright/test/index.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -73,8 +73,22 @@ try {
   const hash = file => createHash('sha256').update(readFileSync(file)).digest('hex');
   check('Installed executable equals frozen payload', hash(path.join(installed, exeName)) === hash(path.join(extracted, exeName)));
   check('Install preserves data', readFileSync(sentinel, 'utf8') === 'preserve this isolated test data\n');
+  writeFileSync(path.join(installed, '_internal', 'rollback-marker.txt'), 'prior program');
   install();
   check('Reinstall preserves data', readFileSync(sentinel, 'utf8') === 'preserve this isolated test data\n');
+  check('Reinstall replaces prior program files', !existsSync(path.join(installed, '_internal', 'rollback-marker.txt')));
+  const previous = `${installed}.old`;
+  check('Previous installation is retained', existsSync(path.join(previous, exeName)) && hash(path.join(previous, exeName)) === hash(path.join(extracted, exeName)));
+  const candidate = `${installed}.candidate`;
+  renameSync(installed, candidate);
+  try {
+    renameSync(previous, installed);
+    check('Previous installation can be restored', hash(path.join(installed, exeName)) === hash(path.join(extracted, exeName)));
+    check('Restored installation retains previous program files', readFileSync(path.join(installed, '_internal', 'rollback-marker.txt'), 'utf8') === 'prior program');
+  } finally {
+    if (existsSync(installed)) renameSync(installed, previous);
+    renameSync(candidate, installed);
+  }
   if (windows) {
     const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
     const shortcut = JSON.parse(run(ps, ['-NoProfile', '-Command', "$p=Join-Path ([Environment]::GetFolderPath('Programs')) 'Krellbot.lnk';$s=(New-Object -ComObject WScript.Shell).CreateShortcut($p);@{exists=(Test-Path -LiteralPath $p);target=$s.TargetPath;arguments=$s.Arguments;workingDirectory=$s.WorkingDirectory}|ConvertTo-Json -Compress"], env));

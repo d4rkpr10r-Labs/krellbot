@@ -23,7 +23,10 @@ stays unavailable in this release.
 
 ## What an API key is
 
-An API key is a password your exchange gives to a program. Krellbot uses it to ask Kraken what to do. The key stays in a file on your machine. krellbot.dev never receives it.
+An API key lets Krellbot connect to your exchange. When you connect Kraken
+or Coinbase through **Settings → Exchange keys**, the workstation stores
+the credential in your operating system’s keychain. krellbot.dev never
+receives it. You can run paper trading without connecting an exchange.
 
 ## Turn trade on. Turn withdraw off.
 
@@ -79,8 +82,9 @@ keyring pair exists. A partial environment pair is an error.
 | Frozen binary | `~/.local/share/krellbot/versions/<ver>/krellbot` | `%LOCALAPPDATA%\Krellbot\versions\<ver>\krellbot.exe` |
 | Data home (default `$KRELLBOT_HOME`) | `~/.krellbot/` | `%USERPROFILE%\.krellbot\` |
 
-The installer does not touch the data home. Your keys, paper state,
-journal, and receipts survive install, update, and uninstall.
+The installer does not touch the data home. Paper state, journal, and
+receipts survive install, update, and uninstall. Exchange keys connected
+through the workstation remain in your operating system's keychain.
 
 ### Code-signing / notarization status
 
@@ -114,7 +118,7 @@ There is no top-level engine CLI product command named
 **Release install** (site installer / managed launcher and staged
 version directory): use the **installer's** uninstall flow. That flow
 removes only the managed launcher and the staged version directory for
-the version you ran with. `$KRELLBOT_HOME` (keys, paper state, journal,
+the version you ran with. `$KRELLBOT_HOME` (paper state, journal,
 receipts) is **retained** by default. To delete the data home too,
 pass `--purge-data` to the uninstall flow inside the installer.
 

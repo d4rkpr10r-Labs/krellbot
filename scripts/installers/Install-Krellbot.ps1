@@ -9,7 +9,7 @@
 #     execution policy, never claims signing, never touches secrets
 #   - preserves KRELLBOT_HOME and every piece of user state: the
 #     install only writes inside LOCALAPPDATA\Krellbot and the user's
-#     own Start menu folder. Existing installs are replaced in place;
+#     own Start menu folder. The prior installation is retained for rollback;
 #     "~/.krellbot" (KRELLBOT_HOME) is never written or deleted.
 #
 # Exit codes: 0 installed, 1 refused (unsafe source/destination or
@@ -20,7 +20,7 @@ $ErrorActionPreference = 'Stop'
 function Fail([string]$Message) {
     Write-Host ""
     Write-Host "Install refused: $Message"
-    Write-Host "Nothing has been changed."
+    Write-Host "Installation did not complete."
     exit 1
 }
 
@@ -81,14 +81,63 @@ if (Test-Path -LiteralPath $Destination) {
 # --- install ----------------------------------------------------------------
 
 Write-Host "Installing Krellbot to: $Destination"
-New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+$Staging = "$Destination.updating.$PID"
+$Previous = "$Destination.old"
+$SavedPrevious = "$Destination.old.saved.$PID"
+if (Test-Path -LiteralPath $Staging) {
+    Fail "temporary install folder already exists: $Staging"
+}
+if (Test-Path -LiteralPath $SavedPrevious) {
+    Fail "temporary previous installation folder already exists: $SavedPrevious"
+}
+if (Test-Path -LiteralPath $Previous) {
+    $PreviousItem = Get-Item -LiteralPath $Previous -Force
+    if (($PreviousItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or -not $PreviousItem.PSIsContainer) {
+        Fail "previous installation path is not a regular folder: $Previous"
+    }
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        Fail "restore the previous installation at $Previous before installing again."
+    }
+}
+New-Item -ItemType Directory -Path $Staging | Out-Null
 
 # Robocopy mirrors the full one-dir payload; /E includes empty dirs,
 # /NFL /NDL /NJH /NJS keep the console readable. Exit codes 0-7 are
 # success for robocopy; anything else is a real failure.
-& robocopy $Source $Destination /E /NFL /NDL /NJH /NJS /NP /R:2 /W:1 | Out-Null
+& robocopy $Source $Staging /E /NFL /NDL /NJH /NJS /NP /R:2 /W:1 | Out-Null
 if ($LASTEXITCODE -ge 8) {
+    Remove-Item -LiteralPath $Staging -Recurse -Force
     Fail "robocopy failed with exit code $LASTEXITCODE."
+}
+
+if (-not (Test-Path -LiteralPath (Join-Path $Staging 'krellbot.exe') -PathType Leaf) -or
+    -not (Test-Path -LiteralPath (Join-Path $Staging '_internal') -PathType Container)) {
+    Remove-Item -LiteralPath $Staging -Recurse -Force
+    Fail "the staged program is incomplete."
+}
+
+try {
+    if (Test-Path -LiteralPath $Previous) {
+        Move-Item -LiteralPath $Previous -Destination $SavedPrevious
+    }
+    if (Test-Path -LiteralPath $Destination) {
+        Move-Item -LiteralPath $Destination -Destination $Previous
+    }
+    Move-Item -LiteralPath $Staging -Destination $Destination
+} catch {
+    if (-not (Test-Path -LiteralPath $Destination) -and (Test-Path -LiteralPath $Previous)) {
+        try { Move-Item -LiteralPath $Previous -Destination $Destination } catch {}
+    }
+    if (-not (Test-Path -LiteralPath $Previous) -and (Test-Path -LiteralPath $SavedPrevious)) {
+        try { Move-Item -LiteralPath $SavedPrevious -Destination $Previous } catch {}
+    }
+    if (Test-Path -LiteralPath $Staging) {
+        Remove-Item -LiteralPath $Staging -Recurse -Force
+    }
+    Fail "could not replace the installed program; check the previous installation folders."
+}
+if (Test-Path -LiteralPath $SavedPrevious) {
+    Remove-Item -LiteralPath $SavedPrevious -Recurse -Force
 }
 
 $InstalledExe = Join-Path $Destination 'krellbot.exe'
