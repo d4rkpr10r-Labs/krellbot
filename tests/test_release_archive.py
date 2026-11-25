@@ -456,6 +456,7 @@ def test_posix_executable_mode_preserved_in_zip(tmp_path):
     with zipfile.ZipFile(out) as zf:
         info = zf.getinfo(_EXE_NAME)
         # Top 16 bits of external_attr hold the unix mode.
+        assert stat.S_ISREG(info.external_attr >> 16)
         mode = (info.external_attr >> 16) & 0o7777
     assert mode == 0o755, f"expected 0o755, got {oct(mode)}; external_attr=0x{info.external_attr:x}"
 

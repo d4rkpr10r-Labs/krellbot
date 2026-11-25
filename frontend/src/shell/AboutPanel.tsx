@@ -120,6 +120,12 @@ export function AboutPanel({
               {channelLabel(info.channel)}
             </dd>
           </div>
+          {info.source_commit ? (
+            <div className="kbot-about__row">
+              <dt>Source commit</dt>
+              <dd data-testid="app-home-about-source-commit">{info.source_commit}</dd>
+            </div>
+          ) : null}
           <div className="kbot-about__row">
             <dt>Signing</dt>
             <dd data-testid="app-home-about-signing">

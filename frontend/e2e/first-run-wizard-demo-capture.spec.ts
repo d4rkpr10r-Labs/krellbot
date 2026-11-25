@@ -82,7 +82,7 @@ test("capture Krell first-run wizard demo frames", async ({ journey }) => {
   await page.getByTestId("first-run-wizard-primary").click();
   await expectWizardOnly(page, "choose");
   await expect(page.getByTestId("first-run-wizard-tiles")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Use" })).toHaveCount(3);
+  await expect(page.getByRole("button", { name: /^Use / })).toHaveCount(3);
   await expect(page.getByText("Dual moving average")).toBeVisible();
   await expect(page.getByText("Mean reversion")).toBeVisible();
   await expect(page.getByText("Range breakout")).toBeVisible();
@@ -134,14 +134,14 @@ test("capture Krell first-run wizard demo frames", async ({ journey }) => {
     .toBe("status");
   await expectWizardOnly(page, "status");
   await expect(page.getByTestId("first-run-wizard-sentence")).toContainText(
-    /running on this computer/i,
+    /waiting for the first market check/i,
   );
   await expect(page.getByTestId("first-run-wizard-status-chip")).toContainText(
     /Live trading unavailable/i,
   );
   await expect(page.getByTestId("first-run-wizard-status-chip")).toHaveAttribute(
     "data-paper-status",
-    "running",
+    "waiting",
   );
   await expect(page.getByTestId("first-run-wizard-primary")).toHaveText(
     "Looks good",

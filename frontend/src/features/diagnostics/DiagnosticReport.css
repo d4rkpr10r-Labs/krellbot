@@ -1,0 +1,27 @@
+.kbot-diagnostic-report {
+  display: grid;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.kbot-diagnostic-report h3,
+.kbot-diagnostic-report p {
+  margin: 0;
+}
+
+.kbot-diagnostic-report button {
+  justify-self: start;
+}
+
+.kbot-diagnostic-report textarea {
+  width: 100%;
+  min-height: 6rem;
+  resize: vertical;
+}
+
+.kbot-diagnostic-report pre {
+  max-height: 16rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

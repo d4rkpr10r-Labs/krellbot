@@ -73,8 +73,8 @@ covers the venue+pair, and the stored key is trade-only. Typed `LIVE` is
 collected at grant time in the workstation, not again on every tick or on
 CLI arm. A withdraw-capable key is refused with that reason. It is not
 reported as the env gate. Paper ticks stay on this machine. If a Kraken key
-is stored, a paper entry also posts `validate=true` and does not record that
-post as a fill.
+is stored, paper ticks still use public data and simulate orders locally.
+The signed Kraken validate-only check is a separate diagnostic.
 
 ## Live-only invariants
 

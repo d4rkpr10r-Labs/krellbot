@@ -3,7 +3,7 @@
 import { chromium, expect } from '../frontend/node_modules/@playwright/test/index.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -73,8 +73,22 @@ try {
   const hash = file => createHash('sha256').update(readFileSync(file)).digest('hex');
   check('Installed executable equals frozen payload', hash(path.join(installed, exeName)) === hash(path.join(extracted, exeName)));
   check('Install preserves data', readFileSync(sentinel, 'utf8') === 'preserve this isolated test data\n');
+  writeFileSync(path.join(installed, '_internal', 'rollback-marker.txt'), 'prior program');
   install();
   check('Reinstall preserves data', readFileSync(sentinel, 'utf8') === 'preserve this isolated test data\n');
+  check('Reinstall replaces prior program files', !existsSync(path.join(installed, '_internal', 'rollback-marker.txt')));
+  const previous = `${installed}.old`;
+  check('Previous installation is retained', existsSync(path.join(previous, exeName)) && hash(path.join(previous, exeName)) === hash(path.join(extracted, exeName)));
+  const candidate = `${installed}.candidate`;
+  renameSync(installed, candidate);
+  try {
+    renameSync(previous, installed);
+    check('Previous installation can be restored', hash(path.join(installed, exeName)) === hash(path.join(extracted, exeName)));
+    check('Restored installation retains previous program files', readFileSync(path.join(installed, '_internal', 'rollback-marker.txt'), 'utf8') === 'prior program');
+  } finally {
+    if (existsSync(installed)) renameSync(installed, previous);
+    renameSync(candidate, installed);
+  }
   if (windows) {
     const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
     const shortcut = JSON.parse(run(ps, ['-NoProfile', '-Command', "$p=Join-Path ([Environment]::GetFolderPath('Programs')) 'Krellbot.lnk';$s=(New-Object -ComObject WScript.Shell).CreateShortcut($p);@{exists=(Test-Path -LiteralPath $p);target=$s.TargetPath;arguments=$s.Arguments;workingDirectory=$s.WorkingDirectory}|ConvertTo-Json -Compress"], env));
@@ -117,18 +131,27 @@ try {
   // Readiness/meta/bootstrap/CSRF/Host/origin are never mocked or bypassed.
   const response = await page.goto(url);
   check('Installed shell serves HTML, not shell_not_built', response.status() === 200);
-  // A fresh install mounts only the first-run wizard. Skip it, then require home.
   const wizard = page.getByTestId('first-run-wizard');
-  if (await wizard.count()) {
-    const skip = page.getByTestId('first-run-wizard-skip');
-    const primary = page.getByTestId('first-run-wizard-primary');
-    if ((await skip.count()) === 0 && (await primary.count()) > 0) {
-      await primary.click();
-      await expect(skip).toBeVisible();
-    }
-    await skip.click();
-    await expect(wizard).toHaveCount(0);
-  }
+  await expect(wizard).toHaveAttribute('data-wizard-step', 'welcome');
+  const primary = page.getByTestId('first-run-wizard-primary');
+  await expect(wizard.getByTestId('first-run-wizard-sentence')).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(primary).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(wizard).toHaveAttribute('data-wizard-step', 'choose');
+  const useStarter = page.getByTestId('first-run-wizard-use-starter-dual-ma-crossover');
+  await useStarter.click();
+  await expect(wizard).toHaveAttribute('data-wizard-step', 'start_paper');
+  await page.reload();
+  await expect(wizard).toHaveAttribute('data-wizard-step', 'start_paper');
+  await wizard.getByRole('button', {name: 'Back to strategies'}).click();
+  await useStarter.click();
+  await primary.click();
+  await expect(wizard.getByTestId('first-run-wizard-sentence')).toContainText('Waiting for the first market check');
+  await primary.click();
+  await primary.click();
+  await expect(wizard).toHaveCount(0);
+  check('Keyboard onboarding, reload recovery and real paper arm', true);
   const workspace = page.getByTestId('app-home');
   await expect(workspace).toBeVisible();
   // Skipping the wizard arms the setup tour. Dismiss it, then require home.
@@ -139,7 +162,7 @@ try {
   }
   await expect(workspace.getByTestId('app-home-cta-paper')).toBeVisible();
   await expect(workspace.getByTestId('app-home-cta-packs')).toBeVisible();
-  check('Home clearly labels paper-only and disabled live', (await workspace.innerText()).includes('Live trading stays off'));
+  await expect(workspace).toContainText("Paper trading on this computer");
   // Labels match frontend/src/shell/Navigation.tsx PRIMARY_VIEWS and MORE_VIEWS.
   const homeTab = 'Workspace';
   const navigation = page.getByTestId('kbot-nav');
@@ -149,6 +172,10 @@ try {
     await expect(navigation.getByRole('button', {name: label, exact: true})).toHaveAttribute('aria-pressed', 'true');
     check(`${label} navigation reachable`, true);
   }
+  await navigation.getByRole('button', {name: 'Run', exact: true}).click();
+  await page.getByRole('button', {name: 'Stop paper run', exact: true}).click();
+  await expect(page.getByTestId('paper-status-empty')).toBeVisible();
+  check('Stop updates the real paper run state', true);
   await navigation.getByTestId('kbot-nav-more-toggle').click();
   await expect(navigation.getByTestId('kbot-nav-more')).toBeVisible();
   for (const [view, label] of [
@@ -176,7 +203,7 @@ try {
   await page.screenshot({path: path.join(evidence, 'installed-home-mobile.png'), fullPage: true});
   report.screenshots.push('installed-home-mobile.png');
   check('No uncaught JavaScript errors', report.pageErrors.length === 0);
-  check('No product commands or external requests', report.requests.every(request => request.path === '/api/v1/session/bootstrap' || request.method === 'GET'));
+  check('Writes are limited to session, starter, and paper commands', report.requests.every(request => request.method === 'GET' || /^\/api\/v1\/(session\/bootstrap|strategies\/drafts(?:\/[^/]+\/validate)?|commands)$/.test(request.path)));
   await context.close();
   await browser.close();
   browser = null;

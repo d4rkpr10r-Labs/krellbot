@@ -1221,6 +1221,7 @@ function ResultPanel({
   );
   // Result provenance: only what the stored receipt itself carries plus the
   // job identity it was loaded under — never the (editable) setup fields.
+  const receiptDate = (value: unknown) => typeof value === "string" && value ? value : "unavailable";
   const provenance: Array<{ label: string; value: string; testId: string }> = [
     {
       label: "Job",
@@ -1231,6 +1232,16 @@ function ResultPanel({
       label: "Fee (bps)",
       value: formatMetric(receipt.fee_bps),
       testId: "research-result-context-fee",
+    },
+    {
+      label: "Historical data window",
+      value: `${receiptDate(receipt.from)} to ${receiptDate(receipt.to)}`,
+      testId: "research-result-context-window",
+    },
+    {
+      label: "Simulated slippage (bps)",
+      value: formatMetric(receipt.slippage_bps),
+      testId: "research-result-context-slippage",
     },
     {
       label: "Data manifest sha256",

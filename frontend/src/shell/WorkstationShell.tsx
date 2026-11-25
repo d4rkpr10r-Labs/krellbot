@@ -1277,6 +1277,7 @@ export function WorkstationShell({
             }
             strategyClient={client}
             armedPaperRuns={armedPaperRuns}
+            paperClient={paper}
             onReplaySetupTour={replaySetupTour}
             onStarterReady={({ revisionId }) => {
               setPreferredArmRevisionId(revisionId);

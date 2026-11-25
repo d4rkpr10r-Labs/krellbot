@@ -119,8 +119,8 @@ describe("AppHome armed paper run status", () => {
     );
 
     const status = screen.getByTestId("app-home-active-paper");
-    expect(status.getAttribute("data-paper-state")).toBe("running");
-    expect(status.textContent).toContain("Running: Dual moving average");
+    expect(status.getAttribute("data-paper-state")).toBe("waiting");
+    expect(status.textContent).toContain("Waiting: Dual moving average");
     expect(status.textContent).toMatch(/Paper only on this computer/i);
 
     const cta = screen.getByTestId("app-home-cta-paper");
@@ -214,7 +214,7 @@ describe("AppHome armed paper run status", () => {
 
     await waitFor(() => {
       expect(screen.getByTestId("app-home-active-paper").textContent).toContain(
-        "Running: Dual moving average",
+        "Waiting: Dual moving average",
       );
     });
     expect(screen.getByTestId("app-home-cta-paper").textContent).toBe(

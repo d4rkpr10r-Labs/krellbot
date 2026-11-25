@@ -5,6 +5,7 @@ export type VersionInfo = {
   version: string;
   channel: ReleaseChannel;
   artifacts_signed: boolean;
+  source_commit?: string;
 };
 
 export type VersionClient = {
@@ -22,6 +23,9 @@ export function adaptVersionInfo(raw: unknown): VersionInfo {
     version: typeof obj.version === "string" ? obj.version : "",
     channel,
     artifacts_signed: obj.artifacts_signed === true,
+    ...(typeof obj.source_commit === "string" && /^[0-9a-f]{40}$/.test(obj.source_commit)
+      ? { source_commit: obj.source_commit }
+      : {}),
   };
 }
 

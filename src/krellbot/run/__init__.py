@@ -462,6 +462,7 @@ def tick(
     clock: Callable[[], float] | None = None,
     home: Path | None = None,
     transport: Any | None = None,
+    on_pack_completed: Callable[[str, str], None] | None = None,
 ) -> int:
     """Run one tick. Returns 0 on success, 1 on refusal.
 
@@ -513,6 +514,7 @@ def tick(
                     bar_ts=0,
                     detail={
                         "reason": "live_fenced",
+                        "mode": live_armed.mode,
                         "code": gate_result.code,
                         "pair": live_armed.pair,
                     },
@@ -528,6 +530,7 @@ def tick(
                 bar_ts=0,
                 detail={
                     "reason": "live_refused",
+                    "mode": live_armed.mode,
                     "code": gate_result.code,
                     "pair": live_armed.pair,
                 },
@@ -550,6 +553,7 @@ def tick(
                     bar_ts=0,
                     detail={
                         "reason": "store_refused",
+                        "mode": live_armed.mode,
                         "code": exc.code,
                         "intent_refused": exc.code,
                         "pair": live_armed.pair,
@@ -580,6 +584,8 @@ def tick(
             latest = candles[-1] if candles else None
             bar_ts = int(latest.ts_ms) if latest is not None else 0
             if candles and _already_journaled(home, armed.pack_id, bar_ts, venue=venue, pair=armed.pair):
+                if on_pack_completed is not None:
+                    on_pack_completed(armed.pack_id, armed.pair)
                 continue
 
             base, _quote = _base_quote(armed.pair)
@@ -686,8 +692,15 @@ def tick(
                     venue=venue,
                     pack=armed.pack_id,
                     bar_ts=0,
-                    detail={"reason": "no_candles", "pair": armed.pair, "ensure_stop_failed": ensure_stop_failed},
+                    detail={
+                        "reason": "no_candles",
+                        "mode": armed.mode,
+                        "pair": armed.pair,
+                        "ensure_stop_failed": ensure_stop_failed,
+                    },
                 )
+                if on_pack_completed is not None:
+                    on_pack_completed(armed.pack_id, armed.pair)
                 continue
 
             target = kb_evaluate.run(pack, candles)
@@ -873,6 +886,7 @@ def tick(
                 bar_ts=bar_ts,
                 detail={
                     "pair": armed.pair,
+                    "mode": armed.mode,
                     "reason": target.reason,
                     "entry_qty": str(entry_qty),
                     "exit_qty": str(exit_qty),
@@ -889,6 +903,8 @@ def tick(
                     **trace_extra,
                 },
             )
+            if on_pack_completed is not None:
+                on_pack_completed(armed.pack_id, armed.pair)
 
         config = kb_config.load_config(home)
         for armed in config.armed:
