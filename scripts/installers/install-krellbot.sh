@@ -107,6 +107,12 @@ if [ -d "$DEST" ]; then
     link_target=$(readlink -- "$DEST" 2>/dev/null || true)
     [ -z "$link_target" ] || fail "'$DEST' is a symbolic link; refusing to install through it."
 fi
+if [ -L "$DEST.old" ] || { [ -e "$DEST.old" ] && [ ! -d "$DEST.old" ]; }; then
+    fail "previous installation path is not a regular folder: $DEST.old"
+fi
+if [ -d "$DEST.old" ] && [ ! -d "$DEST" ]; then
+    fail "restore the previous installation at $DEST.old before installing again."
+fi
 
 # --- install -----------------------------------------------------------------
 

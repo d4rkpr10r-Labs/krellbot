@@ -91,6 +91,9 @@ if (Test-Path -LiteralPath $Previous) {
     if (($PreviousItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or -not $PreviousItem.PSIsContainer) {
         Fail "previous installation path is not a regular folder: $Previous"
     }
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        Fail "restore the previous installation at $Previous before installing again."
+    }
 }
 New-Item -ItemType Directory -Path $Staging | Out-Null
 

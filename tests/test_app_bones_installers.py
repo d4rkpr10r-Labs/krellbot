@@ -461,3 +461,21 @@ def test_linux_installer_retains_previous_program_for_rollback(tmp_path: Path) -
     assert second.returncode == 0, second.stderr
     assert (installed / "_internal" / "runtime.marker").read_text(encoding="utf-8") == "updated"
     assert (xdg_data / "Krellbot.old" / "_internal" / "runtime.marker").read_text(encoding="utf-8") == "payload\n"
+
+
+def test_linux_installer_preserves_previous_when_current_is_missing(tmp_path: Path) -> None:
+    _bash()
+    if not IS_LINUX:
+        pytest.skip("Linux installer rollback is Linux-only")
+    home = tmp_path / "home"
+    home.mkdir()
+    xdg_data = home / ".local" / "share"
+    previous = xdg_data / "Krellbot.old"
+    previous.mkdir(parents=True)
+    sentinel = previous / "previous-program"
+    sentinel.write_text("keep", encoding="utf-8")
+    payload = _make_payload(tmp_path / "source" / "krellbot")
+    result = _run_installer(payload / "install-krellbot.sh", home=home, xdg_data=xdg_data, xdg_config=home / ".config")
+    assert result.returncode != 0
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not (xdg_data / "Krellbot").exists()
