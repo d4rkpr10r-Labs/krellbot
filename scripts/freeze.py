@@ -176,13 +176,13 @@ def _stage_installers(bundle: Path, *, repo_root: Path) -> Path:
 
 
 def _stage_build_identity(bundle: Path, *, repo_root: Path) -> None:
-    """Record a source commit only when the tracked checkout is clean."""
+    """Record a source commit only when the source checkout is clean."""
     try:
         commit = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=repo_root, capture_output=True, text=True, check=True
         ).stdout.strip()
         dirty = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
+            ["git", "status", "--porcelain"],
             cwd=repo_root,
             capture_output=True,
             text=True,
