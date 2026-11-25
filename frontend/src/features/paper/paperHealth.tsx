@@ -9,7 +9,6 @@ export type PaperHealth = {
   state?: string;
   last_check?: number | null;
   last_success?: number | null;
-  refusal?: string | null;
   scheduler_installed?: boolean;
   scheduler_enabled?: boolean;
   scheduler_error?: boolean;
@@ -21,6 +20,7 @@ export function paperHealthSentence(health: PaperHealth | null): string {
   switch (health.state) {
     case "waiting": return "Waiting for the first market check.";
     case "paused": return "New buys are paused.";
+    case "blocked": return "The paper run needs attention before it can place new simulated buys.";
     case "checked": return "Market checked. See the run history for decisions.";
     case "filled": return "Market checked. A simulated trade was made.";
     case "feed_error": return "Market data could not be fetched. Check your connection.";
@@ -60,7 +60,8 @@ export function PaperHealthDetails({ health }: { health: PaperHealth | null }): 
   const needsScheduler = health?.armed && (!health.scheduler_installed || !health.scheduler_enabled || health.scheduler_error);
   return <div data-testid="paper-run-health" role="status">
     <p>{paperHealthSentence(health)}</p>
+    {health?.last_check ? <p>Last check: {new Date(health.last_check * 1000).toLocaleString()}</p> : null}
     {health?.last_success ? <p>Last successful check: {new Date(health.last_success * 1000).toLocaleString()}</p> : null}
-    {needsScheduler ? <p>Automatic checks are not enabled. <a href="/?view=operations">Set up automatic checks</a></p> : null}
+    {needsScheduler ? <p>Automatic checks need attention. <a href="/?view=operations">Review automatic checks</a></p> : null}
   </div>;
 }

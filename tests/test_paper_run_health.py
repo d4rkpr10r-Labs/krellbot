@@ -33,6 +33,8 @@ def armed_health(home):
         assert status == 200
         return body
 
+    health.app = app
+
     def tick(ts, reason="flat", **detail):
         directory = home / "journal"
         directory.mkdir(exist_ok=True)
@@ -70,6 +72,9 @@ def test_health_requires_tick_after_current_arm(armed_health):
         ("fetch_error", {}, "feed_error"),
         ("entry", {"metadata_refusal": "metadata_stale"}, "stale_rules"),
         ("entry", {"metadata_refusal": "metadata_symbol_mismatch"}, "refused"),
+        ("entry", {"kill_switch": True}, "blocked"),
+        ("entry", {"ensure_stop_failed": True}, "blocked"),
+        ("entry", {"entries_blocked": True}, "blocked"),
     ],
 )
 def test_health_explains_each_tick_outcome(armed_health, reason, detail, expected):
@@ -87,3 +92,39 @@ def test_health_reports_pause_and_scheduler_status(home, armed_health):
     assert body["state"] == "paused"
     assert body["scheduler_installed"] is False
     assert body["scheduler_enabled"] is False
+
+
+def test_health_rejects_outdated_check_and_stale_candle(home, armed_health):
+    health, tick = armed_health
+    tick(100001)
+    journal = home / "journal" / "test.jsonl"
+    record = json.loads(journal.read_text())
+    record["bar_ts"] = (record["ts"] - 10800) * 1000
+    journal.write_text(json.dumps(record) + "\n")
+    assert health()["state"] == "stale_candles"
+    assert health()["last_success"] is None
+    record["bar_ts"] = (record["ts"] - 3600) * 1000
+    journal.write_text(json.dumps(record) + "\n")
+    assert health()["state"] == "checked"
+    health.app.state.krellbot.clock = lambda: 110801
+    assert health()["state"] == "stale_check"
+
+
+@pytest.mark.parametrize("timeframe,seconds", [("4h", 14400), ("1d", 86400)])
+def test_health_waits_for_next_long_timeframe_bar(home, armed_health, timeframe, seconds):
+    health, tick = armed_health
+    pack = home / "packs" / "wave.json"
+    content = json.loads(pack.read_text())
+    content["timeframe"] = timeframe
+    pack.write_text(json.dumps(content))
+    tick(100001)
+    health.app.state.krellbot.clock = lambda: 100001 + seconds
+    assert health()["state"] == "checked"
+    health.app.state.krellbot.clock = lambda: 100001 + seconds + 7200
+    assert health()["state"] == "stale_check"
+
+
+def test_zero_quantity_is_not_reported_as_a_fill(armed_health):
+    health, tick = armed_health
+    tick(100001, "entry", entry_qty="0.00000000")
+    assert health()["state"] == "checked"

@@ -2970,6 +2970,9 @@ def create_app(
             for rec in records
             if _tick_refusal_code(rec) is None
             and (rec.get("detail") or {}).get("reason") not in {"fetch_error", "no_candles"}
+            and not any(
+                (rec.get("detail") or {}).get(flag) for flag in ("kill_switch", "entries_blocked", "ensure_stop_failed")
+            )
             and has_fresh_candle(rec)
         ]
         bar_ts = latest.get("bar_ts") if latest else None
@@ -2980,6 +2983,8 @@ def create_app(
             has_fill = False
         if armed.entries_paused:
             state = "paused"
+        elif detail.get("kill_switch") or detail.get("ensure_stop_failed") or detail.get("entries_blocked"):
+            state = "blocked"
         elif reason == "fetch_error":
             state = "feed_error"
         elif refusal:
@@ -2990,7 +2995,7 @@ def create_app(
             state = "unavailable"
         elif candle_stale:
             state = "stale_candles"
-        elif latest and _app_now(s) - latest["ts"] >= 7200:
+        elif latest and _app_now(s) - latest["ts"] >= max(7200, (timeframe_seconds or 0) + 7200):
             state = "stale_check"
         elif latest:
             state = "filled" if has_fill else "checked"
@@ -3006,7 +3011,6 @@ def create_app(
                 "state": state,
                 "last_check": int(latest["ts"]) if latest else None,
                 "last_success": int(successful[-1]["ts"]) if successful else None,
-                "refusal": refusal,
                 "scheduler_installed": scheduler["installed"],
                 "scheduler_enabled": scheduler["enabled"],
                 "scheduler_error": bool(scheduler["last_error"]),
