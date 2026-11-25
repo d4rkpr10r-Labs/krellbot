@@ -47,6 +47,7 @@ from krellbot.execution import reservations as kb_reservations
 from krellbot.pack import evaluate as kb_evaluate
 from krellbot.pack import lint as kb_pack_lint
 from krellbot.pack.model import Candle as Candle
+from krellbot.run.reconcile import OwnershipIdentity, OwnershipProjection, project_ownership
 from krellbot.storage.database import OperationalStore, StoreError, StoreFull
 from krellbot.storage.outbox import (
     ModeError,
@@ -62,6 +63,10 @@ from krellbot.venues.base import OrderRef, PairRules, ProtectiveStopRejectedErro
 from krellbot.venues.paper import SLIPPAGE_BPS
 
 from .lock import TickLock
+
+# Tick ``intent_refused`` code when journal history for an arm cannot be attributed.
+OWNERSHIP_AMBIGUOUS = "ownership_ambiguous"
+
 
 # ---- coid ----------------------------------------------------------------
 
@@ -594,7 +599,13 @@ def tick(
 
             base, _quote = _base_quote(armed.pair)
             venue_base = snap_balances.get(base, Decimal(0))
-            journal_qty = _journal_owned(home, armed.pack_id, armed.pair)
+            ownership = _journal_ownership(home, armed, venue)
+            journal_qty = ownership.attributable_qty
+            if ownership.ambiguous:
+                # History that may belong to this arm cannot be attributed, so
+                # the strategy cannot be shown to be flat: hold new entries.
+                # Exits and stop maintenance below act on attributable qty only.
+                pack_intent_refused.setdefault(armed.pack_id, OWNERSHIP_AMBIGUOUS)
             recognized = _recognized_open_qty(armed, venue, candles, snap_orders)
             owned = min(venue_base, max(journal_qty, recognized))
             resting = next(
@@ -735,6 +746,7 @@ def tick(
                 not blocked
                 and not entries_suppressed
                 and not reconcile_blocked
+                and not ownership.ambiguous
                 and target.long
                 and owned == Decimal(0)
                 and target.stop_price is not None
@@ -1005,10 +1017,11 @@ def journal_tail(n: int = 5, *, home: Path | None = None) -> int:
 # ---- internals ------------------------------------------------------------
 
 
-def _journal_owned(home: Path, pack_id: str, pair: str) -> Decimal:
-    from krellbot.run.reconcile import reconcile_owned_qty
-
-    return reconcile_owned_qty(home, pack_id=pack_id, pair=pair, venue_owned_qty=Decimal("1e18"))
+def _journal_ownership(home: Path, armed: kb_config.ArmedPack, venue: str) -> OwnershipProjection:
+    return project_ownership(
+        home,
+        OwnershipIdentity(pack_id=armed.pack_id, venue=venue, pair=armed.pair, mode=armed.mode),
+    )
 
 
 def _recognized_open_qty(armed: kb_config.ArmedPack, venue: str, candles: list, orders: list) -> Decimal:
