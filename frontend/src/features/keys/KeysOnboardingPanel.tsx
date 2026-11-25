@@ -342,7 +342,7 @@ export function KeysOnboardingPanel({
             <div className="kbot-keys__form" data-testid={`keys-form-${venue}`}>
               <p className="kbot-keys__absent" data-testid={`keys-absent-${venue}`}>
                 {replacing
-                  ? "The existing key stays in place until the new key is verified and saved."
+                  ? "Krellbot checks the new key before replacing the existing key."
                   : status.message === "keyring state could not be read"
                     ? "Unlock your keychain and refresh before adding a key."
                     : status.corrupt
