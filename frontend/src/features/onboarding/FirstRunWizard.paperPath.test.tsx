@@ -180,7 +180,7 @@ describe("FirstRunWizard choose saves a free starter through the strategy client
     const pack = catalogue.examples.find(
       (row) => row.id === "starter-mean-reversion-band",
     )!.pack;
-    expect(strategyClient.create).toHaveBeenCalledWith(pack);
+    expect(strategyClient.create).toHaveBeenCalledWith({ ...pack, markets: [{ venue: "kraken", pair: "XXBTZUSD" }] });
     expect(strategyClient.validate).toHaveBeenCalledWith("rev-starter-1");
     expect(strategyClient.arm).not.toHaveBeenCalled();
     expect(paperClient.arm).not.toHaveBeenCalled();
@@ -189,8 +189,26 @@ describe("FirstRunWizard choose saves a free starter through the strategy client
       stepId: "start_paper",
       selectedStarterId: "starter-mean-reversion-band",
       revisionId: "rev-starter-1",
+      marketVenue: "kraken",
     });
     expectNoJargonOrPnl(surfaceText());
+  });
+
+
+  it("saves the Coinbase BTC/USD choice across a reload and arms that venue", async () => {
+    const strategyClient = fakeStrategy();
+    const paperClient = fakePaper();
+    writeFirstRunWizardState({ status: "active", stepId: "choose", selectedStarterId: null }, STORAGE);
+    const view = render(<FirstRunWizard strategyClient={strategyClient} paperClient={paperClient} loadStarters={async () => jargonCatalogue()} />);
+    fireEvent.change(screen.getByTestId("first-run-wizard-market"), { target: { value: "coinbase" } });
+    fireEvent.click(screen.getByTestId("first-run-wizard-use-starter-dual-ma-crossover"));
+    await screen.findByTestId("first-run-wizard-market-summary");
+    expect(strategyClient.create).toHaveBeenCalledWith(expect.objectContaining({ markets: [{ venue: "coinbase", pair: "BTC-USD" }] }));
+    expect(screen.getByTestId("first-run-wizard-market-summary").textContent).toContain("Coinbase · BTC/USD · 1 hour · 1,000 USD");
+    view.unmount();
+    render(<FirstRunWizard strategyClient={strategyClient} paperClient={paperClient} loadStarters={async () => jargonCatalogue()} />);
+    fireEvent.click(screen.getByTestId("first-run-wizard-primary"));
+    await waitFor(() => expect(paperClient.arm).toHaveBeenCalledWith(expect.objectContaining({ venue: "coinbase", paper_balance: "1000" })));
   });
 
   it("stays on choose when validation does not leave a runnable draft", async () => {

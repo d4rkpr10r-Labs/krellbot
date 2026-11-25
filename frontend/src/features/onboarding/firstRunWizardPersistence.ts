@@ -30,6 +30,7 @@ export type FirstRunWizardPersisted = {
    * paper clients save one, so older stub state stays unchanged.
    */
   revisionId?: string;
+  marketVenue?: "kraken" | "coinbase";
 };
 
 export const DEFAULT_FIRST_RUN_WIZARD_STATE: FirstRunWizardPersisted = {
@@ -87,6 +88,9 @@ export function readFirstRunWizardState(
       };
       if (typeof record.revisionId === "string" && record.revisionId.length > 0) {
         next.revisionId = record.revisionId;
+      }
+      if (record.marketVenue === "kraken" || record.marketVenue === "coinbase") {
+        next.marketVenue = record.marketVenue;
       }
       return next;
     }

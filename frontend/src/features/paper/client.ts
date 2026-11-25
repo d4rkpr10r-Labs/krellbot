@@ -58,6 +58,8 @@ export type PaperArmDraftSummary = {
   runnable: boolean;
   label: string;
   pair: string;
+  markets?: Array<{ venue: string; pair: string }>;
+  timeframe?: string;
 };
 
 export type PaperPnlPoint = {
@@ -409,6 +411,12 @@ function adaptDraftSummary(raw: Record<string, unknown>): PaperArmDraftSummary {
     runnable: raw.runnable === true,
     label: str(raw.label),
     pair: str(raw.pair),
+    timeframe: str(raw.timeframe),
+    markets: Array.isArray(raw.markets)
+      ? raw.markets.filter((market): market is {venue: string; pair: string} =>
+          market !== null && typeof market === "object" &&
+          typeof market.venue === "string" && typeof market.pair === "string")
+      : undefined,
   };
 }
 

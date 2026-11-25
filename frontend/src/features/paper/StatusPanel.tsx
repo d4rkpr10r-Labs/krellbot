@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef, useState, type JSX } from "react";
 import { DisclosureSection } from "../../components/disclosure/DisclosureSection";
 import { getCsrf } from "../../session";
+import { paperMarketAvailability } from "./marketAvailability";
 import type {
   PaperArmDraftSummary,
   PaperClient,
@@ -475,6 +476,11 @@ function ArmForm({
         const armable = rows.filter((row) => row.runnable === true);
         setDrafts(armable);
         setLoadError(null);
+        const initialDraft = armable.find((row) => row.revision_id === preferredRevisionId) ?? armable[0];
+        const firstVenue = initialDraft?.markets?.[0]?.venue;
+        if (firstVenue && ARM_VENUES.includes(firstVenue)) {
+          setVenue(firstVenue);
+        }
         setRevisionId((current) => {
           if (
             preferredRevisionId &&
@@ -517,9 +523,11 @@ function ArmForm({
   }
 
   const balanceValid = isValidPaperBalance(balance);
-  const armDisabled = pending || !balanceValid || revisionId === "";
   const selectedDraft =
     drafts?.find((row) => row.revision_id === revisionId) ?? null;
+  const selectedPair = selectedDraft?.markets?.find((market) => market.venue === venue)?.pair;
+  const armDisabled = pending || !balanceValid || revisionId === "" ||
+    (selectedDraft?.markets !== undefined && !selectedPair);
 
   const handleArm = async (): Promise<void> => {
     const arm = client.arm;
@@ -636,7 +644,12 @@ function ArmForm({
               value={revisionId}
               title={selectedDraft?.revision_id}
               onChange={(event) => {
-                setRevisionId(event.target.value);
+                const nextRevision = event.target.value;
+                setRevisionId(nextRevision);
+                const firstMarket = drafts.find((row) => row.revision_id === nextRevision)?.markets?.[0];
+                if (firstMarket && ARM_VENUES.includes(firstMarket.venue)) {
+                  setVenue(firstMarket.venue);
+                }
               }}
               disabled={pending}
             >
@@ -701,6 +714,18 @@ function ArmForm({
               />
             </label>
           </div>
+          {selectedDraft ? (
+            <p data-testid="paper-market-availability">
+              {selectedPair
+                ? paperMarketAvailability(venue, selectedPair, selectedDraft.timeframe ?? "")
+                : selectedDraft.markets
+                  ? "This strategy has no market on the selected exchange."
+                  : "Check that the strategy has a market on the selected exchange."}
+              {selectedPair && paperMarketAvailability(venue, selectedPair, selectedDraft.timeframe ?? "").includes("offline candle replay") ? (
+                <> <a href="https://github.com/d4rkpr10r-Labs/krellbot/blob/main/docs/paper.md#run-a-tick" target="_blank" rel="noreferrer">Offline replay instructions</a></>
+              ) : null}
+            </p>
+          ) : null}
           {!balanceValid ? (
             <p
               className="kbot-paper-status__error"

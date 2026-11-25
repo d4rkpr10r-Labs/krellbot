@@ -35,6 +35,14 @@ instrument rules separately. Order simulation remains local. For paper
 venues without a scheduled candle reader, the pinned CSV path is the
 verified end-to-end tick path.
 
+The first-run wizard can save a BTC/USD strategy for Kraken (`XXBTZUSD`)
+or Coinbase (`BTC-USD`). It shows the exchange, market, one-hour timeframe,
+and simulated USD starting balance before the run is armed. Existing saved
+SUI/USD strategies remain available. The Run form indicates whether the
+selected market has scheduled candles, needs offline replay, or has not yet
+been verified. Scheduled coverage in this interface currently names Kraken
+BTC/USD and SUI/USD, Coinbase BTC/USD, and Binance BTC/USDT at 1h, 4h, and 1d.
+
 The paper acceptance suite exercises one spot market per registered venue
 using pinned candles and instrument rules. For each market it validates and
 arms a strategy, checks the simulated fill and balance in the workstation,
