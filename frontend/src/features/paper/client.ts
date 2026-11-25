@@ -1,5 +1,6 @@
 import { getCsrf, recoverPaperStatusSession } from "../../session";
 import type { RehearsalClient } from "./rehearsalClient";
+import type { PaperHealth } from "./paperHealth";
 import { createRehearsalHttpClient } from "./rehearsalClient";
 
 export type PaperStatus = {
@@ -104,6 +105,7 @@ export type PaperStatusSelect = {
 
 export type PaperClient = {
   getStatus(select?: PaperStatusSelect): Promise<PaperStatus>;
+  getHealth?(select?: PaperStatusSelect): Promise<PaperHealth>;
   getPosition?(select?: PaperStatusSelect): Promise<PaperPosition>;
   getChart?(): Promise<PaperChart>;
   pauseEntries(venue: string, pair: string): Promise<PaperCommandResult>;
@@ -982,6 +984,20 @@ export function createHttpClient(): PaperClient &
   return {
     getStatus(select?: PaperStatusSelect): Promise<PaperStatus> {
       return getJson(paperStatusUrl(select));
+    },
+    async getHealth(select?: PaperStatusSelect): Promise<PaperHealth> {
+      const params = select ? `?venue=${encodeURIComponent(select.venue)}&pair=${encodeURIComponent(select.pair)}` : "";
+      const response = await fetch(`/api/v1/paper/health${params}`, {
+        method: "GET",
+        credentials: "include",
+      });
+      if (!response.ok) throw new Error("Paper run status unavailable");
+      const health = await response.json() as PaperHealth;
+      if (typeof health.armed !== "boolean") throw new Error("Paper run status unavailable");
+      if (select && health.armed && (health.venue !== select.venue || health.pair !== select.pair)) {
+        throw new Error("Paper run status unavailable");
+      }
+      return health;
     },
     getPosition(select?: PaperStatusSelect): Promise<PaperPosition> {
       return getPaperPosition(select);
