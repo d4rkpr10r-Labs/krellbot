@@ -60,6 +60,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -312,7 +313,7 @@ def _write_zip(dist: Path, output: Path) -> None:
                 # itself, not by external_attr.
                 mode = 0o644
             else:
-                mode = src.stat().st_mode & 0o7777
+                mode = src.stat().st_mode
             info.external_attr = (mode & 0xFFFF) << 16
             zf.writestr(info, data)
 
@@ -375,7 +376,7 @@ def _write_zip_prefixed(root: Path, output: Path, *, archive_root_name: str) -> 
             if is_windows:
                 mode = 0o644
             else:
-                mode = src.stat().st_mode & 0o7777
+                mode = src.stat().st_mode
             info.external_attr = (mode & 0xFFFF) << 16
             zf.writestr(info, data)
 
@@ -435,6 +436,7 @@ def build_macos_app_archive(
     version: str,
     arch: str,
     url: str,
+    preserve_platform_metadata: bool = False,
 ) -> dict[str, str | int]:
     """Archive a stapled (or unsigned) ``Krellbot.app`` with installer manifest.
 
@@ -460,7 +462,13 @@ def build_macos_app_archive(
     commit = _source_commit(app / "Contents" / "MacOS")
     if commit is not None:
         manifest["source_commit"] = commit
-    _write_zip_prefixed(app, output, archive_root_name=app.name)
+    if preserve_platform_metadata:
+        # The notarization ticket and native bundle metadata must survive the ZIP.
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.unlink(missing_ok=True)
+        subprocess.run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", app, output], check=True)
+    else:
+        _write_zip_prefixed(app, output, archive_root_name=app.name)
     digest = _sha256_of(output)
     size = output.stat().st_size
     manifest["sha256"] = digest
