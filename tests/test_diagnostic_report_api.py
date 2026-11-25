@@ -26,6 +26,21 @@ def test_report_requires_loopback_session_and_is_no_store(home):
     assert set(report) == {"schema_version", "build", "os", "scheduler", "events", "reproduction_steps"}
 
 
+def test_report_includes_validated_frozen_build_commit(home, monkeypatch):
+    import sys
+
+    commit = "a" * 40
+    (home / "krellbot-build.json").write_text(json.dumps({"source_commit": commit}), encoding="utf-8")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(home), raising=False)
+    app = _build_app(home)
+    status, body = _get(app, "/api/v1/diagnostics/report", headers=_auth(*_bootstrap(app)))
+    assert status == 200
+    build = json.loads(body)["build"]
+    assert build["commit"] == commit
+    assert "source_commit" not in build
+
+
 def test_report_bounds_and_allowlists_evidence(home):
     pack = _pack_dict("paper-report")
     path = home / "pack.json"
