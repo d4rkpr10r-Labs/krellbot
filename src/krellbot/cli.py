@@ -1094,8 +1094,9 @@ class CandleFetchError(RuntimeError):
     never called.
     """
 
-    def __init__(self, exc_type_name: str):
+    def __init__(self, exc_type_name: str, *, pair: str | None = None):
         self.exc_type_name = exc_type_name
+        self.pair = pair
         super().__init__(exc_type_name)
 
 
@@ -1249,21 +1250,21 @@ def _build_fetch_reader(armed_list, *, fetch, transport):
     def reader(venue: str, pair: str):
         armed = by_pair.get(pair)
         if armed is None:
-            raise CandleFetchError("ValueError")
+            raise CandleFetchError("ValueError", pair=pair)
         try:
             raw = Path(armed.pack_path).read_text(encoding="utf-8")
             data = json.loads(raw)
         except (OSError, json.JSONDecodeError) as exc:
-            raise CandleFetchError(type(exc).__name__) from exc
+            raise CandleFetchError(type(exc).__name__, pair=pair) from exc
         if not isinstance(data, dict) or not data.get("timeframe"):
-            raise CandleFetchError("ValueError")
+            raise CandleFetchError("ValueError", pair=pair)
         try:
             candles = fetch(venue, pair, data["timeframe"], transport)
             return list(candles or [])
-        except CandleFetchError:
-            raise
+        except CandleFetchError as exc:
+            raise CandleFetchError(exc.exc_type_name, pair=pair) from exc
         except Exception as exc:
-            raise CandleFetchError(type(exc).__name__) from exc
+            raise CandleFetchError(type(exc).__name__, pair=pair) from exc
 
     return reader
 
@@ -1454,7 +1455,7 @@ def _build_live_venue_for_offline(armed, *, transport):
     return venue_obj
 
 
-def _record_fetch_error(*, venue: str, armed, exc_type_name: str) -> None:
+def _record_fetch_error(*, venue: str, armed, exc_type_name: str, reason: str = "fetch_error") -> None:
     """Append a `reason: fetch_error` tick record before exit 1."""
     from krellbot import journal as kb_journal
 
@@ -1467,7 +1468,8 @@ def _record_fetch_error(*, venue: str, armed, exc_type_name: str) -> None:
                 "pack": armed.pack_id,
                 "bar_ts": 0,
                 "detail": {
-                    "reason": "fetch_error",
+                    "reason": reason,
+                    "mode": armed.mode,
                     "exception": exc_type_name,
                     "pair": armed.pair,
                 },
@@ -1625,7 +1627,9 @@ def _tick_one_venue(
         return _tick_and_summarize(home, venue, venue_obj, reader, armed.mode)
     except CandleFetchError as exc:
         print(exc.exc_type_name, flush=True)
-        _record_fetch_error(venue=venue, armed=armed, exc_type_name=exc.exc_type_name)
+        for affected in armed_list:
+            reason = "fetch_error" if exc.pair is None or affected.pair == exc.pair else "check_incomplete"
+            _record_fetch_error(venue=venue, armed=affected, exc_type_name=exc.exc_type_name, reason=reason)
         return 1
 
 

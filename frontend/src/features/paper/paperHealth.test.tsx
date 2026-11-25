@@ -10,6 +10,7 @@ describe("paper run health", () => {
     expect(paperHealthSentence({ armed: true, state: "filled" })).toMatch(/simulated trade/i);
     expect(paperHealthSentence({ armed: true, state: "stale_candles" })).toMatch(/out of date/i);
     expect(paperHealthSentence({ armed: true, state: "feed_error" })).toMatch(/could not be fetched/i);
+    expect(paperHealthSentence({ armed: true, state: "check_incomplete" })).toMatch(/did not complete/i);
     expect(paperHealthSentence({ armed: true, state: "blocked" })).toMatch(/needs attention/i);
   });
 

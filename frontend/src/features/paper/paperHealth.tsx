@@ -24,6 +24,7 @@ export function paperHealthSentence(health: PaperHealth | null): string {
     case "checked": return "Market checked. See the run history for decisions.";
     case "filled": return "Market checked. A simulated trade was made.";
     case "feed_error": return "Market data could not be fetched. Check your connection.";
+    case "check_incomplete": return "The market check did not complete. Review the other runs on this exchange.";
     case "no_candles": return "No completed market candles are available yet.";
     case "stale_candles": return "Market data is out of date. Check the feed before relying on this run.";
     case "stale_check": return "The last market check is out of date. Check automatic scheduling.";

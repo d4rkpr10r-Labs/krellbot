@@ -70,6 +70,7 @@ def test_health_requires_tick_after_current_arm(armed_health):
         ("flat", {}, "checked"),
         ("no_candles", {}, "no_candles"),
         ("fetch_error", {}, "feed_error"),
+        ("check_incomplete", {}, "check_incomplete"),
         ("entry", {"metadata_refusal": "metadata_stale"}, "stale_rules"),
         ("entry", {"metadata_refusal": "metadata_symbol_mismatch"}, "refused"),
         ("entry", {"kill_switch": True}, "blocked"),

@@ -2977,7 +2977,7 @@ def create_app(
             rec
             for rec in records
             if _tick_refusal_code(rec) is None
-            and (rec.get("detail") or {}).get("reason") not in {"fetch_error", "no_candles"}
+            and (rec.get("detail") or {}).get("reason") not in {"fetch_error", "check_incomplete", "no_candles"}
             and not any(
                 (rec.get("detail") or {}).get(flag) for flag in ("kill_switch", "entries_blocked", "ensure_stop_failed")
             )
@@ -2997,6 +2997,8 @@ def create_app(
             state = "blocked"
         elif reason == "fetch_error":
             state = "feed_error"
+        elif reason == "check_incomplete":
+            state = "check_incomplete"
         elif refusal:
             state = "stale_rules" if refusal == "metadata_stale" else "refused"
         elif reason == "no_candles":
