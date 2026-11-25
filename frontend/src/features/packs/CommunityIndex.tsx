@@ -63,7 +63,7 @@ export function CommunityIndex({
   const [installingId, setInstallingId] = useState<string | null>(null);
   const [installFeedback, setInstallFeedback] = useState<Record<string, string>>({});
   const requestSeq = useRef(0);
-  const installSeq = useRef(0);
+  const installPending = useRef(false);
 
   const load = useCallback((): void => {
     const seq = (requestSeq.current += 1);
@@ -93,7 +93,8 @@ export function CommunityIndex({
 
   const handleInstall = useCallback(
     (pack: CommunityIndexPack): void => {
-      const seq = (installSeq.current += 1);
+      if (installPending.current) return;
+      installPending.current = true;
       setInstallingId(pack.id);
       setInstallFeedback((prev) => {
         const next = { ...prev };
@@ -103,7 +104,6 @@ export function CommunityIndex({
       client
         .installCommunity(pack.id)
         .then((result) => {
-          if (seq !== installSeq.current) return;
           if (result.ok) {
             const version = result.pack?.version ?? "—";
             const author = result.pack?.author ?? pack.author ?? "—";
@@ -121,16 +121,14 @@ export function CommunityIndex({
           }));
         })
         .catch((err: unknown) => {
-          if (seq !== installSeq.current) return;
           setInstallFeedback((prev) => ({
             ...prev,
             [pack.id]: failureMessage(err),
           }));
         })
         .finally(() => {
-          if (seq === installSeq.current) {
-            setInstallingId(null);
-          }
+          installPending.current = false;
+          setInstallingId(null);
         });
     },
     [client, onInstalled],
@@ -158,7 +156,7 @@ export function CommunityIndex({
           aria-busy={refreshing}
           onClick={load}
         >
-          {refreshing ? "Refreshing…" : "Refresh index"}
+          {refreshing ? "Refreshing…" : error !== null ? "Try again" : "Refresh index"}
         </button>
       </header>
       <p
@@ -168,8 +166,7 @@ export function CommunityIndex({
         {COMMUNITY_BADGE}
       </p>
       <p className="kbot-community-index__helper" data-testid="community-index-honesty">
-        {meta.honesty} One-click install writes under packs/community/ after
-        allow-list checks.
+        {meta.honesty} Review the rules and validate the pack before starting a paper run.
       </p>
       {document !== null ? (
         <p className="kbot-community-index__meta" data-testid="community-index-meta">
@@ -185,7 +182,7 @@ export function CommunityIndex({
           </p>
         ) : document === null ? (
           <p className="kbot-community-index__failed" data-testid="community-index-failed">
-            Community index not loaded.
+            Community packs are unavailable. Check your connection and try again.
           </p>
         ) : packs.length === 0 ? (
           <p className="kbot-community-index__empty" data-testid="community-index-empty">
@@ -238,8 +235,8 @@ export function CommunityIndex({
                       type="button"
                       className="kbot-community-index__install"
                       data-testid={`community-index-install-${pack.id}`}
-                      disabled={busy}
-                      aria-disabled={busy}
+                      disabled={installingId !== null}
+                      aria-disabled={installingId !== null}
                       aria-busy={busy}
                       onClick={() => {
                         handleInstall(pack);

@@ -281,6 +281,7 @@ export function FirstRunWizard({
     kind: "loading",
   });
   const inFlight = useRef(false);
+  const stepPrompt = useRef<HTMLParagraphElement>(null);
 
   useEffect(() => {
     setState(readFirstRunWizardState(storageKey));
@@ -304,6 +305,10 @@ export function FirstRunWizard({
     return steps[index] ?? steps[0]!;
   }, [steps, state.stepId]);
   const health = usePaperHealth(activeStep.id === "status" ? paperClient : undefined);
+
+  useEffect(() => {
+    if (visible) stepPrompt.current?.focus({ preventScroll: true });
+  }, [activeStep.id, visible]);
 
   useEffect(() => {
     if (!visible) {
@@ -637,6 +642,8 @@ export function FirstRunWizard({
 
           <p
             id="kbot-first-run-wizard-sentence"
+            ref={stepPrompt}
+            tabIndex={-1}
             className="kbot-first-run-wizard__sentence"
             data-testid="first-run-wizard-sentence"
           >
@@ -661,7 +668,9 @@ export function FirstRunWizard({
                   value={state.marketVenue ?? "kraken"} disabled={chooseBusyId !== null}
                   onChange={(event) => {
                     const marketVenue = event.target.value === "coinbase" ? "coinbase" : "kraken";
-                    persist({ ...state, marketVenue });
+                    const next: FirstRunWizardPersisted = { ...state, marketVenue };
+                    writeFirstRunWizardState(next, storageKey);
+                    setState(next);
                   }}>
                   <option value="kraken">Kraken · BTC/USD</option>
                   <option value="coinbase">Coinbase · BTC/USD</option>
@@ -691,6 +700,7 @@ export function FirstRunWizard({
                         type="button"
                         className="kbot-first-run-wizard__primary"
                         data-testid={`first-run-wizard-use-${id}`}
+                        aria-label={`Use ${card.title}`}
                         disabled={chooseBusyId !== null}
                         onClick={() => handleSelectStarter(id)}
                       >
@@ -722,6 +732,13 @@ export function FirstRunWizard({
             </button>
           )}
 
+          {activeStep.id === "start_paper" && !armBusy ? (
+            <button type="button" className="kbot-first-run-wizard__skip"
+              onClick={() => {
+                setArmError(null);
+                persist(persisted("active", "choose", state.selectedStarterId ?? null));
+              }}>Back to strategies</button>
+          ) : null}
           {activeStep.id === "start_paper" && state.marketVenue ? (
             <p data-testid="first-run-wizard-market-summary">
               {state.marketVenue === "kraken" ? "Kraken" : "Coinbase"} · BTC/USD · 1 hour · 1,000 USD paper balance.

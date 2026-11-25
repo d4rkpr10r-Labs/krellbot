@@ -79,7 +79,7 @@ describe("PaperPnlPositionChart (armed paper fixture)", () => {
 
     const pnlPanel = screen.getByTestId("paper-pnl-chart");
     expect(pnlPanel.textContent ?? "").toContain(
-      "paper fills · cash + qty×mark − starting_cash",
+      "Simulated fills · cash and holdings minus starting balance",
     );
     const pnlLine = screen.getByTestId("paper-pnl-chart-line");
     expect(pnlLine.tagName).toBe("polyline");
@@ -89,7 +89,7 @@ describe("PaperPnlPositionChart (armed paper fixture)", () => {
 
     const positionPanel = screen.getByTestId("paper-position-chart");
     expect(positionPanel.textContent ?? "").toContain(
-      "journal.owned_qty_after · base qty over time",
+      "Simulated asset holdings over time",
     );
     const positionLine = screen.getByTestId("paper-position-chart-line");
     expect(

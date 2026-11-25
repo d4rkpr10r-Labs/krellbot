@@ -233,3 +233,25 @@ test("packs one-click install: free pack lands in library with bucket and versio
   );
   journey.assertGuards();
 });
+
+test("community catalogue can recover after a temporary outage", async ({ journey }) => {
+  const page = journey.page;
+  await stubPackApis(page);
+  let requests = 0;
+  await page.route("**/api/v1/community/index", async (route) => {
+    requests += 1;
+    if (requests === 1) {
+      await route.fulfill({ status: 503, json: {} });
+      return;
+    }
+    await route.fulfill({ json: { schema_version: "1", packs: [COMMUNITY_PACK] } });
+  });
+  await page.goto(journey.workstation.baseURL);
+  await journey.waitForSessionReady(page);
+  await clickNav(page, "Packs");
+  const panel = page.getByTestId("community-index-panel");
+  await expect(panel.getByText("Community packs are unavailable.", { exact: false })).toBeVisible();
+  await panel.getByRole("button", { name: "Try again" }).click();
+  await expect(panel.getByTestId("community-index-row-trend-follow")).toBeVisible();
+  await expect(panel.getByRole("alert")).toHaveCount(0);
+});

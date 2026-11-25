@@ -82,7 +82,7 @@ test("capture Krell first-run wizard demo frames", async ({ journey }) => {
   await page.getByTestId("first-run-wizard-primary").click();
   await expectWizardOnly(page, "choose");
   await expect(page.getByTestId("first-run-wizard-tiles")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Use" })).toHaveCount(3);
+  await expect(page.getByRole("button", { name: /^Use / })).toHaveCount(3);
   await expect(page.getByText("Dual moving average")).toBeVisible();
   await expect(page.getByText("Mean reversion")).toBeVisible();
   await expect(page.getByText("Range breakout")).toBeVisible();
