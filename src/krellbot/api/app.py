@@ -2913,6 +2913,123 @@ def create_app(
         )
         return JSONResponse(body, status_code=200)
 
+    @app.get("/api/v1/paper/health")
+    async def paper_health(request: Request) -> Response:
+        """Report current-arm paper evidence and scheduler state."""
+        from krellbot.service import supervise as kb_supervise
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+        armed, _ = _select_armed_for_request(kb_config.load_config(s.home), request)
+        if armed is None or armed.mode != "paper":
+            return JSONResponse(
+                {"schema_version": SCHEMA_VERSION, "armed": False}, headers={"Cache-Control": "no-store"}
+            )
+
+        scheduler = await asyncio.to_thread(
+            kb_supervise.scheduler_status,
+            s.home,
+            write_root=_scheduler_write_root(s),
+            supervisor=_scheduler_supervisor(s),
+        )
+        records = []
+        for record in _read_journal_records(s.home):
+            detail = record.get("detail")
+            ts = record.get("ts")
+            if (
+                record.get("kind") == "tick"
+                and record.get("venue") == armed.venue
+                and record.get("pack") == armed.pack_id
+                and isinstance(detail, dict)
+                and detail.get("pair") == armed.pair
+                and isinstance(ts, (int, float))
+                and not isinstance(ts, bool)
+                and 0 < ts < 1_000_000_000_000
+                and armed.armed_at_ts > 0
+                and ts > armed.armed_at_ts
+            ):
+                records.append(record)
+        records.sort(key=lambda rec: rec["ts"])
+        latest = records[-1] if records else None
+        detail = latest.get("detail", {}) if latest else {}
+        reason = detail.get("reason")
+        refusal = _tick_refusal_code(latest) if latest else None
+        timeframe_seconds = None
+        try:
+            pack = json.loads(Path(armed.pack_path).read_text(encoding="utf-8"))
+            timeframe_seconds = {"1h": 3600, "4h": 14400, "1d": 86400}.get(pack.get("timeframe"))
+        except (OSError, ValueError, AttributeError):
+            pass
+
+        def has_fresh_candle(rec: dict) -> bool:
+            bar = rec.get("bar_ts")
+            return (
+                timeframe_seconds is not None
+                and isinstance(bar, (int, float))
+                and not isinstance(bar, bool)
+                and 0 <= bar < 1_000_000_000_000_000
+                and 0 <= rec["ts"] * 1000 - bar <= timeframe_seconds * 2000
+            )
+
+        successful = [
+            rec
+            for rec in records
+            if _tick_refusal_code(rec) is None
+            and (rec.get("detail") or {}).get("reason") not in {"fetch_error", "check_incomplete", "no_candles"}
+            and not any(
+                (rec.get("detail") or {}).get(flag) for flag in ("kill_switch", "entries_blocked", "ensure_stop_failed")
+            )
+            and has_fresh_candle(rec)
+        ]
+        bar_ts = latest.get("bar_ts") if latest else None
+        candle_stale = latest is not None and not has_fresh_candle(latest)
+        try:
+            has_fill = any(Decimal(str(detail.get(k, "0"))) > 0 for k in ("entry_qty", "exit_qty", "stop_qty"))
+        except (InvalidOperation, ValueError):
+            has_fill = False
+        if armed.entries_paused:
+            state = "paused"
+        elif armed.armed_at_ts <= 0:
+            state = "unavailable"
+        elif detail.get("kill_switch") or detail.get("ensure_stop_failed") or detail.get("entries_blocked"):
+            state = "blocked"
+        elif reason == "fetch_error":
+            state = "feed_error"
+        elif reason == "check_incomplete":
+            state = "check_incomplete"
+        elif refusal:
+            state = "stale_rules" if refusal == "metadata_stale" else "refused"
+        elif reason == "no_candles":
+            state = "no_candles"
+        elif latest and (timeframe_seconds is None or not isinstance(bar_ts, (int, float))):
+            state = "unavailable"
+        elif candle_stale:
+            state = "stale_candles"
+        elif latest and _app_now(s) - latest["ts"] >= max(7200, (timeframe_seconds or 0) + 7200):
+            state = "stale_check"
+        elif latest:
+            state = "filled" if has_fill else "checked"
+        else:
+            state = "waiting"
+        return JSONResponse(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "armed": True,
+                "venue": armed.venue,
+                "pair": armed.pair,
+                "pack_id": armed.pack_id,
+                "state": state,
+                "last_check": int(latest["ts"]) if latest else None,
+                "last_success": int(successful[-1]["ts"]) if successful else None,
+                "scheduler_installed": scheduler["installed"],
+                "scheduler_enabled": scheduler["enabled"],
+                "scheduler_error": bool(scheduler["last_error"]),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
     @app.get("/api/v1/paper/details")
     async def paper_details(request: Request) -> Response:
         """Read configured paper deposit/percent and this pair's durable stop.
