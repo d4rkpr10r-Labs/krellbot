@@ -604,10 +604,15 @@ def tick(
             if ownership.ambiguous:
                 # History that may belong to this arm cannot be attributed, so
                 # the strategy cannot be shown to be flat: hold new entries.
-                # Exits and stop maintenance below act on attributable qty only.
+                # Exits and stop maintenance act only on what the recorded
+                # history supports. A requested open-order quantity is not
+                # proof of executed inventory, so it cannot raise that bound;
+                # resting orders are left as they are.
                 pack_intent_refused.setdefault(armed.pack_id, OWNERSHIP_AMBIGUOUS)
-            recognized = _recognized_open_qty(armed, venue, candles, snap_orders)
-            owned = min(venue_base, max(journal_qty, recognized))
+                owned = min(venue_base, journal_qty)
+            else:
+                recognized = _recognized_open_qty(armed, venue, candles, snap_orders)
+                owned = min(venue_base, max(journal_qty, recognized))
             resting = next(
                 (
                     o.stop_price

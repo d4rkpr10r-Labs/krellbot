@@ -18,12 +18,18 @@ the record itself durably says:
   key only for paper arms, so it is positive evidence of paper mode.
 
 A record for this pack that matches every dimension it does carry, but lacks
-one (or has an unreadable quantity), is *ambiguous*. Ambiguous history is
-never credited to the identity being projected and is never inferred from
-what the rest of the journal happens to contain. Its decreases still lower
-the attributable quantity, so ambiguity can only shrink what the engine
-believes it may sell, never grow it. A projection with ambiguity also cannot
-establish that the strategy is flat; callers hold new entries for it.
+one, is *ambiguous*; so is any record with a quantity that is not a finite,
+nonnegative number. Ambiguous history is never credited to the identity being
+projected, and its identity is never inferred from what the rest of the
+journal happens to contain. Readable decreases still count, and an unusable
+decrease drops the bound to zero at that point, so uncertainty can only shrink
+what the recorded history supports. A projection with ambiguity cannot
+establish that the strategy is flat; the tick holds new entries for it and
+does not let requested open-order quantity stand in for executed inventory.
+
+The projection describes recorded history only. Fills the engine never
+journaled (for example paper stop-outs, which tick records as
+``stop_qty: "0"``) are outside it.
 """
 
 from __future__ import annotations
@@ -33,8 +39,8 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-_QTY_INCREASE = ("entry_qty",)
-_QTY_DECREASE = ("exit_qty", "stop_qty")
+_INCREASE_KEY = "entry_qty"
+_DECREASE_KEYS = ("exit_qty", "stop_qty")
 # Written into tick detail only when ``armed.mode == "paper"`` (run.tick).
 _PAPER_ONLY_TRACE_KEY = "decision_trace_bars"
 
@@ -51,11 +57,13 @@ class OwnershipIdentity:
 
 @dataclass(frozen=True)
 class OwnershipProjection:
-    """Journal-attributed ownership for one identity.
+    """What the recorded journal history establishes for one identity.
 
-    ``attributable_qty`` is a conservative lower bound and never negative.
-    ``ambiguous_records`` counts quantity-bearing records for this pack whose
-    identity could not be established and that might belong to it.
+    ``attributable_qty`` is the quantity the recorded history supports
+    without crediting anything uncertain; it is never negative. It is a bound
+    over *recorded* history only: fills the engine never journaled are not
+    in it. ``ambiguous_records`` counts records for this pack whose identity
+    or quantities could not be established and that may belong to it.
     """
 
     attributable_qty: Decimal
@@ -64,10 +72,6 @@ class OwnershipProjection:
     @property
     def ambiguous(self) -> bool:
         return self.ambiguous_records > 0
-
-
-class _Unreadable(Exception):
-    pass
 
 
 def _journal_dir(home: Path) -> Path:
@@ -110,23 +114,39 @@ def _record_mode(detail: dict) -> str | None:
     return None
 
 
-def _qty(detail: dict, key: str) -> Decimal:
+def _qty(detail: dict, key: str) -> Decimal | None:
+    """Return a finite, nonnegative quantity; ``None`` when it is unusable.
+
+    An absent field is zero. A present field that is not a finite,
+    nonnegative number is unusable: its true value is unknown.
+    """
     raw = detail.get(key)
     if raw is None:
         return Decimal(0)
     try:
         value = Decimal(str(raw))
     except (InvalidOperation, ValueError, TypeError):
-        raise _Unreadable from None
-    if not value.is_finite():
-        raise _Unreadable
+        return None
+    if not value.is_finite() or value < 0:
+        return None
     return value
 
 
 def project_ownership(home: Path, identity: OwnershipIdentity) -> OwnershipProjection:
-    """Sum entry - exit - stop over journal ticks attributed to ``identity``."""
-    attributable = Decimal(0)
-    ambiguous_decrease = Decimal(0)
+    """Replay journal ticks for ``identity`` and bound what they establish.
+
+    Records are replayed in journal order. Each quantity field is read on its
+    own, so an unusable field never discards a readable one.
+
+    * Increases are credited only from records whose identity is established
+      and whose ``entry_qty`` is usable.
+    * Readable decreases always lower the bound, including from ambiguous
+      records, so uncertainty can only shrink it.
+    * An unusable decrease could have consumed everything held at that point,
+      so the bound drops to zero there; later established entries still count.
+    * The bound never goes below zero.
+    """
+    bound = Decimal(0)
     ambiguous_records = 0
     expected = (identity.venue, identity.pair, identity.mode)
     for rec in _tick_records(home):
@@ -135,27 +155,25 @@ def project_ownership(home: Path, identity: OwnershipIdentity) -> OwnershipProje
         detail = rec.get("detail")
         if not isinstance(detail, dict):
             continue
-        try:
-            increase = sum((_qty(detail, key) for key in _QTY_INCREASE), Decimal(0))
-            decrease = sum((_qty(detail, key) for key in _QTY_DECREASE), Decimal(0))
-            unreadable = False
-        except _Unreadable:
-            increase = decrease = Decimal(0)
-            unreadable = True
-        if not unreadable and increase == 0 and decrease == 0:
+        increase = _qty(detail, _INCREASE_KEY)
+        decreases = [_qty(detail, key) for key in _DECREASE_KEYS]
+        quantities = [increase, *decreases]
+        if all(q is not None and q == 0 for q in quantities):
             continue
         recorded = (_text(rec.get("venue")), _text(detail.get("pair")), _record_mode(detail))
         if any(value is not None and value != want for value, want in zip(recorded, expected, strict=True)):
             continue  # provably another identity
-        if unreadable or None in recorded:
+        established = None not in recorded
+        if not established or None in quantities:
             ambiguous_records += 1
-            ambiguous_decrease += decrease
-            continue
-        attributable += increase - decrease
-    return OwnershipProjection(
-        attributable_qty=max(attributable - ambiguous_decrease, Decimal(0)),
-        ambiguous_records=ambiguous_records,
-    )
+        if established and increase is not None:
+            bound += increase
+        if any(d is None for d in decreases):
+            bound = Decimal(0)
+        else:
+            bound -= sum(decreases, Decimal(0))
+        bound = max(bound, Decimal(0))
+    return OwnershipProjection(attributable_qty=bound, ambiguous_records=ambiguous_records)
 
 
 def reconcile_owned_qty(

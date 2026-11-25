@@ -304,3 +304,95 @@ def test_ambiguous_history_still_exits_attributable_inventory_only(home):
 
     assert _exits(fake) == [owned]
     assert fake._balances["BTC"] == EXTERNAL
+
+
+# ---- malformed quantities -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("second", "expected"),
+    [
+        ({"entry_qty": "0", "exit_qty": "3"}, Decimal(2)),
+        ({"entry_qty": "not-a-number", "exit_qty": "3"}, Decimal(2)),
+        ({"entry_qty": "-4", "exit_qty": "3"}, Decimal(2)),
+        ({"exit_qty": "not-a-number"}, Decimal(0)),
+        ({"stop_qty": "NaN"}, Decimal(0)),
+        ({"exit_qty": "-3"}, Decimal(0)),
+        ({"stop_qty": "-3"}, Decimal(0)),
+    ],
+    ids=[
+        "readable-decrease",
+        "unreadable-increase-keeps-readable-decrease",
+        "negative-increase-keeps-readable-decrease",
+        "unreadable-exit",
+        "non-finite-stop",
+        "negative-exit",
+        "negative-stop",
+    ],
+)
+def test_each_quantity_is_read_on_its_own_and_unknown_decreases_establish_nothing(home, second, expected):
+    _record(pair="SUIUSD", mode="paper", entry_qty="5")
+    _record(pair="SUIUSD", mode="paper", **second)
+
+    projection = project_ownership(home, _kraken("paper"))
+
+    assert projection.attributable_qty == expected
+    assert projection.ambiguous == (second != {"entry_qty": "0", "exit_qty": "3"})
+
+
+def test_negative_decrease_on_an_ambiguous_record_cannot_grow_ownership(home):
+    _record(pair="SUIUSD", mode="paper", entry_qty="5")
+    _record(venue=None, pair="SUIUSD", mode="paper", exit_qty="-3")
+
+    projection = project_ownership(home, _kraken("paper"))
+
+    assert (projection.attributable_qty, projection.ambiguous) == (Decimal(0), True)
+
+
+def test_unknown_decrease_bounds_only_history_before_it(home):
+    _record(pair="SUIUSD", mode="paper", entry_qty="5")
+    _record(pair="SUIUSD", mode="paper", exit_qty="garbled")
+    _record(pair="SUIUSD", mode="paper", entry_qty="3")
+
+    projection = project_ownership(home, _kraken("paper"))
+
+    assert (projection.attributable_qty, projection.ambiguous) == (Decimal(3), True)
+
+
+def _binance_record(**detail) -> None:
+    _record(pack="shared-pack", venue="binance", pair=PAIR, mode="paper", **detail)
+
+
+@pytest.mark.parametrize("entry_qty", ["0", "not-a-number"], ids=["control", "unreadable-increase"])
+def test_unreadable_increase_never_sells_external_holdings(home, entry_qty):
+    _arm(home, pack_id="shared-pack", venue="binance", cash=Decimal(1000))
+    _binance_record(entry_qty="5")
+    _binance_record(entry_qty=entry_qty, exit_qty="3")
+    # Strategy still holds 2; the venue also holds 100 external. No open orders.
+    fake = _BtcUsdtVenue(venue="binance", pair=PAIR, initial_balances={"BTC": EXTERNAL + 2, "USDT": Decimal(0)})
+
+    _tick(home, "binance", fake, EXIT_BARS, clock=1_003_600)
+
+    assert all(c.qty <= 2 for c in fake.calls if c.method == "stop")
+    assert _exits(fake) == [Decimal(2)]
+    assert fake._balances["BTC"] == EXTERNAL
+
+
+def test_requested_open_order_quantity_is_not_owned_inventory_under_ambiguity(home):
+    from krellbot.venues.base import OpenOrder
+
+    _arm(home, pack_id="shared-pack", venue="binance", cash=Decimal(1000))
+    _binance_record(entry_qty="5")
+    _record(pack="shared-pack", venue=None, pair=PAIR, mode="paper", exit_qty="5")
+    coid = run.coid_for(
+        pack_id="shared-pack", pack_version="1.0.0", venue="binance", pair=PAIR, bar_ts=7_200_000, intent="entry"
+    )
+    fake = _BtcUsdtVenue(venue="binance", pair=PAIR, initial_balances={"BTC": EXTERNAL, "USDT": Decimal(0)})
+    resting = OpenOrder(id=coid, coid=coid, pair=PAIR, side="buy", qty=Decimal(5))
+    fake._orders = [resting]
+
+    _tick(home, "binance", fake, EXIT_BARS, clock=1_003_600)
+
+    assert [c.method for c in fake.calls if c.method in {"entry", "exit", "stop", "cancel_stops"}] == []
+    assert fake._balances["BTC"] == EXTERNAL
+    assert fake._orders == [resting]
