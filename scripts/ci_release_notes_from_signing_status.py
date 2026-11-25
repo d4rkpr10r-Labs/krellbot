@@ -54,10 +54,11 @@ def build_notes(*, root: Path, sha: str, verify_archives: bool = False) -> str:
     macos_signed = False
     windows_signed = False
     linux_policy = "checksum_pinned_policy"
-    markers = verified_markers(root, sha) if verify_archives else [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in sorted(root.rglob("signing-status-*.json"))
-    ]
+    markers = (
+        verified_markers(root, sha)
+        if verify_archives
+        else [json.loads(path.read_text(encoding="utf-8")) for path in sorted(root.rglob("signing-status-*.json"))]
+    )
     for data in markers:
         platform = data.get("platform")
         signed = data.get("signed") is True and data.get("sha") == sha

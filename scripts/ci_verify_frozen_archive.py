@@ -46,8 +46,7 @@ def require_signing_inputs(target: str) -> None:
     missing = [name for name in SIGNING_INPUTS[target] if not os.environ.get(name, "").strip()]
     if missing:
         raise ValueError(
-            f"{target} signing requested but required secrets are missing: "
-            f"{', '.join(missing)}. See docs/signing.md."
+            f"{target} signing requested but required secrets are missing: {', '.join(missing)}. See docs/signing.md."
         )
 
 
@@ -76,9 +75,7 @@ def verify_native_archive(args: argparse.Namespace) -> None:
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     digest = verify_manifest(args.archive, manifest, target=args.platform, source=args.sha)
     system, arch = NATIVE_TARGETS[args.platform]
-    machine = {"amd64": "x86_64", "aarch64": "arm64"}.get(
-        platform.machine().lower(), platform.machine().lower()
-    )
+    machine = {"amd64": "x86_64", "aarch64": "arm64"}.get(platform.machine().lower(), platform.machine().lower())
     if (platform.system(), machine) != (system, arch):
         raise ValueError(f"Unexpected native runner: {platform.system()} {machine}")
     detail = "checksum_pinned_policy" if args.platform == "linux" else "unsigned_preview"
@@ -112,7 +109,11 @@ def verify_native_archive(args: argparse.Namespace) -> None:
             if any(info.get(key) != value for key, value in expected_metadata.items()):
                 raise ValueError("Archived macOS bundle metadata mismatch")
             run(
-                "codesign", "--verify", "--deep", "--strict", "-R",
+                "codesign",
+                "--verify",
+                "--deep",
+                "--strict",
+                "-R",
                 "anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists",
                 app,
             )
@@ -133,7 +134,9 @@ def verify_native_archive(args: argparse.Namespace) -> None:
         def install() -> None:
             if args.platform == "linux":
                 run(
-                    "bash", extracted / "install-krellbot.sh", installed,
+                    "bash",
+                    extracted / "install-krellbot.sh",
+                    installed,
                     env={
                         **os.environ,
                         "HOME": str(scratch),
@@ -171,11 +174,16 @@ def verify_native_archive(args: argparse.Namespace) -> None:
             run(
                 sys.executable,
                 ROOT / "scripts/ci_smoke_frozen_paper.py",
-                "--binary", binary,
-                "--workdir", scratch / "smoke",
-                "--home", scratch / "smoke-home",
-                "--pack", ROOT / "docs/example-pack.json",
-                "--log", log,
+                "--binary",
+                binary,
+                "--workdir",
+                scratch / "smoke",
+                "--home",
+                scratch / "smoke-home",
+                "--pack",
+                ROOT / "docs/example-pack.json",
+                "--log",
+                log,
                 cwd=scratch,
             )
         finally:
@@ -204,7 +212,8 @@ def verify_native_archive(args: argparse.Namespace) -> None:
             },
             indent=2,
             sort_keys=True,
-        ) + "\n",
+        )
+        + "\n",
         encoding="utf-8",
     )
 

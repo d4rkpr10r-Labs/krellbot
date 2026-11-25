@@ -172,6 +172,7 @@ def test_merge_group_candidates_never_enter_signing_or_release_steps() -> None:
 
 
 def test_missing_signing_inputs_fail_before_producing_evidence(tmp_path) -> None:
+    import os
     import subprocess
     import sys
 
@@ -179,14 +180,17 @@ def test_missing_signing_inputs_fail_before_producing_evidence(tmp_path) -> None
 
     output = tmp_path / "signing-status.json"
     for platform, names in SIGNING_INPUTS.items():
-        env = {names[0]: "fixture-secret-value"}
+        env = {key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR") if key in os.environ}
+        env[names[0]] = "fixture-secret-value"
         result = subprocess.run(
             [
                 sys.executable,
                 str(REPO_ROOT / "scripts/ci_verify_frozen_archive.py"),
-                "--platform", platform,
+                "--platform",
+                platform,
                 "--require-signing-inputs",
-                "--output", str(output),
+                "--output",
+                str(output),
             ],
             env=env,
             capture_output=True,
