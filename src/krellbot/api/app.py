@@ -583,7 +583,7 @@ def _read_journal_records(home: Path) -> list[dict]:
     for path in sorted(journal_dir.glob("*.jsonl")):
         try:
             text = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeError):
             continue
         for line in text.splitlines():
             line = line.strip()
@@ -2789,6 +2789,92 @@ def create_app(
             write_root=_scheduler_write_root(s),
             supervisor=_scheduler_supervisor(s),
         )
+        return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/diagnostics/report")
+    async def diagnostic_report(request: Request) -> Response:
+        """Return an allowlisted local paper diagnostic report."""
+        import platform
+        import re
+
+        from krellbot import release_channel
+        from krellbot.data.instruments import (
+            METADATA_INVALID,
+            METADATA_STALE,
+            METADATA_SYMBOL_MISMATCH,
+            METADATA_UNAVAILABLE,
+            MINIMUM_NOT_MET,
+        )
+        from krellbot.service import supervise as kb_supervise
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+        try:
+            scheduler = kb_supervise.scheduler_status(
+                s.home, write_root=_scheduler_write_root(s), supervisor=_scheduler_supervisor(s)
+            )
+            scheduler_view = {"installed": scheduler["installed"], "enabled": scheduler["enabled"]}
+        except Exception:  # noqa: BLE001 — diagnostics must survive an unavailable scheduler.
+            scheduler_view = None
+
+        allowed_codes = {
+            METADATA_INVALID,
+            METADATA_STALE,
+            METADATA_SYMBOL_MISMATCH,
+            METADATA_UNAVAILABLE,
+            MINIMUM_NOT_MET,
+        }
+        from krellbot import secrets as kb_secrets
+
+        try:
+            armed = kb_config.load_config(s.home).armed
+            paper_markets = {
+                (item.venue, item.pair, item.pack_id): item.armed_at_ts for item in armed if item.mode == "paper"
+            }
+        except (OSError, ValueError, TypeError, KeyError):
+            paper_markets = {}
+        events = []
+        for record in _read_journal_records(s.home):
+            venue = record.get("venue")
+            if record.get("kind") != "tick" or not isinstance(venue, str) or venue not in kb_secrets.VENUES:
+                continue
+            detail = record.get("detail")
+            if not isinstance(detail, dict):
+                continue
+            pair = detail.get("pair")
+            ts = record.get("ts")
+            if not isinstance(pair, str) or re.fullmatch(r"[A-Z0-9-]{3,24}", pair) is None:
+                continue
+            if type(ts) is not int or ts < 0:
+                continue
+            pack = record.get("pack")
+            if not isinstance(pack, str):
+                continue
+            armed_at = paper_markets.get((venue, pair, pack))
+            if armed_at is None or ts < armed_at:
+                continue
+            code = _tick_refusal_code(record)
+            events.append(
+                {
+                    "ts": ts,
+                    "venue": venue,
+                    "pair": pair,
+                    "source": "journal",
+                    "refusal_code": code if code in allowed_codes else None,
+                }
+            )
+        events.sort(key=lambda event: event["ts"])
+        os_name = platform.system()
+        body = {
+            "schema_version": SCHEMA_VERSION,
+            "build": {**release_channel.version_payload(), "commit": None},
+            "os": os_name if os_name in {"Linux", "Darwin", "Windows"} else "other",
+            "scheduler": scheduler_view,
+            "events": events[-100:],
+            "reproduction_steps": "",
+        }
         return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/v1/scheduler/install")
