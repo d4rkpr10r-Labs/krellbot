@@ -1,17 +1,40 @@
-# Package a testable paper-only release candidate
+# Paper candidate build
 
-Build the exact merged commit into installable preview artifacts, verify upgrade and rollback, and make it possible to begin owner testing without a live release or signing dependency.
+A frozen build is tied to its clean source checkout. The archive manifest
+and Settings → About show its full source commit. If the checkout contains
+tracked or untracked changes, or Git is unavailable, no commit is claimed.
+Build the candidate after the paper sprint changes have landed, and compare
+the displayed commit with the build's manifest before testing.
 
-## Implementation
+The existing release workflow can build workflow-dispatch artifacts on Linux
+x86-64, macOS arm64, and Windows x86-64. Its archive step requires
+`KRELLBOT_RELEASE_BASE_URL`. Repository signing settings may request platform
+signatures even for a workflow dispatch. Check those settings before running
+it. A tag can publish a release, so use a non-tag build for a candidate.
 
-- Use the existing `release-frozen.yml` packaging path and report the same commit, version, artifact names, digests, and platform matrix in the artifact manifest, About panel, and diagnostics. Ensure prerelease build and release metadata derive from a single source where practical.
-- Provide an artifact-only candidate path that leaves the public release and site installer pins alone. Run smoke tests on macOS arm64, Linux x86-64, and Windows x86-64, and record the platform-specific support boundary. Provide local build or controlled artifact delivery. Artifacts on a public repository should be treated as potentially accessible to people who can read the run.
-- Exercise unpack, launch, fresh profile session, upgrades from v0.9.7, rollback, and uninstall behavior using throwaway profiles. Check PATH recovery and old tabs after restart. Keep keys, history, paper strategies, and the live-order release block intact. Leave current public signing and production promotion separate.
+For an offline Linux x86-64 candidate on a machine with the development
+requirements installed, build from a clean checkout:
 
-## Acceptance
+```sh
+npm --prefix frontend ci --include=dev
+npm --prefix frontend run build
+uv sync --frozen --group dev --python 3.13
+uv run python scripts/freeze.py
+```
 
-- A candidate is traceable from the exact commit to each downloadable archive and SHA-256, and opens the current workstation with key Settings. The candidate can be exercised with fake exchanges and a fake keychain before any account is connected.
-- One starter can arm, consume a controlled tick, pause/resume, restart, stop, and export on the packaged candidate. Upgrade and rollback preserve data and reuse the stable launcher and scheduler path.
-- Provide signed-build preparation in the later distribution PR. Native OS keychains and real-account connectivity are feedback to collect once the candidate is in use.
+The resulting `dist/krellbot/` contains the executable, workstation, runtime,
+and local installer. Package it using `scripts.release_archive.build_archive`
+with the real delivery URL if it is being distributed. The helper records the
+archive SHA-256, size, OS, architecture, version, and source commit. Compare
+the downloaded archive against that digest before extracting. A local-only
+archive can be used directly from the build machine; do not present a
+placeholder URL as a download location. The candidate is an unsigned
+prerelease and retains the release-wide paper-only policy.
 
-During implementation, add the acceptance coverage to the existing test suites and record the actual results in the pull request. The audited baseline is Krellbot `main` at `1a3f4cc`.
+Run the existing `scripts/ci_smoke_frozen_paper.py` against the actual frozen
+binary and a fresh home outside the checkout. The smoke validates a strategy,
+arms and disarms it in paper, opens the built workstation, and checks that the
+release refuses a live arm. Further candidate acceptance covers a controlled
+paper tick, pause and resume, restart, export, upgrade, and rollback for each
+supported platform. Record real results for the exact build; a successful Linux
+smoke does not establish native macOS or Windows behavior.
