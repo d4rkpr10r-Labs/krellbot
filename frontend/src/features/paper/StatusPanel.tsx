@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useReducer, useRef, useState, type JSX } from "react";
 import { DisclosureSection } from "../../components/disclosure/DisclosureSection";
+import { DiagnosticReport } from "../diagnostics/DiagnosticReport";
 import { getCsrf } from "../../session";
 import { paperMarketAvailability } from "./marketAvailability";
 import type {
@@ -1349,6 +1350,7 @@ export function StatusPanel({
             ) : null}
             {unknownAlert}
             {state.errorMessage !== null ? (
+              <div>
               <p
                 className="kbot-paper-status__error"
                 role="alert"
@@ -1356,6 +1358,8 @@ export function StatusPanel({
               >
                 {state.errorMessage}
               </p>
+              <DiagnosticReport />
+              </div>
             ) : null}
             <DisclosureSection
               title="Start another paper run"
