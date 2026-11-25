@@ -222,6 +222,23 @@ describe.each([
 });
 
 describe.each(["kraken", "coinbase"] as const)("key replacement (%s)", (venue) => {
+  it("saves a replacement once and clears the form after success", async () => {
+    const client = makeClient({
+      getStatus: vi.fn().mockResolvedValue(present(venue, [])),
+      probeAndStore: vi.fn().mockResolvedValue(stored(venue)),
+    });
+    render(<KeysOnboardingPanel client={client} venue={venue} />);
+    await screen.findByTestId(`keys-stored-${venue}`);
+    fireEvent.click(screen.getByTestId(`keys-replace-${venue}`));
+    fireEvent.change(screen.getByTestId(`keys-public-${venue}`), { target: { value: "replacement-key" } });
+    fireEvent.change(screen.getByTestId(`keys-private-${venue}`), { target: { value: "replacement-secret" } });
+    fireEvent.click(screen.getByTestId(`keys-store-${venue}`));
+    fireEvent.click(screen.getByTestId(`keys-store-${venue}`));
+    await waitFor(() => expect(screen.queryByTestId(`keys-form-${venue}`)).toBeNull());
+    expect(client.probeAndStore).toHaveBeenCalledTimes(1);
+    expect(client.probeAndStore).toHaveBeenCalledWith("replacement-key", "replacement-secret", venue);
+  });
+
   it("keeps the stored key on a refused replacement and lets the user cancel", async () => {
     const client = makeClient({
       getStatus: vi.fn().mockResolvedValue(present(venue, [])),
