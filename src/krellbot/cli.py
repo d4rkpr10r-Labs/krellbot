@@ -1623,11 +1623,21 @@ def _tick_one_venue(
         print(result, flush=True)
         return 1
     venue_obj, reader = result
+    completed: set[tuple[str, str]] = set()
     try:
-        return _tick_and_summarize(home, venue, venue_obj, reader, armed.mode)
+        return _tick_and_summarize(
+            home,
+            venue,
+            venue_obj,
+            reader,
+            armed.mode,
+            on_pack_completed=lambda pack_id, pair: completed.add((pack_id, pair)),
+        )
     except CandleFetchError as exc:
         print(exc.exc_type_name, flush=True)
         for affected in armed_list:
+            if (affected.pack_id, affected.pair) in completed:
+                continue
             reason = "fetch_error" if exc.pair is None or affected.pair == exc.pair else "check_incomplete"
             _record_fetch_error(venue=venue, armed=affected, exc_type_name=exc.exc_type_name, reason=reason)
         return 1
@@ -1661,12 +1671,12 @@ def _tick_summary_line(rec: dict, mode: str) -> str | None:
     return f"{head} no signal, staying flat"
 
 
-def _tick_and_summarize(home, venue, venue_obj, reader, mode) -> int:
+def _tick_and_summarize(home, venue, venue_obj, reader, mode, *, on_pack_completed=None) -> int:
     """Run the tick, then print one line per journal record it wrote."""
     from krellbot.run import tick as run_tick
 
     before = len(_read_journal_records(home))
-    rc = run_tick(venue=venue, venue_obj=venue_obj, reader=reader)
+    rc = run_tick(venue=venue, venue_obj=venue_obj, reader=reader, on_pack_completed=on_pack_completed)
     for rec in _read_journal_records(home)[before:]:
         line = _tick_summary_line(rec, mode)
         if line:
