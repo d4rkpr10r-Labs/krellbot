@@ -12,6 +12,16 @@ x86-64, macOS arm64, and Windows x86-64. Its archive step requires
 signatures even for a workflow dispatch. Check those settings before running
 it. A tag can publish a release, so use a non-tag build for a candidate.
 
+The merge queue also builds unsigned candidates for those three platforms.
+After the queued commit passes and lands, open its `release-frozen` Actions
+run and download the `paper-candidate-<platform>-<architecture>` artifact.
+Each contains the archive and a local-delivery manifest with SHA-256, version,
+platform, architecture, and source commit. The job checks that the source
+commit in the frozen archive matches the queued commit before upload. These
+Actions artifacts expire after seven days and are accessible under the
+repository's Actions permissions. A queue build does not sign artifacts or
+publish a GitHub release.
+
 For an offline Linux x86-64 candidate on a machine with the development
 requirements installed, build from a clean checkout:
 
