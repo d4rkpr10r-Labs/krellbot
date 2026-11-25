@@ -73,8 +73,10 @@ try {
   const hash = file => createHash('sha256').update(readFileSync(file)).digest('hex');
   check('Installed executable equals frozen payload', hash(path.join(installed, exeName)) === hash(path.join(extracted, exeName)));
   check('Install preserves data', readFileSync(sentinel, 'utf8') === 'preserve this isolated test data\n');
+  writeFileSync(path.join(installed, '_internal', 'rollback-marker.txt'), 'prior program');
   install();
   check('Reinstall preserves data', readFileSync(sentinel, 'utf8') === 'preserve this isolated test data\n');
+  check('Reinstall replaces prior program files', !existsSync(path.join(installed, '_internal', 'rollback-marker.txt')));
   const previous = `${installed}.old`;
   check('Previous installation is retained', existsSync(path.join(previous, exeName)) && hash(path.join(previous, exeName)) === hash(path.join(extracted, exeName)));
   const candidate = `${installed}.candidate`;
@@ -82,6 +84,7 @@ try {
   try {
     renameSync(previous, installed);
     check('Previous installation can be restored', hash(path.join(installed, exeName)) === hash(path.join(extracted, exeName)));
+    check('Restored installation retains previous program files', readFileSync(path.join(installed, '_internal', 'rollback-marker.txt'), 'utf8') === 'prior program');
   } finally {
     if (existsSync(installed)) renameSync(installed, previous);
     renameSync(candidate, installed);
