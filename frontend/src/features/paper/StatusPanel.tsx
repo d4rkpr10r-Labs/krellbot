@@ -13,6 +13,7 @@ import { PaperStatusCsvExport } from "./PaperStatusCsvExport";
 import { PaperPnlPositionChart } from "./PaperPnlPositionChart";
 import { RehearsalPanel } from "./RehearsalPanel";
 import { TradingViewAlertPreview } from "./TradingViewAlertPreview";
+import { PaperHealthDetails, usePaperHealth } from "./paperHealth";
 import type { RehearsalClient } from "./rehearsalClient";
 import { summarizePaperCommandRefusal } from "./paperCommandRefusalSummary";
 import "./StatusPanel.position.css";
@@ -774,6 +775,7 @@ export function StatusPanel({
     select.pair !== ""
       ? select
       : undefined;
+  const health = usePaperHealth(client, statusSelect, state.status);
 
   // The rehearsal surface is a separate client behind the same paper
   // panel: a legacy injected client without the factory renders the
@@ -1136,6 +1138,7 @@ export function StatusPanel({
         >
         {paperControls ? (
           <>
+            {client.getHealth ? <PaperHealthDetails health={health} /> : null}
             <p
               className="kbot-paper-status__entries"
               data-testid="paper-status-entries"
