@@ -249,6 +249,7 @@ def _seed_journal_owned(home: Path, *, pack_id: str, owned_qty: Decimal) -> None
             "bar_ts": 0,
             "detail": {
                 "pair": "SUIUSD",
+                "mode": "paper",
                 "entry_qty": str(owned_qty),
                 "exit_qty": "0",
                 "stop_qty": "0",
@@ -517,7 +518,9 @@ def test_flatten_of_unowned_quantity_is_refused(home) -> None:
     # because the journal only attributes 5 to this pack.
     _seed_journal_owned(home, pack_id="ns14-flatten", owned_qty=Decimal(5))
 
-    code = reservations.flatten_result(home, pack_id="ns14-flatten", pair="SUIUSD", qty=Decimal(10))
+    code = reservations.flatten_result(
+        home, venue="kraken", mode="paper", pack_id="ns14-flatten", pair="SUIUSD", qty=Decimal(10)
+    )
     assert code == reservations.CODE_FLATTEN_NOT_OWNED, (
         f"flatten of unowned qty must refuse with flatten_not_owned; got {code!r}"
     )
@@ -529,11 +532,15 @@ def test_flatten_of_owned_quantity_is_allowed(home) -> None:
     """
     _seed_journal_owned(home, pack_id="ns14-flatten-own", owned_qty=Decimal(5))
 
-    code = reservations.flatten_result(home, pack_id="ns14-flatten-own", pair="SUIUSD", qty=Decimal(5))
+    code = reservations.flatten_result(
+        home, venue="kraken", mode="paper", pack_id="ns14-flatten-own", pair="SUIUSD", qty=Decimal(5)
+    )
     assert code == reservations.CODE_FLATTEN, f"flatten of fully owned qty must return flatten; got {code!r}"
 
     # Below the owned qty is also fine.
-    code_partial = reservations.flatten_result(home, pack_id="ns14-flatten-own", pair="SUIUSD", qty=Decimal(3))
+    code_partial = reservations.flatten_result(
+        home, venue="kraken", mode="paper", pack_id="ns14-flatten-own", pair="SUIUSD", qty=Decimal(3)
+    )
     assert code_partial == reservations.CODE_FLATTEN
 
 

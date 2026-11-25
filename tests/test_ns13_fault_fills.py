@@ -259,7 +259,13 @@ def _seed_journal_owned(home: Path, *, pack_id: str, owned_qty: Decimal) -> None
             "venue": "kraken",
             "pack": pack_id,
             "bar_ts": 0,
-            "detail": {"pair": "SUIUSD", "entry_qty": str(owned_qty), "exit_qty": "0", "stop_qty": "0"},
+            "detail": {
+                "pair": "SUIUSD",
+                "mode": "paper",
+                "entry_qty": str(owned_qty),
+                "exit_qty": "0",
+                "stop_qty": "0",
+            },
         }
     )
 

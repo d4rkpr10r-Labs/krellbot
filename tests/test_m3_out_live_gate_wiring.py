@@ -567,7 +567,7 @@ def test_paper_tick_with_kill_engaged_still_exits(home, monkeypatch):
             "venue": "kraken",
             "pack": "m3-kill-exit",
             "bar_ts": 0,
-            "detail": {"pair": "SUIUSD", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
+            "detail": {"pair": "SUIUSD", "mode": "paper", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
         }
     )
     inner = _FakeVenue(balances={"USD": Decimal(1000), "SUI": Decimal(5)})

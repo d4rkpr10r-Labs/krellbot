@@ -84,7 +84,7 @@ def test_tick_does_not_sell_coins_the_pack_did_not_buy(home):
             "venue": "kraken",
             "pack": "sma-cross",
             "bar_ts": 0,
-            "detail": {"pair": "SUIUSD", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
+            "detail": {"pair": "SUIUSD", "mode": "paper", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
         }
     )
 
@@ -193,7 +193,7 @@ def test_pending_version_stays_while_the_venue_still_holds_the_pack(home):
                 "venue": "kraken",
                 "pack": "v1",
                 "bar_ts": 1,
-                "detail": {"pair": "SUIUSD", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
+                "detail": {"pair": "SUIUSD", "mode": "paper", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
             }
         )
         + "\n",

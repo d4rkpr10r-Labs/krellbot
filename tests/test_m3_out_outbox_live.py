@@ -396,7 +396,7 @@ def test_live_exit_ledger_row_has_live_mode_and_venue(home, monkeypatch):
             "venue": "kraken",
             "pack": pack_id,
             "bar_ts": 0,
-            "detail": {"pair": "SUIUSD", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
+            "detail": {"pair": "SUIUSD", "mode": "live", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
         }
     )
     venue = _FakeVenue(balances={"USD": Decimal(1000), "SUI": Decimal(5)})
@@ -457,7 +457,7 @@ def test_live_stop_repair_ledger_row_has_live_mode_and_venue(home, monkeypatch):
             "venue": "kraken",
             "pack": pack_id,
             "bar_ts": 0,
-            "detail": {"pair": "SUIUSD", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
+            "detail": {"pair": "SUIUSD", "mode": "live", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
         }
     )
     venue = _FakeVenue(balances={"USD": Decimal(1000), "SUI": Decimal(5)})
