@@ -47,7 +47,7 @@ from krellbot.execution import reservations as kb_reservations
 from krellbot.pack import evaluate as kb_evaluate
 from krellbot.pack import lint as kb_pack_lint
 from krellbot.pack.model import Candle as Candle
-from krellbot.run.reconcile import OwnershipIdentity, OwnershipProjection, project_ownership
+from krellbot.run.reconcile import OwnershipIdentity, project_ownership, stop_fill_history
 from krellbot.storage.database import OperationalStore, StoreError, StoreFull
 from krellbot.storage.outbox import (
     ModeError,
@@ -599,8 +599,13 @@ def tick(
 
             base, _quote = _base_quote(armed.pair)
             venue_base = snap_balances.get(base, Decimal(0))
-            ownership = _journal_ownership(home, armed, venue)
-            journal_qty = ownership.attributable_qty
+            identity = _ownership_identity(armed, venue)
+            ownership = project_ownership(home, identity)
+            # A resting stop of this strategy that filled (possibly inside this
+            # tick's own snapshot) is a decrease the journal has not recorded
+            # yet. It is recorded below with its fill ids, exactly once.
+            stop_fill_ids, stop_fill_qty = _stop_fills_for(home, identity, snap.recent_fills or [])
+            journal_qty = max(ownership.attributable_qty - stop_fill_qty, Decimal(0))
             if ownership.ambiguous:
                 # History that may belong to this arm cannot be attributed, so
                 # the strategy cannot be shown to be flat: hold new entries.
@@ -914,7 +919,8 @@ def tick(
                     "reason": target.reason,
                     "entry_qty": str(entry_qty),
                     "exit_qty": str(exit_qty),
-                    "stop_qty": "0",
+                    "stop_qty": str(stop_fill_qty),
+                    **({"stop_fill_ids": stop_fill_ids} if stop_fill_ids else {}),
                     "owned_qty_after": str(owned),
                     "entries_blocked": blocked,
                     "entries_paused": entries_suppressed,
@@ -1022,11 +1028,30 @@ def journal_tail(n: int = 5, *, home: Path | None = None) -> int:
 # ---- internals ------------------------------------------------------------
 
 
-def _journal_ownership(home: Path, armed: kb_config.ArmedPack, venue: str) -> OwnershipProjection:
-    return project_ownership(
-        home,
-        OwnershipIdentity(pack_id=armed.pack_id, venue=venue, pair=armed.pair, mode=armed.mode),
-    )
+def _ownership_identity(armed: kb_config.ArmedPack, venue: str) -> OwnershipIdentity:
+    return OwnershipIdentity(pack_id=armed.pack_id, venue=venue, pair=armed.pair, mode=armed.mode)
+
+
+def _stop_fills_for(home: Path, identity: OwnershipIdentity, fills: list) -> tuple[list[str], Decimal]:
+    """Stop fills of this identity's own orders that the journal has not accounted.
+
+    A fill counts only when the venue reports which order it executed
+    (``order_coid``) and that order is one this identity journaled. Fills
+    without that link are never attributed.
+    """
+    order_coids, accounted = stop_fill_history(home, identity)
+    ids: list[str] = []
+    qty = Decimal(0)
+    for fill in fills:
+        order_coid = getattr(fill, "order_coid", None)
+        fill_id = getattr(fill, "id", "")
+        if getattr(fill, "side", "") != "sell" or getattr(fill, "pair", None) != identity.pair:
+            continue
+        if not order_coid or order_coid not in order_coids or not fill_id or fill_id in accounted or fill_id in ids:
+            continue
+        ids.append(fill_id)
+        qty += Decimal(str(fill.qty))
+    return ids, qty
 
 
 def _recognized_open_qty(armed: kb_config.ArmedPack, venue: str, candles: list, orders: list) -> Decimal:

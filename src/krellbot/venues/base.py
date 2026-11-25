@@ -54,6 +54,9 @@ class Fill:
     qty: Decimal
     price: Decimal
     ts_ms: int
+    # Client order id of the resting order this fill executed, when the venue
+    # reports it (paper stop fills do). ``coid`` stays the fill's own id.
+    order_coid: str | None = None
 
 
 @dataclass(frozen=True)
