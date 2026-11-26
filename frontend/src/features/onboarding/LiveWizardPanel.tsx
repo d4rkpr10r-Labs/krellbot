@@ -41,7 +41,7 @@ function describeGrant(view: LiveWizardHonesty): string {
     view.live_grant.expires_at != null
       ? new Date(view.live_grant.expires_at * 1000).toISOString()
       : "unknown expiry";
-  return `Grant on file: ${grant.venue} ${grant.pair} until ${until}. A grant is not live order send.`;
+  return `Grant on file: ${grant.venue} ${grant.pair} until ${until}. This records permission only. It cannot start a strategy or place an order.`;
 }
 
 export function LiveWizardPanel({
