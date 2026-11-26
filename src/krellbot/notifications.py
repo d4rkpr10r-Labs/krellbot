@@ -23,11 +23,13 @@ reports failure by raising, the failure is kept per channel for
 ``GET /api/v1/notifications/delivery``, and a failing channel is retried at
 most once every ``RETRY_SECONDS``.
 
-Two processes deliver: the workstation on each Operations read and the
-scheduled tick after each tick, so alerts arrive without a tab open. They
-share the occurrence store, and each pass holds
-``<home>/run/notifications-sent.lock`` from reading the store to writing it,
-so an occurrence is sent once whichever process sees it first.
+Three processes deliver: the workstation on each Operations read, the
+scheduled tick after each tick, so alerts arrive without a tab open, and the
+scheduler heartbeat, which reports a tick that never ran. They share the
+occurrence store, and each pass holds ``<home>/run/notifications-sent.lock``
+from reading the store to writing it, so an occurrence is sent once
+whichever process sees it first. The heartbeat collects only its own kinds,
+so its pass ends no occurrence (``kinds``).
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ import smtplib
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from email.message import EmailMessage
@@ -657,6 +659,7 @@ def maybe_notify(
     *,
     notifier: Notifier | None = None,
     now: int | None = None,
+    kinds: Iterable[str] | None = None,
 ) -> int:
     """Notify each unacknowledged alert occurrence once on enabled channels.
 
@@ -665,6 +668,14 @@ def maybe_notify(
     channel that was enabled when it was first seen. It ends when the alert
     leaves the list or is acknowledged, so a later appearance or an event
     that un-acknowledges it notifies again, and an ack holds.
+
+    ``kinds`` marks a pass that collected only alerts of those kinds (the
+    scheduler heartbeat passes ``alerts.collect_scheduler``). It ignores any
+    other kind and notifies and records the rest like any pass, but ends no
+    occurrence: an alert missing from its list may simply be one it did not
+    collect. Ending occurrences stays with the full passes. A recurrence of
+    a heartbeat kind is still a new occurrence, because it starts at a later
+    ``first_ts`` (a later last tick, or a later ``last_error`` write).
 
     A channel is recorded as sent only when the notifier returns. A failed
     channel keeps its occurrences pending, records its last failure, and is
@@ -683,10 +694,11 @@ def maybe_notify(
     if not enabled:
         return 0
 
+    scope = None if kinds is None else frozenset(kinds)
     with _store_lock(home) as held:
         if not held:
             return 0
-        return _notify_locked(home, alerts, enabled=enabled, notifier=notifier, now=now)
+        return _notify_locked(home, alerts, enabled=enabled, notifier=notifier, now=now, scope=scope)
 
 
 def _notify_locked(
@@ -696,8 +708,12 @@ def _notify_locked(
     enabled: list[Channel],
     notifier: Notifier | None,
     now: int | None,
+    scope: frozenset[str] | None = None,
 ) -> int:
-    """One ``maybe_notify`` pass. The caller holds the store's lock."""
+    """One ``maybe_notify`` pass. The caller holds the store's lock.
+
+    ``scope`` is ``maybe_notify``'s ``kinds``: None for a full pass.
+    """
 
     now_s = int(time.time()) if now is None else int(now)
     active = notifier if notifier is not None else default_notifier(home)
@@ -710,6 +726,8 @@ def _notify_locked(
     dirty = False
 
     for alert in alerts:
+        if scope is not None and _alert_kind(alert) not in scope:
+            continue
         alert_id = _alert_id(alert)
         if alert_id is None or _alert_acknowledged(alert):
             continue
@@ -747,9 +765,10 @@ def _notify_locked(
                 deliveries += 1
             dirty = True
 
-    for alert_id in [key for key in occurrences if key not in open_ids]:
-        del occurrences[alert_id]
-        dirty = True
+    if scope is None:
+        for alert_id in [key for key in occurrences if key not in open_ids]:
+            del occurrences[alert_id]
+            dirty = True
 
     if dirty:
         _save_store(home, store)

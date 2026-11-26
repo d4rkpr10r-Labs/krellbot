@@ -1962,7 +1962,11 @@ def _resolve_executable() -> str:
 
 
 def cmd_service(args):
-    """`krellbot service install|uninstall [--dry-run] [--root PATH]`."""
+    """`krellbot service install|uninstall [--dry-run] [--root PATH]`.
+
+    `krellbot service heartbeat` is the scheduler's 15-minute check
+    (plumbing); see ``cmd_service_heartbeat``.
+    """
     from krellbot import service as kb_service
 
     if not args:
@@ -1972,6 +1976,11 @@ def cmd_service(args):
         )
         return 2
     sub = args[0]
+    if sub == "heartbeat":
+        if len(args) > 1:
+            print("usage: krellbot service heartbeat", file=sys.stderr)
+            return 2
+        return cmd_service_heartbeat(home=kb_paths.home())
     dry_run = False
     write_root: Path | None = None
     executable: str | None = None
@@ -2003,13 +2012,43 @@ def cmd_service(args):
             dry_run=dry_run,
         )
     if sub == "uninstall":
+        from krellbot.service import supervise
+
         if write_root is None:
             write_root = Path.home()
-        return kb_service.uninstall(home=kb_paths.home(), write_root=write_root)
+        rc = kb_service.uninstall(home=kb_paths.home(), write_root=write_root)
+        if rc == 0:
+            # The web scheduler install also wrote the heartbeat units.
+            supervise.uninstall_heartbeat_units(write_root)
+        return rc
     if sub == "status":
         return cmd_service_status(home=kb_paths.home(), write_root=write_root)
     print(f"unknown service subcommand: {sub}", file=sys.stderr)
     return 2
+
+
+def cmd_service_heartbeat(*, home: Path) -> int:
+    """`krellbot service heartbeat`: the scheduler's 15-minute check (plumbing).
+
+    Its own scheduler units fire it, independently of the tick, so a tick
+    that never runs is still reported. ``supervise.check_heartbeat`` reads
+    only scheduler and journal state and sends ``scheduler_stale`` and
+    ``tick_failure`` to the opted-in channels. It never fetches candles,
+    builds venues, reads keys or ticks; ``main`` dispatches it before the
+    legacy key migration for that reason.
+
+    Exits 0 after a check, whatever the notifiers did: a notifier failure is
+    recorded for ``GET /api/v1/notifications/delivery``. Any other failure
+    prints only its exception type and exits 1.
+    """
+    from krellbot.service import supervise
+
+    try:
+        supervise.check_heartbeat(home, now=int(_now_seconds_tick()))
+    except Exception as exc:
+        print(f"heartbeat check failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def cmd_service_status(*, home: Path, write_root: Path | None) -> int:
@@ -2432,6 +2471,10 @@ def main(argv):
         return cmd_uninstall_help()
     if argv[1] == "backup" and len(argv) >= 2:
         return cmd_backup(argv[2:])
+    if argv[1:3] == ["service", "heartbeat"]:
+        # The scheduler's heartbeat check reads no keys, so it runs before
+        # the legacy key migration below.
+        return cmd_service(argv[2:])
     try:
         kb_secrets.migrate_legacy()
     except (ValueError, RuntimeError, FileNotFoundError) as exc:

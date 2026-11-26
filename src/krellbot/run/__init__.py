@@ -30,7 +30,8 @@ import errno
 import hashlib
 import json
 from collections.abc import Callable
-from decimal import ROUND_DOWN, Decimal
+from dataclasses import dataclass
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -1097,6 +1098,212 @@ def reconcile_intents(*, venue: str, venue_obj: Any, home: Path | None = None, c
         lock.release()
 
 
+OPERATOR_EXECUTED = "executed"
+OPERATOR_NOT_EXECUTED = "not_executed"
+# Venue observations that are an outcome. ``open`` and ``partial`` are not:
+# the order may still be working, so only a typed assertion settles it.
+_SETTLED_OBSERVATIONS = frozenset({"filled", "absent"})
+# Lock for an intent committed without a venue: no tick accounts those, but two
+# operator resolves of the same one must still not interleave.
+_UNSCOPED_INTENT_LOCK = "unscoped-intents"
+_OPERATOR_RESOLVE_MESSAGES = {
+    "order_resolved": "Order resolved. Nothing was sent to the exchange.",
+    "order_already_resolved": "This order was already resolved. Nothing changed.",
+    "bad_input": "The resolve request is not well formed.",
+    "obligations_unavailable": "Unresolved orders cannot be read right now. Nothing changed.",
+    "order_not_found": "No unresolved order has this client order ID.",
+    "tick_running": "A tick for this venue is running. Try again in a moment.",
+    "no_venue_evidence": "No venue lookup is recorded for this order. Say what happened and type its client order ID.",
+    "order_still_working": (
+        "The last venue lookup shows this order still working. Cancel it at the exchange and wait for the next "
+        "lookup, or say what happened and type its client order ID."
+    ),
+    "confirmation_required": "Type the client order ID to confirm what you assert.",
+    "confirmation_mismatch": "The typed client order ID does not match this order.",
+    "executed_qty_invalid": "Executed quantity must be a non-negative decimal number.",
+    "executed_qty_above_requested": "Executed quantity cannot exceed the quantity the order requested.",
+    "requested_qty_unknown": "The order's requested quantity cannot be read, so an executed quantity cannot be checked.",
+    "executed_below_accounted": "The journal already records more executed quantity for this order than asserted.",
+}
+
+
+@dataclass(frozen=True)
+class OperatorResolveResult:
+    """What one operator resolve did. ``code`` is stable; see ``_OPERATOR_RESOLVE_MESSAGES``."""
+
+    code: str
+    ok: bool = False
+    effect: str = "refused"
+    outcome: str | None = None
+    filled_qty: Decimal | None = None
+    evidence: str | None = None
+    attributed: bool = False
+
+    @property
+    def message(self) -> str:
+        return _OPERATOR_RESOLVE_MESSAGES.get(self.code, self.code)
+
+
+def _operator_qty(raw: object) -> Decimal | None:
+    """An operator-typed executed quantity: a finite, non-negative decimal string."""
+    if not isinstance(raw, str):
+        return None  # a JSON number is not an exact Decimal
+    try:
+        value = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        return None
+    if not value.is_finite() or value < 0:
+        return None
+    return value if value != 0 else Decimal(0)
+
+
+def resolve_order_by_operator(
+    *,
+    coid: str,
+    outcome: str | None = None,
+    executed_qty: object = None,
+    confirmation: object = None,
+    home: Path | None = None,
+    clock=None,
+) -> OperatorResolveResult:
+    """Retire one unresolved intent on the operator's word. Never sends an order.
+
+    Without ``outcome`` the intent's latest recorded venue observation settles
+    it, and no confirmation is needed, but only when that observation is an
+    outcome (``filled`` or ``absent``); an ``open`` or ``partial`` order may
+    still fill and is refused as ``order_still_working``. With ``outcome``
+    (``not_executed``, or ``executed`` with ``executed_qty``) the operator
+    asserts what happened without venue evidence and must type ``coid`` back
+    as ``confirmation``.
+
+    Runs under the intent venue's tick lock (``tick_running`` while a tick
+    holds it). Durable writes follow ``_resolve_obligations``: evidence (the
+    assertion row; a venue observation is already recorded), then the journal
+    record for executed quantity not yet accounted under ``resolved_coid``,
+    then the ``intent_resolved`` row. Quantity is attributed only to the owner
+    recorded in the intent; without one it stays external and is not
+    journaled. A resolved intent is left as it is (``order_already_resolved``).
+    """
+    if not isinstance(coid, str) or not coid:
+        return OperatorResolveResult(code="bad_input")
+    asserted: Decimal | None = None
+    if outcome is None:
+        if executed_qty is not None or confirmation is not None:
+            return OperatorResolveResult(code="bad_input")
+    elif outcome == OPERATOR_EXECUTED:
+        asserted = _operator_qty(executed_qty)
+        if asserted is None:
+            return OperatorResolveResult(code="executed_qty_invalid")
+    elif outcome == OPERATOR_NOT_EXECUTED:
+        if executed_qty is not None:
+            return OperatorResolveResult(code="bad_input")
+        asserted = Decimal(0)
+    else:
+        return OperatorResolveResult(code="bad_input")
+    if outcome is not None:
+        if confirmation is None or confirmation == "":
+            return OperatorResolveResult(code="confirmation_required")
+        if confirmation != coid:
+            return OperatorResolveResult(code="confirmation_mismatch")
+
+    home = Path(home) if home is not None else kb_paths.home()
+    intent = _unresolved_intent(home, coid)
+    if not isinstance(intent, kb_obligations.Obligation):
+        return intent
+    lock = TickLock(home, intent.venue or _UNSCOPED_INTENT_LOCK)
+    if not lock.acquire():
+        return OperatorResolveResult(code="tick_running")
+    try:
+        # Read again under the lock: a tick may have settled the intent meanwhile.
+        intent = _unresolved_intent(home, coid)
+        if not isinstance(intent, kb_obligations.Obligation):
+            return intent
+        now = clock() if clock is not None else _now_seconds()
+        return _settle_by_operator(home, intent, outcome=outcome, asserted=asserted, now=now)
+    finally:
+        lock.release()
+
+
+def _unresolved_intent(home: Path, coid: str) -> kb_obligations.Obligation | OperatorResolveResult:
+    view = kb_obligations.read_obligations(home)
+    if not view.available:
+        return OperatorResolveResult(code="obligations_unavailable")
+    intent = next((o for o in view.unresolved if o.coid == coid), None)
+    if intent is not None:
+        return intent
+    try:
+        resolution = kb_obligations.read_resolution(home, coid)
+    except kb_obligations.ObligationsUnavailable:
+        return OperatorResolveResult(code="obligations_unavailable")
+    if resolution is None:
+        return OperatorResolveResult(code="order_not_found")
+    try:
+        filled: Decimal | None = Decimal(str(resolution.get("filled_qty")))
+    except (InvalidOperation, ValueError):
+        filled = None
+    return OperatorResolveResult(
+        code="order_already_resolved",
+        ok=True,
+        effect="unchanged",
+        outcome=resolution.get("outcome") if isinstance(resolution.get("outcome"), str) else None,
+        filled_qty=filled if filled is not None and filled.is_finite() else None,
+        evidence=resolution.get("evidence") if isinstance(resolution.get("evidence"), str) else None,
+    )
+
+
+def _settle_by_operator(
+    home: Path, intent, *, outcome: str | None, asserted: Decimal | None, now: float
+) -> OperatorResolveResult:
+    """Account and retire ``intent`` while its venue's tick lock is held."""
+    field = _QTY_FIELD_FOR_INTENT.get(intent.kind or "")
+    attributed = field is not None and None not in (intent.venue, intent.pack_id, intent.mode)
+    accounted = _accounted_for(home, intent.coid, field)[0] if attributed else Decimal(0)
+    store = OperationalStore(home / "ops.sqlite")
+    if outcome is None:
+        if intent.last_observation is None or intent.observed_status is None or intent.observed_qty is None:
+            return OperatorResolveResult(code="no_venue_evidence")
+        if intent.observed_status not in _SETTLED_OBSERVATIONS:
+            # An open or partly executed order may still fill: its lookup is not
+            # an outcome, so settling on it would lift the entry hold too early.
+            return OperatorResolveResult(code="order_still_working")
+        status = intent.observed_status
+        # An observation row is written once per change of kind; later partial
+        # lookups may have journaled more than the row shows.
+        filled = max(intent.observed_qty, accounted)
+        evidence = "operator_accepted_venue_observation"
+    else:
+        filled = asserted if asserted is not None else Decimal(0)
+        if outcome == OPERATOR_EXECUTED:
+            if intent.qty is None:
+                return OperatorResolveResult(code="requested_qty_unknown")
+            if filled > intent.qty:
+                return OperatorResolveResult(code="executed_qty_above_requested")
+        if filled < accounted:
+            return OperatorResolveResult(code="executed_below_accounted")
+        status = "filled" if filled > 0 else "absent"
+        evidence = "operator_asserted"
+        kb_obligations.record_assertion(store, coid=intent.coid, outcome=outcome, filled_qty=filled, ts=int(now))
+    if attributed and filled > accounted:
+        _account_intent(
+            home,
+            intent,
+            OrderOutcome(status=status, filled_qty=filled, authoritative=True),
+            venue=intent.venue,
+            journal=kb_journal.append,
+            now=now,
+        )
+    kb_obligations.record_resolution(store, coid=intent.coid, outcome=status, filled_qty=filled, evidence=evidence)
+    return OperatorResolveResult(
+        code="order_resolved",
+        ok=True,
+        effect="changed",
+        outcome=status,
+        filled_qty=filled,
+        evidence=evidence,
+        attributed=attributed,
+    )
+
+
 def _resolve_obligations(home: Path, *, venue: str, venue_obj: Any, snap: Any, journal, now: float) -> None:
     """Record evidence for each unresolved intent on ``venue`` and retire what it settles.
 
@@ -1158,19 +1365,7 @@ def _account_intent(home: Path, intent, outcome: OrderOutcome, *, venue: str, jo
     field = _QTY_FIELD_FOR_INTENT.get(intent.kind or "")
     if field is None or intent.pack_id is None or intent.mode is None:
         return False
-    already = Decimal(0)
-    already_ids: set[str] = set()
-    for rec in kb_journal.read_records_lenient(home):
-        detail = rec.get("detail") if isinstance(rec, dict) else None
-        if rec.get("kind") != "tick" or not isinstance(detail, dict) or detail.get("resolved_coid") != intent.coid:
-            continue
-        try:
-            already += Decimal(str(detail.get(field) or "0"))
-        except (ArithmeticError, ValueError):
-            pass
-        ids = detail.get("stop_fill_ids")
-        if isinstance(ids, list):
-            already_ids.update(i for i in ids if isinstance(i, str))
+    already, already_ids = _accounted_for(home, intent.coid, field)
     has_record = already > 0 or bool(already_ids) or _has_resolved_record(home, intent.coid)
     delta = outcome.filled_qty - already
     if delta <= 0 and has_record:
@@ -1204,6 +1399,24 @@ def _account_intent(home: Path, intent, outcome: OrderOutcome, *, venue: str, jo
         }
     )
     return True
+
+
+def _accounted_for(home: Path, coid: str, field: str) -> tuple[Decimal, set[str]]:
+    """``field`` quantity and stop fill ids already journaled under ``resolved_coid``."""
+    already = Decimal(0)
+    already_ids: set[str] = set()
+    for rec in kb_journal.read_records_lenient(home):
+        detail = rec.get("detail") if isinstance(rec, dict) else None
+        if rec.get("kind") != "tick" or not isinstance(detail, dict) or detail.get("resolved_coid") != coid:
+            continue
+        try:
+            already += Decimal(str(detail.get(field) or "0"))
+        except (ArithmeticError, ValueError):
+            pass
+        ids = detail.get("stop_fill_ids")
+        if isinstance(ids, list):
+            already_ids.update(i for i in ids if isinstance(i, str))
+    return already, already_ids
 
 
 def _has_resolved_record(home: Path, coid: str) -> bool:
