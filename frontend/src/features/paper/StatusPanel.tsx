@@ -47,6 +47,12 @@ export type StatusPanelProps = {
   onStatusMutated?: () => void;
   /** Reports confirmed armed/unarmed so the shell can celebrate a first win. */
   onArmedChange?: (armed: boolean) => void;
+  /**
+   * Incrementing this key re-reads paper status in place, and with it the
+   * owned position (for example when the operator re-selects Run while it
+   * is already shown, after a tick may have changed the persisted state).
+   */
+  refreshKey?: number;
 };
 
 type EntriesSentence = "Entries active" | "Entries paused";
@@ -782,6 +788,7 @@ export function StatusPanel({
   onPaperArmed,
   onStatusMutated,
   onArmedChange,
+  refreshKey = 0,
 }: StatusPanelProps): JSX.Element {
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
   // Synchronous guard so a rapid double click cannot dispatch a duplicate
@@ -978,6 +985,21 @@ export function StatusPanel({
       inFlightRef.current = false;
     }
   };
+
+  // A tick (scheduler or offline CLI) changes the persisted position out of
+  // band, after the panel's last read. A `refreshKey` bump is the shell
+  // asking for current state: run the same read as Refresh status, whose
+  // new status body re-reads the owned position. Mount is not a bump. While
+  // a read or command is in flight the bump is skipped, as a second Refresh
+  // click is: that work ends with its own status read, then position read.
+  const lastRefreshKeyRef = useRef(refreshKey);
+  useEffect(() => {
+    if (refreshKey === lastRefreshKeyRef.current) {
+      return;
+    }
+    lastRefreshKeyRef.current = refreshKey;
+    void refreshStatus();
+  }, [refreshKey]);
 
   const runCommand = async (
     command: CommandName,
