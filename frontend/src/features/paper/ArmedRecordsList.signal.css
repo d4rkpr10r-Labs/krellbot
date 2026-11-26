@@ -157,6 +157,16 @@
   overflow-wrap: anywhere;
 }
 
+/* What pause and 'Stop paper run' do: muted contextual copy beside the
+   detail controls, never a success or caution tone. */
+.kbot-paper-armed .kbot-paper-armed__note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted, #abc4d8);
+  overflow-wrap: anywhere;
+}
+
 /* Confirmed empty state ("No packs armed"): coral-derived caution
    tone — never a success color; the sentence carries the state. */
 .kbot-paper-armed .kbot-paper-armed__empty--none {

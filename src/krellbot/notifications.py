@@ -13,15 +13,26 @@ time. No secrets ship in the repository.
 
 Tests inject a ``FakeNotifier`` so no desktop bus or SMTP host is
 touched.
+
+Each alert notifies once per occurrence: deliveries dedupe on
+``(alert_id, first_ts)`` in ``<home>/run/notifications-sent.json``. An
+occurrence ends when its alert clears or is acknowledged, so a zero-time
+alert (``needs_reconcile``, ``store_fault``) notifies once per appearance.
+A channel is recorded as sent only when its notifier returns; a notifier
+reports failure by raising, the failure is kept per channel for
+``GET /api/v1/notifications/delivery``, and a failing channel is retried at
+most once every ``RETRY_SECONDS``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import smtplib
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from pathlib import Path
@@ -34,11 +45,53 @@ CONFIG_FILE = "notifications.json"
 SENT_FILE = "notifications-sent.json"
 SMTP_PASSWORD_ENV = "KRELLBOT_SMTP_PASSWORD"
 
+# The occurrence store's shape. A file without it is the earlier flat
+# ``{alert_id: last_ts}`` map, which is read once and upgraded.
+STORE_SCHEMA_VERSION = "2"
+DELIVERY_SCHEMA_VERSION = "1"
+
+# A channel whose last send failed is not tried again for this long.
+RETRY_SECONDS = 60
+
 Channel = Literal["desktop", "email"]
+CHANNELS: tuple[Channel, ...] = ("desktop", "email")
+
+_SENT = "sent"
+_PENDING = "pending"
+
+# Fixed copy per failure code. Exception text never reaches the API: it can
+# carry paths, server banners or addresses.
+FAILURE_MESSAGES: dict[str, str] = {
+    "desktop_unsupported": "Desktop notifications are not supported on this platform.",
+    "desktop_command_missing": "The desktop notification command (notify-send or osascript) was not found.",
+    "desktop_command_failed": "The desktop notification command exited with an error.",
+    "desktop_timeout": "The desktop notification command timed out.",
+    "email_not_configured": "Email needs an SMTP host and a To address.",
+    "smtp_unreachable": "Could not connect to the SMTP server.",
+    "smtp_auth_failed": f"The SMTP server refused the login. Check {SMTP_PASSWORD_ENV}.",
+    "smtp_rejected": "The SMTP server refused the sender, a recipient or the message.",
+    "smtp_error": "The SMTP server returned an error.",
+    "notifier_error": "The notifier failed unexpectedly.",
+}
+_UNKNOWN_FAILURE_MESSAGE = "The notification was not delivered."
+_FAILURE_CODE_RE = re.compile(r"[a-z0-9_]{1,64}")
+
+
+class NotificationFailed(Exception):
+    """A notifier could not deliver. ``code`` is a fixed, secret-free label."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 class Notifier(Protocol):
-    """Deliver one alert notification on a single channel."""
+    """Deliver one alert notification on a single channel.
+
+    Returning means delivered. A notifier that could not deliver raises,
+    preferably :class:`NotificationFailed` with a code from
+    ``FAILURE_MESSAGES``.
+    """
 
     def notify(
         self,
@@ -52,9 +105,16 @@ class Notifier(Protocol):
 
 @dataclass
 class FakeNotifier:
-    """Test double that records every notify call and never egresses."""
+    """Test double that records every notify call and never egresses.
+
+    ``attempts`` records every call; ``sent`` only the calls that succeeded.
+    A channel listed in ``failures`` raises :class:`NotificationFailed` with
+    the mapped code.
+    """
 
     sent: list[dict[str, str]] = field(default_factory=list)
+    failures: dict[str, str] = field(default_factory=dict)
+    attempts: list[dict[str, str]] = field(default_factory=list)
 
     def notify(
         self,
@@ -64,14 +124,17 @@ class FakeNotifier:
         body: str,
         alert_id: str,
     ) -> None:
-        self.sent.append(
-            {
-                "channel": channel,
-                "title": title,
-                "body": body,
-                "alert_id": alert_id,
-            }
-        )
+        row = {
+            "channel": channel,
+            "title": title,
+            "body": body,
+            "alert_id": alert_id,
+        }
+        self.attempts.append(dict(row))
+        code = self.failures.get(channel)
+        if code:
+            raise NotificationFailed(code)
+        self.sent.append(row)
 
 
 def _config_path(home: Path) -> Path:
@@ -197,21 +260,116 @@ def email_enabled(home: Path) -> bool:
     return bool(_load(home)["email_enabled"])
 
 
-def _load_sent(home: Path) -> dict[str, int]:
+def _as_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _empty_channel_state() -> dict:
+    return {"last_sent_ts": None, "last_failure": None}
+
+
+def _normalize_failure(raw: object) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    ts = _as_int(raw.get("ts"))
+    code = raw.get("code")
+    if ts is None or not isinstance(code, str) or not _FAILURE_CODE_RE.fullmatch(code):
+        return None
+    kind = raw.get("kind")
+    return {"ts": ts, "code": code, "kind": kind if isinstance(kind, str) else None}
+
+
+def _normalize_occurrence(raw: object) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    first_ts = _as_int(raw.get("first_ts"))
+    if first_ts is None:
+        return None
+    channels_raw = raw.get("channels")
+    channels: dict[str, str] = {}
+    if isinstance(channels_raw, dict):
+        for name in CHANNELS:
+            state = channels_raw.get(name)
+            if state in (_SENT, _PENDING):
+                channels[name] = state
+    return {"first_ts": first_ts, "channels": channels}
+
+
+def _load_store(home: Path) -> dict:
+    """Read the occurrence store; a missing or corrupt file reads as empty."""
+
     raw = _load_json(_sent_path(home))
-    out: dict[str, int] = {}
-    for key, value in raw.items():
-        if not isinstance(key, str):
-            continue
-        try:
-            out[key] = int(value)
-        except (TypeError, ValueError):
-            continue
-    return out
+    occurrences: dict[str, dict] = {}
+    channels = {name: _empty_channel_state() for name in CHANNELS}
+    store = {
+        "schema_version": STORE_SCHEMA_VERSION,
+        "occurrences": occurrences,
+        "channels": channels,
+    }
+    if raw.get("schema_version") != STORE_SCHEMA_VERSION:
+        # The earlier flat map kept the ``last_ts`` each alert was notified at.
+        for key, value in raw.items():
+            last_ts = _as_int(value)
+            if isinstance(key, str) and last_ts is not None:
+                occurrences[key] = {"legacy_last_ts": last_ts}
+        return store
+    occ_raw = raw.get("occurrences")
+    if isinstance(occ_raw, dict):
+        for key, value in occ_raw.items():
+            record = _normalize_occurrence(value)
+            if isinstance(key, str) and record is not None:
+                occurrences[key] = record
+    ch_raw = raw.get("channels")
+    if isinstance(ch_raw, dict):
+        for name in CHANNELS:
+            state = ch_raw.get(name)
+            if isinstance(state, dict):
+                channels[name] = {
+                    "last_sent_ts": _as_int(state.get("last_sent_ts")),
+                    "last_failure": _normalize_failure(state.get("last_failure")),
+                }
+    return store
 
 
-def _save_sent(home: Path, sent: dict[str, int]) -> None:
-    _save_json(_sent_path(home), sent)
+def _save_store(home: Path, store: dict) -> None:
+    _save_json(_sent_path(home), store)
+
+
+def _current_occurrence(record: dict | None, first_ts: int) -> dict | None:
+    """Return the stored record when it is this occurrence, else None."""
+
+    if record is None:
+        return None
+    legacy = record.get("legacy_last_ts")
+    if legacy is not None:
+        # Notified under the earlier store at or after this occurrence began.
+        return {"first_ts": first_ts, "channels": {}} if legacy >= first_ts else None
+    return record if record.get("first_ts") == first_ts else None
+
+
+def _backing_off(state: dict, now: int) -> bool:
+    """True while a channel's last failure is newer than its last send and
+    less than ``RETRY_SECONDS`` old."""
+
+    failure = state.get("last_failure")
+    if failure is None:
+        return False
+    last_sent = state.get("last_sent_ts")
+    if last_sent is not None and last_sent >= failure["ts"]:
+        return False
+    return now - failure["ts"] < RETRY_SECONDS
+
+
+def _failure_code(exc: BaseException) -> str:
+    if isinstance(exc, NotificationFailed) and _FAILURE_CODE_RE.fullmatch(str(exc.code)):
+        return str(exc.code)
+    return "notifier_error"
+
+
+def _failure_message(code: str) -> str:
+    return FAILURE_MESSAGES.get(code, _UNKNOWN_FAILURE_MESSAGE)
 
 
 def _alert_title(alert: object) -> str:
@@ -258,15 +416,20 @@ def _alert_id(alert: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _alert_last_ts(alert: object) -> int:
+def _alert_first_ts(alert: object) -> int:
     if isinstance(alert, dict):
-        value = alert.get("last_ts", 0)
+        value = alert.get("first_ts", 0)
     else:
-        value = getattr(alert, "last_ts", 0)
+        value = getattr(alert, "first_ts", 0)
     try:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _alert_kind(alert: object) -> str | None:
+    value = alert.get("kind") if isinstance(alert, dict) else getattr(alert, "kind", None)
+    return value if isinstance(value, str) and value else None
 
 
 def _alert_acknowledged(alert: object) -> bool:
@@ -276,7 +439,11 @@ def _alert_acknowledged(alert: object) -> bool:
 
 
 class DesktopLocalNotifier:
-    """Best-effort local desktop notification (notify-send / osascript)."""
+    """Local desktop notification (notify-send / osascript).
+
+    Raises :class:`NotificationFailed` when nothing was shown: an
+    unsupported platform, a missing command, a non-zero exit or a timeout.
+    """
 
     def notify(
         self,
@@ -287,30 +454,36 @@ class DesktopLocalNotifier:
         alert_id: str,
     ) -> None:
         if channel != "desktop":
-            return
+            raise NotificationFailed("notifier_error")
+        if sys.platform == "darwin":
+            script = f"display notification {json.dumps(body)} with title {json.dumps(title)}"
+            argv = ["osascript", "-e", script]
+        elif sys.platform.startswith("linux"):
+            argv = ["notify-send", "--app-name=Krellbot", title, body]
+        else:
+            raise NotificationFailed("desktop_unsupported")
         try:
-            if sys.platform == "darwin":
-                script = f"display notification {json.dumps(body)} with title {json.dumps(title)}"
-                subprocess.run(
-                    ["osascript", "-e", script],
-                    check=False,
-                    capture_output=True,
-                    timeout=5,
-                )
-            elif sys.platform.startswith("linux"):
-                subprocess.run(
-                    ["notify-send", "--app-name=Krellbot", title, body],
-                    check=False,
-                    capture_output=True,
-                    timeout=5,
-                )
-            # Windows and unknown platforms: soft no-op (no secrets, no crash).
+            completed = subprocess.run(
+                argv,
+                check=False,
+                capture_output=True,
+                timeout=5,
+            )
+        except FileNotFoundError:
+            raise NotificationFailed("desktop_command_missing") from None
+        except subprocess.TimeoutExpired:
+            raise NotificationFailed("desktop_timeout") from None
         except (OSError, subprocess.SubprocessError):
-            return
+            raise NotificationFailed("desktop_command_failed") from None
+        if completed.returncode != 0:
+            raise NotificationFailed("desktop_command_failed")
 
 
 class EmailSmtpNotifier:
-    """Best-effort SMTP email. Password from ``KRELLBOT_SMTP_PASSWORD`` only."""
+    """SMTP email. Password from ``KRELLBOT_SMTP_PASSWORD`` only.
+
+    Raises :class:`NotificationFailed` when the message was not accepted.
+    """
 
     def __init__(self, email: dict[str, object], *, password: str | None = None) -> None:
         self._email = _normalize_email(email)
@@ -325,9 +498,9 @@ class EmailSmtpNotifier:
         alert_id: str,
     ) -> None:
         if channel != "email":
-            return
+            raise NotificationFailed("notifier_error")
         if not email_is_configured(self._email):
-            return
+            raise NotificationFailed("email_not_configured")
         to_addr = str(self._email["to"]).strip()
         from_addr = str(self._email["from_addr"]).strip() or to_addr
         host = str(self._email["smtp_host"]).strip()
@@ -348,8 +521,17 @@ class EmailSmtpNotifier:
                 if self._password:
                     smtp.login(from_addr, self._password)
                 smtp.send_message(msg)
-        except (OSError, smtplib.SMTPException):
-            return
+        # SMTPException subclasses OSError, so the SMTP cases come first.
+        except smtplib.SMTPAuthenticationError:
+            raise NotificationFailed("smtp_auth_failed") from None
+        except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError):
+            raise NotificationFailed("smtp_rejected") from None
+        except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected):
+            raise NotificationFailed("smtp_unreachable") from None
+        except smtplib.SMTPException:
+            raise NotificationFailed("smtp_error") from None
+        except OSError:
+            raise NotificationFailed("smtp_unreachable") from None
 
 
 @dataclass
@@ -384,55 +566,130 @@ def default_notifier(home: Path) -> Notifier:
     )
 
 
+def _ready_channels(data: dict) -> dict[str, bool]:
+    email_cfg = data["email"]
+    assert isinstance(email_cfg, dict)
+    return {
+        "desktop": bool(data["desktop_enabled"]),
+        "email": bool(data["email_enabled"]) and email_is_configured(email_cfg),
+    }
+
+
 def maybe_notify(
     home: Path,
     alerts: list,
     *,
     notifier: Notifier | None = None,
+    now: int | None = None,
 ) -> int:
-    """Notify for newly seen unacknowledged alerts on enabled channels.
+    """Notify each unacknowledged alert occurrence once on enabled channels.
 
-    Returns the number of channel deliveries attempted. Acknowledged
-    alerts are skipped (ack remains in-app). When both channels are
-    disabled the notifier is never called. Dedupes by ``alert_id`` +
-    ``last_ts`` so a later occurrence re-notifies.
+    ``alerts`` is the full current alert list (``alerts.collect``). An
+    occurrence is ``(alert_id, first_ts)``; it is notified once per
+    channel that was enabled when it was first seen. It ends when the alert
+    leaves the list or is acknowledged, so a later appearance or an event
+    that un-acknowledges it notifies again, and an ack holds.
+
+    A channel is recorded as sent only when the notifier returns. A failed
+    channel keeps its occurrences pending, records its last failure, and is
+    retried at most once every ``RETRY_SECONDS``. A notifier exception never
+    propagates. When both channels are disabled nothing is read, written or
+    called. Returns the number of successful deliveries.
     """
 
     data = _load(home)
-    desktop_on = bool(data["desktop_enabled"])
-    email_on = bool(data["email_enabled"])
-    email_cfg = data["email"]
-    assert isinstance(email_cfg, dict)
-    email_ready = email_on and email_is_configured(email_cfg)
-    if not desktop_on and not email_ready:
+    ready = _ready_channels(data)
+    enabled = [name for name in CHANNELS if ready[name]]
+    if not enabled:
         return 0
 
+    now_s = int(time.time()) if now is None else int(now)
     active = notifier if notifier is not None else default_notifier(home)
-    sent = _load_sent(home)
+    store = _load_store(home)
+    occurrences: dict[str, dict] = store["occurrences"]
+    channels: dict[str, dict] = store["channels"]
+    waiting = {name for name in enabled if _backing_off(channels[name], now_s)}
+    open_ids: set[str] = set()
     deliveries = 0
     dirty = False
 
     for alert in alerts:
         alert_id = _alert_id(alert)
-        if alert_id is None:
+        if alert_id is None or _alert_acknowledged(alert):
             continue
-        if _alert_acknowledged(alert):
-            continue
-        last_ts = _alert_last_ts(alert)
-        previous = sent.get(alert_id, 0)
-        if last_ts <= previous:
-            continue
-        title = _alert_title(alert)
-        body = _alert_body(alert)
-        if desktop_on:
-            active.notify(channel="desktop", title=title, body=body, alert_id=alert_id)
-            deliveries += 1
-        if email_ready:
-            active.notify(channel="email", title=title, body=body, alert_id=alert_id)
-            deliveries += 1
-        sent[alert_id] = last_ts
+        open_ids.add(alert_id)
+        stored = occurrences.get(alert_id)
+        record = _current_occurrence(stored, _alert_first_ts(alert))
+        if record is None:
+            record = {
+                "first_ts": _alert_first_ts(alert),
+                "channels": {name: _PENDING for name in enabled},
+            }
+        if record is not stored:
+            occurrences[alert_id] = record
+            dirty = True
+        for channel in enabled:
+            if record["channels"].get(channel) != _PENDING or channel in waiting:
+                continue
+            try:
+                active.notify(
+                    channel=channel,
+                    title=_alert_title(alert),
+                    body=_alert_body(alert),
+                    alert_id=alert_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — a notifier never fails the caller
+                channels[channel]["last_failure"] = {
+                    "ts": now_s,
+                    "code": _failure_code(exc),
+                    "kind": _alert_kind(alert),
+                }
+                waiting.add(channel)
+            else:
+                record["channels"][channel] = _SENT
+                channels[channel]["last_sent_ts"] = now_s
+                deliveries += 1
+            dirty = True
+
+    for alert_id in [key for key in occurrences if key not in open_ids]:
+        del occurrences[alert_id]
         dirty = True
 
     if dirty:
-        _save_sent(home, sent)
+        _save_store(home, store)
     return deliveries
+
+
+def delivery_status(home: Path) -> dict:
+    """Closed-shape per-channel delivery record for the API (no secrets).
+
+    Each channel reports whether it is enabled and ready, when it last
+    delivered, how many open occurrences still wait for it, and its last
+    failure with a fixed message. Never creates a file.
+    """
+
+    ready = _ready_channels(_load(home))
+    store = _load_store(home)
+    out: dict[str, dict] = {}
+    for name in CHANNELS:
+        state = store["channels"][name]
+        failure = state["last_failure"]
+        pending = sum(1 for record in store["occurrences"].values() if record.get("channels", {}).get(name) == _PENDING)
+        out[name] = {
+            "enabled": ready[name],
+            "last_sent_ts": state["last_sent_ts"],
+            "pending": pending,
+            "last_failure": None
+            if failure is None
+            else {
+                "ts": failure["ts"],
+                "code": failure["code"],
+                "message": _failure_message(failure["code"]),
+                "kind": failure["kind"],
+            },
+        }
+    return {
+        "schema_version": DELIVERY_SCHEMA_VERSION,
+        "retry_seconds": RETRY_SECONDS,
+        "channels": out,
+    }

@@ -11,6 +11,12 @@ a key that cannot probe its own permissions. Anything truthy replaces
 the success body. `api_key_info_error` is a string surfaced in the
 `error` field; it overrides `api_key_info` when set so callers can
 exercise the "permission denied" branch directly.
+
+`balances` answers the account reads (`Balance`, and an empty
+`TradesHistory`) from state instead of the queue, so a multi-tick test
+can move the account and the order books (`set_order_books`) between
+ticks while one transport keeps the whole call log. `order_info` builds
+one documented OpenOrders / ClosedOrders row, including `vol_exec`.
 """
 
 from __future__ import annotations
@@ -56,8 +62,10 @@ class FakeKrakenTransport:
         closed_orders: dict | None = None,
         api_key_info: object = None,
         api_key_info_error: str | None = None,
+        balances: dict[str, str] | None = None,
     ) -> None:
         self._responses = list(responses or [])
+        self.balances = None if balances is None else dict(balances)
         self._withdraw_methods = withdraw_methods
         self._rate_limit_first = rate_limit_first_n
         self._permission_error_on = permission_error_on or set()
@@ -90,6 +98,10 @@ class FakeKrakenTransport:
         endpoint = url.rsplit("/", 1)[-1]
         if endpoint in self._permission_error_on:
             return {"error": ["EAPI:Invalid key: Permission denied"]}
+        if self.balances is not None and endpoint == "Balance":
+            return {"error": [], "result": dict(self.balances)}
+        if self.balances is not None and endpoint == "TradesHistory":
+            return {"error": [], "result": {"trades": {}, "count": 0}}
         if endpoint == "OpenOrders":
             return self._open_orders or {"error": [], "result": {"open": {}}}
         if endpoint == "ClosedOrders":
@@ -109,6 +121,14 @@ class FakeKrakenTransport:
             return {"error": [], "result": {}}
         return self._responses.pop(0)
 
+    def set_order_books(self, *, open_rows: dict | None = None, closed_rows: dict | None = None) -> None:
+        """Replace what OpenOrders and ClosedOrders return, keyed by txid."""
+        self._open_orders = {"error": [], "result": {"open": dict(open_rows or {})}}
+        self._closed_orders = {
+            "error": [],
+            "result": {"closed": dict(closed_rows or {}), "count": len(closed_rows or {})},
+        }
+
     def _api_key_info_response(self) -> dict:
         if self._api_key_info_error is not None:
             return {"error": [self._api_key_info_error], "result": {}}
@@ -117,6 +137,41 @@ class FakeKrakenTransport:
             # old WithdrawMethods behavior the fake emulated.
             return {"error": ["EAPI:Invalid key: Permission denied"], "result": {}}
         return {"error": [], "result": self._api_key_info}
+
+
+def order_info(
+    *,
+    vol: str,
+    vol_exec: str | None,
+    status: str,
+    pair: str,
+    side: str = "buy",
+    ordertype: str = "market",
+    cl_ord_id: str | None = None,
+    userref: int = 0,
+    refid: str | None = None,
+    stopprice: str = "0.00000000",
+) -> dict:
+    """One documented Kraken order-info row (OpenOrders / ClosedOrders).
+
+    ``vol`` is the requested volume and ``vol_exec`` the executed volume;
+    ``vol_exec=None`` leaves the field out. ``refid`` names the order that
+    created this one (a conditional close names its entry).
+    """
+    row: dict = {
+        "refid": refid,
+        "userref": userref,
+        "status": status,
+        "descr": {"pair": pair, "type": side, "ordertype": ordertype, "price": stopprice},
+        "vol": vol,
+        "stopprice": stopprice,
+        "misc": "",
+    }
+    if vol_exec is not None:
+        row["vol_exec"] = vol_exec
+    if cl_ord_id is not None:
+        row["cl_ord_id"] = cl_ord_id
+    return row
 
 
 def _query_value(url: str, key: str) -> str:

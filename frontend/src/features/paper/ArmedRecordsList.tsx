@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState, type JSX, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useId, useRef, useState, type JSX, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import "./ArmedRecordsList.signal.css";
 import type { PaperArmedClient, PaperArmedRecord, PaperClient } from "./client";
+import { PAUSE_NEW_BUYS_DISCLOSURE, STOP_RUN_DISCLOSURE } from "./stopRunDisclosure";
 
 export type { PaperArmedClient, PaperArmedRecord } from "./client";
 
@@ -55,6 +56,7 @@ export function ArmedRecordsList({
   const [rowActionKind, setRowActionKind] = useState<"pause" | "resume" | "disarm" | null>(null);
   const [rowActionInFlight, setRowActionInFlight] = useState(false);
   const rowActionKey = useRef<string | null>(null);
+  const runControlsDisclosureId = useId();
 
   // The shell may pass a legacy client that does not implement
   // listArmed (the pre-armed-records injected test client). Calling it
@@ -446,6 +448,7 @@ export function ArmedRecordsList({
                   className="kbot-paper-armed__row-action"
                   data-testid="paper-armed-row-pause"
                   aria-label={`Pause new buys on ${selected.venue} ${selected.pair}`}
+                  aria-describedby={runControlsDisclosureId}
                   disabled={rowActionInFlight || !selected || selected.entries_paused === true}
                   onClick={() => { void runRowAction("pause"); }}
                 >
@@ -466,11 +469,19 @@ export function ArmedRecordsList({
                   className="kbot-paper-armed__row-action"
                   data-testid="paper-armed-row-disarm"
                   aria-label={`Stop paper run ${selected.venue} ${selected.pair}`}
+                  aria-describedby={runControlsDisclosureId}
                   disabled={rowActionInFlight}
                   onClick={() => { void runRowAction("disarm"); }}
                 >
                   Stop paper run
                 </button>
+                <p
+                  className="kbot-paper-armed__note"
+                  id={runControlsDisclosureId}
+                  data-testid="paper-armed-stop-run-disclosure"
+                >
+                  {PAUSE_NEW_BUYS_DISCLOSURE} {STOP_RUN_DISCLOSURE}
+                </p>
                 {rowActionError !== null && rowActionKind !== null && rowActionKey.current === rowKey(selected) ? (
                   <p
                     data-testid="paper-armed-row-action-error"
