@@ -87,17 +87,6 @@
   box-shadow: inset 0 1px rgb(255 255 255 / 35%), 0 5px 24px rgb(45 212 191 / 16%);
 }
 
-[data-theme="signal-night"] .kbot-strategy-editor .kbot-starter-picker__item {
-  grid-template-columns: minmax(0, 1fr);
-  align-items: start;
-}
-
-[data-theme="signal-night"] .kbot-strategy-editor .kbot-starter-picker__action {
-  justify-self: start;
-  max-width: 100%;
-  white-space: normal;
-}
-
 [data-theme="signal-night"] .app-home button.app-home__card {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
