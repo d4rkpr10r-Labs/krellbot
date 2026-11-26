@@ -2,8 +2,10 @@
  * Live-ready wizard honesty client — trust snapshot + paper-only vs grant.
  *
  * Presentation-only GET. Never sends credentials. Defense in depth: even if
- * the API ever claimed live_ready, the client forces it false.
+ * the API ever claimed live_ready, the client forces it false. The one write
+ * is the Tailscale session scope, a CSRF-gated PUT a local session makes.
  */
+import { getCsrf } from "../../session";
 
 /** Where ``secrets.get`` takes a venue's credentials from (kind only, never a value). */
 export type CredentialSource = "keychain" | "env_override" | "keyfile_fallback";
@@ -35,6 +37,9 @@ export type RemoteAccess = {
   origin: string | null;
 };
 
+/** What a Tailscale session may do (D14); read-only is the default. */
+export type RemoteScope = "read_only" | "full";
+
 export type LiveGrantState = {
   active: boolean;
   expires_at: number | null;
@@ -58,11 +63,19 @@ export type LiveWizardHonesty = {
   /** Local address the request arrived on; null when not measurable. */
   bind_measured?: string | null;
   remote_access?: RemoteAccess | null;
+  /** Stored Tailscale session scope; null when the server does not report one. */
+  remote_scope?: RemoteScope | null;
 };
 
 export type TrustClient = {
   getTrust(): Promise<LiveWizardHonesty>;
+  /** Store the Tailscale session scope; only a local session may. Resolves to the stored scope. */
+  setRemoteScope?(scope: RemoteScope): Promise<RemoteScope>;
 };
+
+function asRemoteScope(raw: unknown): RemoteScope | null {
+  return raw === "read_only" || raw === "full" ? raw : null;
+}
 
 function asGrant(raw: unknown): LiveGrantState {
   if (!raw || typeof raw !== "object") {
@@ -169,6 +182,7 @@ export function parseLiveWizardHonesty(
     bind_measured:
       typeof body.bind_measured === "string" ? body.bind_measured : null,
     remote_access: asRemoteAccess(body.remote_access),
+    remote_scope: asRemoteScope(body.remote_scope),
   };
 }
 
@@ -192,6 +206,33 @@ export function createTrustHttpClient(): TrustClient {
         throw new Error(detail);
       }
       return parseLiveWizardHonesty(body);
+    },
+    async setRemoteScope(scope: RemoteScope): Promise<RemoteScope> {
+      const response = await fetch("/api/v1/remote-access/scope", {
+        method: "PUT",
+        credentials: "include",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-Krellbot-CSRF": getCsrf(),
+        },
+        body: JSON.stringify({ scope }),
+      });
+      let body: Record<string, unknown> = {};
+      try {
+        body = (await response.json()) as Record<string, unknown>;
+      } catch {
+        body = {};
+      }
+      const stored = asRemoteScope(body.remote_scope);
+      if (!response.ok || stored === null) {
+        const detail =
+          typeof body.detail === "string"
+            ? body.detail
+            : `remote access change refused: ${response.status}`;
+        throw new Error(detail);
+      }
+      return stored;
     },
   };
 }
