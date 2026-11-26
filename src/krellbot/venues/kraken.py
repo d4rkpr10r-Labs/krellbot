@@ -329,6 +329,25 @@ def build_entry_with_stop_form(
     }
 
 
+def build_stop_form(coid: str, qty: Decimal, stop: Decimal, *, pair: str) -> dict[str, str]:
+    """Build the AddOrder form for a standalone sell stop-loss (a repaired protective stop).
+
+    Per the AddOrder reference (https://docs.kraken.com/api-reference/trading/add-order),
+    ``ordertype=stop-loss`` is a market order triggered at ``price``, the same order
+    type as the entry's conditional close. The coid goes in ``cl_ord_id`` and no
+    ``userref`` is sent: the reference documents the two as mutually exclusive.
+    ``qty`` and ``stop`` are already quantized by the caller.
+    """
+    return {
+        "pair": pair,
+        "type": "sell",
+        "ordertype": "stop-loss",
+        "price": format(stop, "f"),
+        "volume": format(qty, "f"),
+        "cl_ord_id": coid,
+    }
+
+
 def require_validate_true(body: dict[str, str]) -> None:
     """Refuse any request body that is not explicitly validate-only."""
     if body.get("validate") != "true":
@@ -515,6 +534,40 @@ class KrakenVenue:
         }
         return self._place(ADD_ORDER, form, coid=coid, side="sell", qty=lot, stop=None)
 
+    def place_stop(self, coid: str, qty: Decimal, stop: Decimal, *, pair: str) -> OrderRef:
+        """Rest a sell stop-loss for ``qty`` triggered at ``stop``, under ``cl_ord_id=coid``.
+
+        See ``build_stop_form`` for the request. An order Kraken already lists
+        under the coid's ``cl_ord_id`` is returned and nothing is sent. Its
+        fills name the coid through ``_link_sell_fills`` (the order carries
+        ``cl_ord_id``), and ``stop_outcome`` finds it again. Only ``ordermin``
+        is checked here: whether the stop's cost is acceptable is Kraken's to
+        say. The send goes through ``_place``, so a documented refusal raises
+        ``VenueRejectedError`` and any other error ``RuntimeError``.
+        """
+        release_policy.ensure_live_orders_allowed()
+        if not pair:
+            raise ValueError("kraken stop requires a pair")
+        found = self._lookup_client_order(coid)
+        if found is not None:
+            _bucket, order_id, raw = found
+            order = _open_order(order_id, raw)
+            return OrderRef(
+                id=order_id,
+                coid=coid,
+                pair=order.pair if order is not None else pair,
+                side="sell",
+                qty=order.qty if order is not None else Decimal(0),
+                filled_qty=_executed_qty(raw) or Decimal(0),
+                stop_price=order.stop_price if order is not None else None,
+            )
+        rules = self.rules(pair)
+        lot = _quantize_qty(qty, rules.lot_decimals)
+        price = _quantize_price(stop, rules.price_decimals)
+        _reject_size(lot, rules, None)
+        form = build_stop_form(coid, lot, price, pair=pair)
+        return self._place(ADD_ORDER, form, coid=coid, side="sell", qty=lot, stop=price)
+
     def cancel_stops(self, pair: str) -> None:
         release_policy.ensure_live_orders_allowed()
         # Refuse to cancel the whole account. Cancel open orders tagged as stop
@@ -560,20 +613,19 @@ class KrakenVenue:
         caller keeps its hold. Never sends an order.
         """
         del pair  # the coid's own cl_ord_id / userref identify the order
-        found = self._lookup(coid, own_only=True)
-        if found is None:
-            return UNKNOWN_OUTCOME
-        bucket, _order_id, raw = found
-        executed = _executed_qty(raw)
-        if executed is None:
-            return UNKNOWN_OUTCOME
-        if bucket == "open":
-            if executed > 0:
-                return OrderOutcome(status="partial", filled_qty=executed, authoritative=True)
-            return OrderOutcome(status="open", authoritative=True)
-        if executed > 0:
-            return OrderOutcome(status="filled", filled_qty=executed, authoritative=True)
-        return OrderOutcome(status="absent", authoritative=True)
+        return _outcome_of(self._lookup(coid, own_only=True))
+
+    def stop_outcome(self, coid: str, *, pair: str) -> OrderOutcome:
+        """``order_outcome`` for a stop ``place_stop`` rested, found by its ``cl_ord_id``.
+
+        ``place_stop`` sends no ``userref``, so the userref lookup cannot find
+        it; this reads the same open and closed lists through their documented
+        ``cl_ord_id`` filter (``_lookup_client_order``). The answer is mapped as
+        in ``order_outcome``: resting with nothing executed is ``open``, and a
+        miss is ``unknown``. Never sends an order.
+        """
+        del pair  # the cl_ord_id identifies the order
+        return _outcome_of(self._lookup_client_order(coid))
 
     def check_key(self) -> KeyPerms:
         # Strictly validate the key against `GetApiKeyInfo` permissions.
@@ -681,6 +733,25 @@ class KrakenVenue:
             found = _match_userref(payload, bucket, coid, userref, own_only=own_only)
             if found is not None:
                 return bucket, found[0], found[1]
+        return None
+
+    def _lookup_client_order(self, coid: str) -> tuple[str, str, dict] | None:
+        """Find the order whose own ``cl_ord_id`` is ``coid`` in the open, then closed, orders.
+
+        Queries by the ``cl_ord_id`` filter of Get Open Orders
+        (https://docs.kraken.com/api-reference/account-data/get-open-orders) and
+        Get Closed Orders
+        (https://docs.kraken.com/api-reference/account-data/get-closed-orders).
+        Only a row that carries ``coid`` as its ``cl_ord_id`` counts. Returns
+        ``(bucket, order_id, row)``.
+        """
+        for endpoint, bucket in (("OpenOrders", "open"), ("ClosedOrders", "closed")):
+            book = _result(self._private(endpoint, {"cl_ord_id": coid})).get(bucket)
+            if not isinstance(book, dict):
+                continue
+            for order_id, raw in book.items():
+                if isinstance(raw, dict) and str(raw.get("cl_ord_id") or "") == coid:
+                    return bucket, str(order_id), raw
         return None
 
     def _link_sell_fills(self, fills: list[Fill]) -> list[Fill]:
@@ -982,6 +1053,23 @@ def _executed_qty(raw: dict) -> Decimal | None:
     if executed is None or not executed.is_finite() or executed < 0:
         return None
     return executed
+
+
+def _outcome_of(found: tuple[str, str, dict] | None) -> OrderOutcome:
+    """Map a looked-up ``(bucket, order_id, row)`` to its outcome; see ``KrakenVenue.order_outcome``."""
+    if found is None:
+        return UNKNOWN_OUTCOME
+    bucket, _order_id, raw = found
+    executed = _executed_qty(raw)
+    if executed is None:
+        return UNKNOWN_OUTCOME
+    if bucket == "open":
+        if executed > 0:
+            return OrderOutcome(status="partial", filled_qty=executed, authoritative=True)
+        return OrderOutcome(status="open", authoritative=True)
+    if executed > 0:
+        return OrderOutcome(status="filled", filled_qty=executed, authoritative=True)
+    return OrderOutcome(status="absent", authoritative=True)
 
 
 def _parse_recent_trades(payload: Any) -> list[Fill]:
