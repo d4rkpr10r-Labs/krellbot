@@ -273,6 +273,20 @@ export function WorkstationShell({
     },
     [navigateTo],
   );
+  /** Bumped when the operator re-selects Run while it is already shown. */
+  const [runRefreshKey, setRunRefreshKey] = useState(0);
+  const handleNavChange = useCallback(
+    (view: View): void => {
+      // Leaving and returning to Run remounts its panels, which read fresh
+      // state. Re-selecting Run keeps them mounted, so ask the paper status
+      // panel to re-read: a tick may have changed the position since.
+      if (view === "workstation" && view === active) {
+        setRunRefreshKey((key) => key + 1);
+      }
+      setActive(view);
+    },
+    [active, setActive],
+  );
   const handleSettingsSectionChange = useCallback(
     (section: SettingsSection): void => {
       setSettingsSectionState(section);
@@ -1238,7 +1252,7 @@ export function WorkstationShell({
           >
             <Wordmark />
           </button>
-          <Navigation active={active} onChange={setActive} />
+          <Navigation active={active} onChange={handleNavChange} />
           <div className="kbot-shell__head-utils">
             <StatusStrip
               live={bootstrapDone ? undefined : null}
@@ -1338,6 +1352,7 @@ export function WorkstationShell({
                       onArmedChange={handlePaperArmedChange}
                       onPaperArmed={handlePaperArmed}
                       onStatusMutated={handlePaperStatusMutated}
+                      refreshKey={runRefreshKey}
                     />
                     <FleetArmedList
                       client={paperFleet}

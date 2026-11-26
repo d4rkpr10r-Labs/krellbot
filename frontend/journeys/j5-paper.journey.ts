@@ -77,6 +77,8 @@ test("J5.3 As paper ticks run, the status shows position, cash, resting stop and
 test("J5.4 The status shows when it last updated. If a read fails or the data goes stale, it says so instead of showing old numbers as current", async ({journey}) => {
   const page=journey.page; await armPaper(page); await clickNav(page,"Workstation");
   await expect(page.getByTestId("paper-position")).toBeVisible();
+  // Re-selecting Run re-reads status and position; let that settle before the read fails.
+  await page.waitForLoadState("networkidle");
   await page.route("**/api/v1/paper/**",route=>route.abort("connectionreset"));
   await paperRefresh(page).click();
   const error=page.getByRole("alert").filter({hasText:/status refresh failed/i});
