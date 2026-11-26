@@ -99,6 +99,9 @@ class _AppState:
     paper_service: object = field(default=None)  # PaperService singleton per home
     rehearsal_service: object = field(default=None)
     live_transport: object = field(default=None)  # test spy override for live.preflight
+    # Test hook for ``positions.close``: ``armed_list -> (venue_obj, reader)``;
+    # None builds the scheduler's own venue (``cli.venue_for_tick``).
+    close_venue_opener: object = field(default=None)
     keys_transport: object = field(default=None)  # injectable venue transport for keys routes
     catalogue_transport: object = field(default=None)  # injectable signed-catalogue fetch
     checkout_transport: object = field(default=None)  # injectable payment transport (fake in CI)
@@ -1097,7 +1100,7 @@ def _fleet_row_for_record(record: kb_config.ArmedPack, tick_index: dict) -> dict
         "pair": record.pair,
         "mode": record.mode,
         "pack_id": record.pack_id,
-        "entries_paused": bool(record.entries_paused),
+        "entries_paused": kb_config.entries_held(record),
         "last_tick_ts_ms": last_tick_ts_ms,
         "last_tick_result": last_tick_result,
         "last_refusal_code": last_refusal_code,
@@ -1806,6 +1809,50 @@ def create_app(
                     "filled_qty": None if resolved.filled_qty is None else str(resolved.filled_qty),
                     "evidence": resolved.evidence,
                     "attributed": resolved.attributed,
+                },
+                status_code=200,
+                headers={"Cache-Control": "no-store"},
+            )
+        if command == "positions.close":
+            # Sell exactly the strategy-owned quantity of one arm (paper or
+            # live) on the operator's word, with the pair typed back. The
+            # engine runs the tick's exit under the venue's tick lock: it
+            # cancels the stop, sells, journals what executed and holds new
+            # entries. A refusal writes nothing.
+            from krellbot.run import ClosePositionResult, close_position
+
+            venue = inner.get("venue")
+            pair = inner.get("pair")
+            confirmation = inner.get("confirmation")
+            if (
+                not isinstance(venue, str)
+                or not isinstance(pair, str)
+                or (confirmation is not None and not isinstance(confirmation, str))
+            ):
+                closed = ClosePositionResult(code="bad_input")
+            else:
+                closed = await asyncio.to_thread(
+                    close_position,
+                    venue=venue,
+                    pair=pair,
+                    confirmation=confirmation,
+                    open_venue=s.close_venue_opener,
+                    home=s.home,
+                )
+            return JSONResponse(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "correlation_id": correlation_id,
+                    "code": closed.code,
+                    "ok": closed.ok,
+                    "effect": closed.effect,
+                    "message": closed.message,
+                    "venue": venue if isinstance(venue, str) else None,
+                    "pair": pair if isinstance(pair, str) else None,
+                    "mode": closed.mode,
+                    "client_order_id": closed.client_order_id,
+                    "requested_qty": None if closed.requested_qty is None else str(closed.requested_qty),
+                    "sold_qty": None if closed.sold_qty is None else str(closed.sold_qty),
                 },
                 status_code=200,
                 headers={"Cache-Control": "no-store"},
@@ -3620,7 +3667,7 @@ def create_app(
                 "armed": True,
                 "venue": armed.venue,
                 "pair": armed.pair,
-                "entries_paused": bool(armed.entries_paused),
+                "entries_paused": kb_config.entries_held(armed),
                 "mode": armed.mode,
                 "pack_id": armed.pack_id,
             },
@@ -3677,7 +3724,7 @@ def create_app(
             has_fill = any(Decimal(str(detail.get(k, "0"))) > 0 for k in ("entry_qty", "exit_qty", "stop_qty"))
         except (InvalidOperation, ValueError):
             has_fill = False
-        if armed.entries_paused:
+        if kb_config.entries_held(armed):
             state = "paused"
         elif armed.armed_at_ts <= 0:
             state = "unavailable"
@@ -4081,7 +4128,7 @@ def create_app(
                 "pair": record.pair,
                 "mode": record.mode,
                 "pack_id": record.pack_id,
-                "entries_paused": bool(record.entries_paused),
+                "entries_paused": kb_config.entries_held(record),
             }
             for record in config.armed
         ]

@@ -23,7 +23,8 @@ Command contracts:
   * The service does NOT read the OS keyring and does NOT open a network
     transport. Paper commands are local-only.
   * `entries_paused` persists and survives `load_config`. Pause and resume
-    are idempotent. Pause does NOT disarm or liquidate.
+    are idempotent. Pause does NOT disarm or liquidate. Resume also clears
+    an operator close's entry hold (`closed_by_operator_at`).
   * Invalid venue, mode, pack, balance, stop, or a live command sent here
     refuses before any config byte changes. Refusals leave `revision_after`
     equal to `revision_before`.
@@ -1359,7 +1360,11 @@ class PaperService:
                 rev_before,
             )
 
-        if armed.entries_paused == paused:
+        # Resume also lifts an operator close's entry hold
+        # (``closed_by_operator_at``, ``run.close_position``): on a paper arm
+        # it is the same operator hold as a pause. Pause leaves it as it is.
+        closed = armed.closed_by_operator_at is not None
+        if armed.entries_paused == paused and (paused or not closed):
             if paused:
                 code, msg = CODE_ALREADY_PAUSED, f"already paused: {venue} {pair}"
             else:
@@ -1376,6 +1381,8 @@ class PaperService:
             )
 
         armed.entries_paused = paused
+        if not paused:
+            armed.closed_by_operator_at = None
         kb_config.save_config(self._home, config)
         rev_after = _revision(self._home)
 

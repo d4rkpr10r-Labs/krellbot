@@ -1,7 +1,7 @@
 /**
  * Every 'Stop paper run' control says what it does today: it removes the arm
  * only, the paper position and its resting stop stay in place unmanaged, and
- * there is no close-position control yet. Beside it, 'Pause new buys' says it
+ * Close position sells it first. Beside it, 'Pause new buys' says it
  * stops new entries only.
  *
  * Engine evidence: `PaperService.disarm` and `run.disarm_pack` only remove the
@@ -53,9 +53,9 @@ function stopRunControls(): HTMLElement[] {
 }
 
 describe("stop-run disclosure copy", () => {
-  it("says the position and stop stay unmanaged and no close control exists yet", () => {
+  it("says the position and stop stay unmanaged and Close position sells it first", () => {
     expect(STOP_RUN_DISCLOSURE).toBe(
-      "Stop paper run removes the arm only. Any open paper position and its resting stop stay in place, unmanaged: nothing raises or re-places that stop or acts on an exit signal for it. There is no close-position control yet.",
+      "Stop paper run removes the arm only. Any open paper position and its resting stop stay in place, unmanaged: nothing raises or re-places that stop or acts on an exit signal for it. To sell the position first, use Close position: it cancels the stop, sells only what this strategy owns and pauses new buys.",
     );
   });
 

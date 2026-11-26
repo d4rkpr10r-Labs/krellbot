@@ -106,8 +106,18 @@ This is what the engine does today.
 - **Stop paper run** (`paper.disarm`) removes the armed record only. The
   paper position and its resting stop stay in the state file, unmanaged.
   Ticks evaluate armed records only, so nothing raises or re-places that stop
-  or acts on an exit signal for it. There is no close-position control yet
-  ([M28.32](milestones/M28.md)).
+  or acts on an exit signal for it. To sell the position first, use Close
+  position.
+- **Close position** (`positions.close`, the pair typed back) runs the
+  tick's exit now, under the venue's tick lock, without waiting for a bar.
+  It cancels the pair's stop, sells exactly the quantity the strategy owns
+  (never other holdings of the same coin) and journals what the paper venue
+  executed (reason `close`). It then holds new entries with
+  `closed_by_operator_at` until you resume new buys, or stop the run and arm
+  it again. It refuses, writing nothing, while ownership is ambiguous, an
+  order on the venue is unresolved, a tick is running, or nothing is owned.
+  It runs under the kill switch. On live it is settled from the venue's
+  record (see [live.md](live.md#close-position)).
 - **Kill switch, paper.** New paper arms are refused with
   `kill_switch_engaged`. Every paper tick suppresses entries and journals
   `kill_switch: true`, while exits, stop repair and `raise_stop` run.

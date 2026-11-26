@@ -19,6 +19,14 @@ An `ArmedPack` record has:
     pending_version: str | None (version to adopt when flat)
     entries_paused: bool (tick stops placing new entries while true;
         reconcile / existing-position protection still runs; persisted)
+    closed_by_operator_at: int | None (unix seconds of the operator close,
+        ``run.close_position``, that sold the strategy's position; the tick
+        places no new entry while it is set. It is not ``entries_paused``:
+        the live restore fence reads only that, so a close never fences a
+        venue. Disarm drops it with the record, and paper resume clears it.
+        Absent when None, so an arm never closed keeps its config bytes. A
+        stored value that is not an integer loads as 0, which still holds
+        entries.)
 """
 
 from __future__ import annotations
@@ -119,6 +127,7 @@ class ArmedPack:
     owned_qty: Decimal = Decimal(0)
     pending_version: str | None = None
     entries_paused: bool = False
+    closed_by_operator_at: int | None = None
 
 
 @dataclass
@@ -168,6 +177,7 @@ def load_config(home: Path) -> Config:
                             str(entry["pending_version"]) if entry.get("pending_version") is not None else None
                         ),
                         entries_paused=bool(entry.get("entries_paused", False)),
+                        closed_by_operator_at=_stored_closed_at(entry),
                     )
                 )
             except (KeyError, ValueError, TypeError):
@@ -198,7 +208,25 @@ def _serialize_armed(a: ArmedPack) -> dict:
         out["starting_cash"] = str(a.starting_cash)
     else:
         out["starting_cash"] = None
+    # Absent when unset, so an arm that was never closed keeps its exact bytes.
+    if a.closed_by_operator_at is None:
+        del out["closed_by_operator_at"]
     return out
+
+
+def _stored_closed_at(entry: dict) -> int | None:
+    """The stored operator-close time; 0 when present but not an integer, so entries stay held."""
+    raw = entry.get("closed_by_operator_at")
+    if raw is None:
+        return None
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    return 0
+
+
+def entries_held(a: ArmedPack) -> bool:
+    """True while the operator holds this arm's new entries: a pause, or a close not yet resumed."""
+    return a.entries_paused or a.closed_by_operator_at is not None
 
 
 def find_armed(config: Config, venue: str, pair: str) -> ArmedPack | None:
