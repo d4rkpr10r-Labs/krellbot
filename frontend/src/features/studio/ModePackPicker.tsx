@@ -1,6 +1,11 @@
 import { useEffect, useState, type JSX } from "react";
 import type { Pack } from "../strategies/client";
 import {
+  CONSUMER_STARTER_CARD_ORDER,
+  STRUGGLE_COPY,
+  type StruggleCopy,
+} from "../strategies/consumerStarterCopy";
+import {
   fetchModePacks,
   type ModePackCatalogue,
   type ModePackRow,
@@ -11,6 +16,21 @@ export type ModePackPickerProps = {
   onPick: (pack: Pack) => void;
   loadModes?: () => Promise<ModePackCatalogue>;
 };
+
+/**
+ * Struggle lines for the modes the catalogue listed, in its order, then the
+ * three starters. A mode the catalogue omitted gets no line.
+ */
+function struggleEntries(rows: ModePackRow[]): StruggleCopy[] {
+  const ids = [
+    ...rows.map((row) => row.id),
+    ...CONSUMER_STARTER_CARD_ORDER,
+  ];
+  return ids.flatMap((id) => {
+    const entry = STRUGGLE_COPY[id];
+    return entry ? [entry] : [];
+  });
+}
 
 /**
  * Studio control to open a built-in trading-mode pack as a real graph.
@@ -88,6 +108,36 @@ export function ModePackPicker({
             </li>
           ))}
         </ul>
+      ) : null}
+      {rows ? (
+        <div
+          className="kbot-mode-pack-picker__struggles"
+          data-testid="studio-struggle-copy"
+        >
+          <p className="kbot-mode-pack-picker__eyebrow">
+            When each tends to struggle
+          </p>
+          <p className="kbot-mode-pack-picker__hint">
+            Market conditions that work against each rule set. Not a forecast
+            or a performance claim.
+          </p>
+          <dl className="kbot-mode-pack-picker__struggle-list">
+            {struggleEntries(rows).map((entry) => (
+              <div
+                key={entry.id}
+                className="kbot-mode-pack-picker__struggle-item"
+                data-testid={`studio-struggle-${entry.id}`}
+              >
+                <dt className="kbot-mode-pack-picker__struggle-title">
+                  {entry.title}
+                </dt>
+                <dd className="kbot-mode-pack-picker__struggle-text">
+                  {entry.struggle}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </div>
       ) : null}
     </div>
   );
