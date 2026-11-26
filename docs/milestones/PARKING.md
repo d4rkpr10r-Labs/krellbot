@@ -17,5 +17,5 @@ One line per item. Nothing here is work until the owner moves it into a mileston
 - Exchange-native free AI agent tooling parity race — spike only in M22.5; no cloud-key me-too product.
 - Multi-pack reservation / breaking one-pack-per-(venue,pair) before independent qualification (still true post-M16).
 - Learn top-nav / Learn view (Signal artboard) — still do not invent in cockpit.
-- `run._recognized_open_qty` counts an open order's requested qty as owned and sums every matching entry/stop order; it is not proof of executed inventory.
 - `run.tick(home=X)` appends the journal under `$KRELLBOT_HOME` but reads ownership from `X/journal`; harmless while both are the same directory.
+- Paper taker-fee tables exist in four copies (`venues/paper._fee_bps_for` and `run._fee_bps_for_venue`, both on risk paths, plus `application/paper._PAPER_TAKER_BPS` and `application/research._default_fee`). They agree on every listed venue but fall back differently for an unlisted one: `run` gives 0, `venues/paper` 120 (Coinbase's), `_PAPER_TAKER_BPS.get(venue, 40)` 40, and `_default_fee` 120 for any venue but Kraken.
