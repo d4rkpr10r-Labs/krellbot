@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import ipaddress
 import json
 import sys
 import time
@@ -508,6 +509,33 @@ def _gate_get(request: Request, s: _AppState) -> Response | None:
     if not session_id or session_id not in s.sessions:
         return JSONResponse({"detail": "session required"}, status_code=403)
     return None
+
+
+def _measured_bind(request: Request) -> str | None:
+    """Return the local address this request actually arrived on.
+
+    Read from the ASGI ``server`` tuple, which uvicorn fills from the
+    accepted socket's own address, so it is measured rather than the
+    literal ``trust.bind``. Behind Tailscale Serve it is still the
+    loopback listener. Anything that is not an IP literal (a test
+    client's placeholder, a Unix socket path, no tuple) is ``None``.
+    """
+
+    server = request.scope.get("server")
+    if not server:
+        return None
+    try:
+        return str(ipaddress.ip_address(str(server[0])))
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def _remote_access_view(tailnet_access: TailnetAccess | None) -> dict[str, object]:
+    """Describe opt-in Tailscale Serve access; never the owner login."""
+
+    if tailnet_access is None:
+        return {"mode": "off", "origin": None}
+    return {"mode": "tailscale_serve", "origin": tailnet_access.origin}
 
 
 def _paper_details_decimal(value: object) -> str | None:
@@ -2448,6 +2476,10 @@ def create_app(
         ``PAPER_ONLY_RELEASE`` is active, ``live_ready`` is always False
         even when a live grant file exists — paper-only release and live
         grant are distinct states.
+
+        ``trust.bind`` stays the literal ``127.0.0.1``. ``bind_measured``
+        is the local address this request arrived on, and
+        ``remote_access`` says whether Tailscale Serve access is on.
         """
 
         s = _state(request.app)
@@ -2476,6 +2508,8 @@ def create_app(
             "trade_only_required": True,
             "license_required_for_exchange": False,
             "keys_leave_machine": False,
+            "bind_measured": _measured_bind(request),
+            "remote_access": _remote_access_view(tailnet_access),
         }
         return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
 
