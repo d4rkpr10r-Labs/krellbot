@@ -793,6 +793,9 @@ def _match_userref(payload: Any, bucket: str, coid: str, userref: int, *, own_on
     the coid's ``userref``. With ``own_only``, a userref row counts only when
     nothing says it is another order: no other ``cl_ord_id`` and no ``refid``
     (an order created by another one, such as an entry's conditional close).
+    Without it (the resend guard), a row ``_open_order`` cannot read is
+    skipped and the scan goes on, so a readable listed order still blocks a
+    second send.
     """
     book = _result(payload).get(bucket)
     if not isinstance(book, dict):
@@ -800,6 +803,8 @@ def _match_userref(payload: Any, bucket: str, coid: str, userref: int, *, own_on
     by_userref: tuple[str, dict] | None = None
     for order_id, raw in book.items():
         if not isinstance(raw, dict):
+            continue
+        if not own_only and _open_order(str(order_id), raw) is None:
             continue
         stored = str(raw.get("cl_ord_id") or "")
         if stored == coid:

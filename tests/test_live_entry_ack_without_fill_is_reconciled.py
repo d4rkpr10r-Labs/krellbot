@@ -382,3 +382,40 @@ def test_kraken_entry_it_already_holds_reports_executed_not_requested_volume(
     assert ref.id == order_id
     assert ref.filled_qty == Decimal(filled)
     assert _add_orders(transport) == []
+
+
+def _unreadable(**kw) -> dict:
+    """A listed order on the coid's userref whose requested volume cannot be read."""
+    return order_info(vol="", vol_exec="0", status="open", pair=PAIR, userref=_REF, **kw)
+
+
+@pytest.mark.parametrize(
+    ("open_rows", "closed_rows", "order_id", "filled"),
+    [
+        (
+            {
+                "UNREADABLE": _unreadable(),
+                "READABLE": order_info(vol="1.25", vol_exec="0", status="open", pair=PAIR, userref=_REF),
+            },
+            {},
+            "READABLE",
+            "0",
+        ),
+        (
+            {"UNREADABLE": _unreadable(cl_ord_id=_COID)},
+            {"OWN": order_info(vol="1.25", vol_exec="1.25", status="closed", pair=PAIR, cl_ord_id=_COID, userref=_REF)},
+            "OWN",
+            "1.25",
+        ),
+    ],
+    ids=["readable-row-after-an-unreadable-one", "readable-closed-order-after-an-unreadable-open-one"],
+)
+def test_kraken_resend_guard_skips_unreadable_rows_and_keeps_scanning(home, open_rows, closed_rows, order_id, filled):
+    transport = FakeKrakenTransport()
+    transport.set_order_books(open_rows=open_rows, closed_rows=closed_rows)
+
+    ref = _venue(home, transport).place_entry_with_stop(_COID, Decimal("1.25"), Decimal(6), pair=PAIR)
+
+    assert _add_orders(transport) == []  # an order on the coid's userref is listed: never send again
+    assert ref.id == order_id
+    assert ref.filled_qty == Decimal(filled)
