@@ -3,6 +3,7 @@ import { getCsrf } from "../../session";
 export type LiveStatus = {
   schema_version: string;
   live_enabled: boolean;
+  release_policy?: string;
   authorized: ReadonlyArray<{ venue: string; pair: string }>;
   kill_switch: { engaged: boolean; reason: string | null; engaged_at: number | null };
   promotion_available: boolean;
@@ -141,6 +142,7 @@ function adaptLive(raw: unknown): LiveStatus {
   return {
     schema_version: typeof obj.schema_version === "string" ? obj.schema_version : "1",
     live_enabled: obj.live_enabled === true,
+    ...(typeof obj.release_policy === "string" ? { release_policy: obj.release_policy } : {}),
     authorized,
     kill_switch: adaptKill(obj.kill_switch),
     promotion_available: obj.promotion_available === true,

@@ -333,8 +333,8 @@ export function SavedStrategyLibrary({
             Saved strategy library
           </h2>
           <p className="kbot-strategy-library__intro">
-            Revisions saved in this local workspace. Reopen and Copy as new
-            stay read-only until you explicitly save from the editor.
+            Reopen a revision to edit its rules. Copy as new starts a separate
+            draft. Save in the editor to keep your changes.
           </p>
         </div>
         {onNewStrategy ? (

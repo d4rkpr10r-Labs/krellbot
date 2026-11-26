@@ -176,9 +176,10 @@ export function OwnedStrategyForm({
       >
         <h3 className="kbot-owned-strategy-form__title">Owned strategy</h3>
         <p className="kbot-owned-strategy-form__hint">
-          A supported subset of the pack DSL: close versus one moving average, or
-          a fast average crossing a slow average, plus a percentage protective
-          stop and one Kraken market. Advanced JSON stays available below.
+          Choose close versus one moving average or a two-average rule for one
+          Kraken market. For a fast average crossing a slow average, the rule
+          tests which average is higher on each bar. Set the protective stop
+          as a percentage.
         </p>
         <div className="kbot-owned-strategy-form__grid">
           <label

@@ -21,6 +21,7 @@ function live(over: Partial<LiveStatus> = {}): LiveStatus {
   return {
     schema_version: "1",
     live_enabled: false,
+    release_policy: "paper_only",
     authorized: [],
     kill_switch: { engaged: false, reason: null, engaged_at: null },
     promotion_available: false,
@@ -86,7 +87,7 @@ describe("StatusStrip — static-to-live contract (KRELL-SIGNAL-20261010)", () =
     );
   });
 
-  it("counts authorized venues and switches the mode label to Live", () => {
+  it("shows stored grants without switching a paper-only release to live", () => {
     render(
       <StatusStrip
         live={live({
@@ -98,9 +99,9 @@ describe("StatusStrip — static-to-live contract (KRELL-SIGNAL-20261010)", () =
       />,
     );
     expect(screen.getByTestId("live-orders-status").textContent).toContain(
-      "2 live venues authorized",
+      "2 stored market grants",
     );
-    expect(screen.getByLabelText("Mode Live").textContent).toBe("Live");
+    expect(screen.getByLabelText("Mode Paper").textContent).toBe("Paper");
   });
 
   it("shows the promotion affordance copy only when promotion is available", () => {
@@ -141,6 +142,7 @@ describe("StatusStrip — static-to-live contract (KRELL-SIGNAL-20261010)", () =
             live: {
               schema_version: "1",
               live_enabled: true,
+              release_policy: "paper_only",
               authorized: [{ venue: "kraken", pair: "BTC/USD" }],
               kill_switch: { engaged: true, reason: "manual_engaged", engaged_at: 1760000000 },
               promotion_available: false,
@@ -159,6 +161,6 @@ describe("StatusStrip — static-to-live contract (KRELL-SIGNAL-20261010)", () =
         "Kill switch: engaged — manual_engaged",
       );
     });
-    expect(screen.getByLabelText("Mode Live").textContent).toBe("Live");
+    expect(screen.getByLabelText("Mode Paper").textContent).toBe("Paper");
   });
 });

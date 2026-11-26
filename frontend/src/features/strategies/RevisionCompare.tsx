@@ -309,9 +309,8 @@ export function RevisionCompare({
         ) : null}
       </header>
       <p className="kbot-revision-compare__note" data-testid="revision-compare-note">
-        Read-only comparison: both revisions are fetched as stored and neither is
-        changed, validated, or armed. Values are shown exactly as saved; nothing
-        about performance is implied.
+        Compare the saved rules field by field. To compare how the revisions
+        traded, backtest both using the same candles, dates and costs.
       </p>
       <div className="kbot-revision-compare__picks">
         <label htmlFor="revision-compare-left">Earlier revision</label>

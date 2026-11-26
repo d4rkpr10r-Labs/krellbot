@@ -25,14 +25,14 @@ const HOME_CARDS: ReadonlyArray<HomeCard> = [
     view: "strategies",
     action: "Create or open a strategy",
     detail:
-      "Write or paste a strategy pack, save a draft, and reopen it from your library.",
+      "Start with an example or import your own rules. Save the draft, then validate it.",
     testid: "app-home-card-strategies",
   },
   {
     view: "research",
     action: "Explore research",
     detail:
-      "Run a backtest over your own dataset and read the recorded evidence.",
+      "Replay a strategy on your candle CSV and inspect the signal on each bar.",
     testid: "app-home-card-research",
   },
   {
@@ -46,7 +46,7 @@ const HOME_CARDS: ReadonlyArray<HomeCard> = [
     view: "workstation",
     action: "Paper workstation",
     detail:
-      "Check the paper engine status, last runs and stop controls.",
+      "See which packs are armed, review paper fills, or try the synthetic rehearsal.",
     testid: "app-home-card-workstation",
   },
   {
@@ -109,7 +109,7 @@ export function AppHome({
           </h1>
           <p className="app-home__purpose">
             Build, inspect and paper-test strategy packs on this machine.
-            Every view below is real navigation in this application.
+            Start in Strategies to try a moving-average example.
           </p>
         </div>
         <p
@@ -128,8 +128,7 @@ export function AppHome({
             data-testid="app-home-session"
             role="status"
           >
-            Starting the local session… areas that need it will load their own
-            data.
+            Starting the local session…
           </p>
         ) : null}
         {sessionFailed ? (
@@ -139,9 +138,8 @@ export function AppHome({
             role="alert"
           >
             <p className="app-home__note-copy">
-              The local session could not start. Areas that need it will show
-              their own errors, and nothing can be saved or changed until the
-              session recovers. Navigation still works offline.
+              The local session could not start. Check that the workstation is
+              running, then recover the session to load or save a strategy.
             </p>
             {onRecoverSession ? (
               <button
@@ -204,15 +202,12 @@ export function AppHome({
             Not connected yet
           </h2>
           <p className="app-home__note-copy">
-            No exchange is connected in this build and live trading is
-            unavailable. Nothing here places real orders, requests credentials,
-            or reports account state. Engine work is still in progress: when an
-            area cannot reach the local service it shows its own unavailable or
-            error state instead of example results.
+            No exchange credentials are needed for paper trading. Live orders
+            are unavailable in this release.
           </p>
           <p className="app-home__note-copy">
-            Navigation works without the engine: you can move between these
-            areas at any time.
+            Keep the workstation running while you save drafts, run backtests,
+            or check paper status.
           </p>
         </section>
       </div>

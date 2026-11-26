@@ -1,7 +1,7 @@
 [project]
 name = "krellbot"
 version = "0.9.8"
-description = "Open crypto automation. A local engine that runs strategy packs on your own exchange account."
+description = "Local crypto strategy workstation for backtesting and paper trading."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

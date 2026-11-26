@@ -1,6 +1,8 @@
 # Live trading
 
-## v0.9.6 is paper-only
+<a id="v096-is-paper-only"></a>
+
+## The public release is paper-only
 
 This release refuses every live order send regardless of environment,
 stored keys, authorization files, or live state armed before an upgrade.
@@ -10,12 +12,7 @@ reads either. Real-venue entry, exit, cancel, and stop-edit methods fail
 closed the same way. Paper trading and every read-only operation (status,
 snapshots, key permission checks) keep working.
 
-This is temporary, not a permanent removal. Live trading returns only
-through an owner-approved code/release change that sets
-`PAPER_ONLY_RELEASE = False` in `src/krellbot/release_policy.py`; there is
-no environment variable, config file, or UI switch for it.
-
-The rest of this document describes the dormant live implementation.
+For a simulated run, follow the [paper trading guide](https://krellbot.dev/docs/paper). The implementation notes below describe the dormant live path for engine contributors. Its commands cannot enable live trading in the public build.
 
 Live mode runs a pack against the real venue. The local engine still owns
 the lifecycle — licensing, locking, journaling, and stop placement — but

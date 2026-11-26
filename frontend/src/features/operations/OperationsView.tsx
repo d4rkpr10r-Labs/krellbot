@@ -14,10 +14,10 @@ import type { AlertRow, OperationsClient, OperationsViewModel } from "./client";
 import { summarizeAlertSeverity } from "./alertSeverityLabel";
 
 const DISABLED_BANNER =
-  "Live trading is disabled in this build (KRELLBOT_ENABLE_LIVE is not 1).";
+  "Live trading is disabled in this paper-only release.";
 const NO_GRANTS_BANNER =
-  "Live trading is not authorized: no operator grant on file.";
-const PROMO_DEFERRED_TEXT = "Promotion to live is owner-deferred.";
+  "No operator grant is on file.";
+const PROMO_DEFERRED_TEXT = "Changing settings or adding an operator grant cannot enable live orders.";
 const KILL_RELEASED_TEXT = "Kill switch: released";
 const KILL_HELPER =
   "Engaging stops new entries and all live sends. It does not sell or disarm.";
@@ -219,7 +219,7 @@ function renderLiveBanner(live: OperationsViewModel["live"]): JSX.Element {
   return (
     <p data-testid="ops-live-status">
       <span>
-        Live trading authorized for{" "}
+        Stored operator grants for{" "}
         {authorized.map((g: { venue: string; pair: string }) => `${g.venue} ${g.pair}`).join(", ")}.
       </span>
       <span> {PROMO_DEFERRED_TEXT}</span>

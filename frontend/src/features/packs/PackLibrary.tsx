@@ -294,11 +294,11 @@ export function PackLibrary({ client }: PackLibraryProps): JSX.Element {
           </p>
         ) : rows === null ? (
           <p className="kbot-pack-library__failed" data-testid="pack-library-failed">
-            Not loaded.
+            Pack list unavailable. Choose Refresh to try again.
           </p>
         ) : rows.length === 0 ? (
           <p className="kbot-pack-library__empty" data-testid="pack-library-empty">
-            No packs.
+            No packs in the local inventory. For saved drafts, open the library in Strategies.
           </p>
         ) : visibleRows.length === 0 ? (
           <p

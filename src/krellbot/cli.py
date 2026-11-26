@@ -1068,7 +1068,7 @@ class CandleFetchError(RuntimeError):
 
 
 LIVE_TICK_REFUSED = "live is off; set KRELLBOT_ENABLE_LIVE=1 to tick a live pack"
-PAPER_ONLY_TICK_REFUSED = "v0.9.6 is paper-only; live tick refused"
+PAPER_ONLY_TICK_REFUSED = "This is a paper-only release. The live tick was refused."
 
 
 def _default_fetch(venue: str, pair: str, tf: str, transport):
