@@ -79,6 +79,10 @@ FAILURE_MESSAGES: dict[str, str] = {
     "desktop_timeout": "The desktop notification command timed out.",
     "email_not_configured": "Email needs an SMTP host and a To address.",
     "smtp_unreachable": "Could not connect to the SMTP server.",
+    "smtp_tls_unavailable": (
+        "The SMTP server did not start TLS (STARTTLS), so Krellbot did not log in or send. "
+        "Use a server that supports STARTTLS."
+    ),
     "smtp_auth_failed": f"The SMTP server refused the login. Check {SMTP_PASSWORD_ENV}.",
     "smtp_rejected": "The SMTP server refused the sender, a recipient or the message.",
     "smtp_error": "The SMTP server returned an error.",
@@ -551,6 +555,9 @@ class EmailSmtpNotifier:
     """SMTP email. Password from ``KRELLBOT_SMTP_PASSWORD`` only.
 
     Raises :class:`NotificationFailed` when the message was not accepted.
+    Fails closed on TLS: when the server does not offer STARTTLS or STARTTLS
+    fails, it raises ``smtp_tls_unavailable`` before ``login``, so neither the
+    password nor the message crosses a plaintext session.
     """
 
     def __init__(self, email: dict[str, object], *, password: str | None = None) -> None:
@@ -581,11 +588,16 @@ class EmailSmtpNotifier:
         try:
             with smtplib.SMTP(host, port, timeout=10) as smtp:
                 smtp.ehlo()
+                # Fail closed: without TLS, never log in and never send.
+                # ``NotificationFailed`` is not caught below; ``from None``
+                # keeps the server's reply text out of the failure.
+                if not smtp.has_extn("starttls"):
+                    raise NotificationFailed("smtp_tls_unavailable")
                 try:
                     smtp.starttls()
-                    smtp.ehlo()
-                except smtplib.SMTPException:
-                    pass
+                except (smtplib.SMTPException, OSError):
+                    raise NotificationFailed("smtp_tls_unavailable") from None
+                smtp.ehlo()
                 if self._password:
                     smtp.login(from_addr, self._password)
                 smtp.send_message(msg)
