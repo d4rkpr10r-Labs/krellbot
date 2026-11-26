@@ -52,6 +52,7 @@ from krellbot.application.live_preflight import evaluate as live_preflight_evalu
 from krellbot.application.paper import (
     project_forward_paper_ledger,
     project_owned_position,
+    project_paper_assumptions,
     project_paper_pnl_position_chart,
     project_portfolio_history,
 )
@@ -3738,6 +3739,34 @@ def create_app(
             },
             headers={"Cache-Control": "no-store"},
         )
+
+    @app.get("/api/v1/paper/assumptions")
+    async def paper_assumptions(request: Request) -> Response:
+        """What a paper run on one venue assumes, as the paper engine uses it.
+
+        Same session gate as ``GET /api/v1/paper/status`` (``_gate_get``):
+        session cookie + loopback Origin + loopback Host, no CSRF. ``venue``
+        is required. The body gives that venue's taker fee and the paper
+        slippage, with the research fee-model label. An optional ``pair``
+        adds the paper-mode armed record's timeframe, stop rule and starting
+        cash. A value the engine does not give is null. Read-only: never
+        constructs a venue, writes, or reaches the network.
+        """
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+
+        venue = (request.query_params.get("venue") or "").strip()
+        if not venue:
+            return JSONResponse(
+                {"detail": "venue required"},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        pair = (request.query_params.get("pair") or "").strip() or None
+        body = project_paper_assumptions(s.home, venue=venue, pair=pair)
+        return JSONResponse(body, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/v1/paper/position")
     async def paper_position(request: Request) -> Response:
