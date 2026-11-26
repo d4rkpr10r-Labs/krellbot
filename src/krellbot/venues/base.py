@@ -227,6 +227,29 @@ class ProtectiveStopRejectedError(RuntimeError):
     """The venue filled an entry and refused the protective stop."""
 
 
+# Codes from the adapters' ``classify_documented_response`` that mean the
+# venue refused an order outright, so nothing executed.
+VENUE_REFUSAL_CODES = frozenset({"insufficient_funds", "order_minimum_not_met", "invalid_nonce"})
+
+
+class VenueRejectedError(RuntimeError):
+    """The venue's documented response refused the order: nothing executed.
+
+    ``code`` is one of ``VENUE_REFUSAL_CODES``. The message names only the
+    venue and the code, never the venue's own text. A response that does not
+    prove a refusal (no response, a transport error, an unrecognized error,
+    an order accepted without fill evidence) is never this error, so its
+    outcome stays unknown.
+    """
+
+    def __init__(self, venue: str, code: str) -> None:
+        if code not in VENUE_REFUSAL_CODES:
+            raise ValueError("not a documented venue refusal code")
+        super().__init__(f"{venue} refused the order: {code}")
+        self.venue = venue
+        self.code = code
+
+
 class WithdrawCapableError(RuntimeError):
     """Raised when `check_key` finds the key can withdraw. Engine refuses it.
 

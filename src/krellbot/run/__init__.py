@@ -59,7 +59,7 @@ from krellbot.storage.outbox import (
     audited_coids,
     dispatched_coids,
 )
-from krellbot.venues.base import OrderOutcome, OrderRef, PairRules, ProtectiveStopRejectedError
+from krellbot.venues.base import OrderOutcome, OrderRef, PairRules, ProtectiveStopRejectedError, VenueRejectedError
 from krellbot.venues.paper import SLIPPAGE_BPS
 
 from .lock import TickLock
@@ -640,6 +640,8 @@ def tick(
                 None,
             )
 
+            # Intents the venue's documented response refused, as (coid, code).
+            venue_refusals: list[tuple[str, str]] = []
             ensure_stop_failed = False
             ensure_stop_entry = ""
             if owned > Decimal(0) and resting is None and latest is not None:
@@ -683,7 +685,9 @@ def tick(
                     any_refused = True
                     print(f"intent refused: {exc.code}", flush=True)
                     ensure_stop_failed = True
-                except (AttributeError, RuntimeError, ValueError):
+                except (AttributeError, RuntimeError, ValueError) as exc:
+                    if isinstance(exc, VenueRejectedError):
+                        pack_intent_refused[armed.pack_id] = _venue_refused(exc, stop_coid, venue_refusals)
                     ensure_stop_failed = True
                     print("ensure_stop failed: stop", flush=True)
                     exit_coid = coid_for(
@@ -721,6 +725,8 @@ def tick(
                         pack_intent_refused[armed.pack_id] = exc.code
                         any_refused = True
                         print(f"intent refused: {exc.code}", flush=True)
+                    except VenueRejectedError as exc:
+                        pack_intent_refused[armed.pack_id] = _venue_refused(exc, exit_coid, venue_refusals)
                     except (AttributeError, RuntimeError, ValueError):
                         pass
                     owned = Decimal(0)
@@ -878,6 +884,10 @@ def tick(
                             except ProtectiveStopRejectedError:
                                 ensure_stop_failed = True
                                 print("entry protective stop rejected; reconciliation required", flush=True)
+                            except VenueRejectedError as exc:
+                                pack_intent_refused[armed.pack_id] = _venue_refused(
+                                    exc, entry_coid_for_signal, venue_refusals
+                                )
                             except (RuntimeError, ValueError):
                                 entry_qty = Decimal(0)
             elif target.reason == "exit" and owned > Decimal(0):
@@ -924,6 +934,8 @@ def tick(
                     pack_intent_refused[armed.pack_id] = exc.code
                     any_refused = True
                     print(f"intent refused: {exc.code}", flush=True)
+                except VenueRejectedError as exc:
+                    pack_intent_refused[armed.pack_id] = _venue_refused(exc, exit_coid, venue_refusals)
                 except (RuntimeError, ValueError):
                     pass
             elif target.long and owned > Decimal(0) and target.stop_price is not None:
@@ -961,6 +973,14 @@ def tick(
                     **trace_extra,
                 },
             )
+            # Journal first, then retire: an interruption in between keeps the
+            # hold instead of losing the refusal code. Nothing is resent.
+            for refused_coid, code in venue_refusals:
+                try:
+                    kb_obligations.record_rejection(OperationalStore(home / "ops.sqlite"), coid=refused_coid, code=code)
+                except StoreError as exc:
+                    any_refused = True  # the intent stays unresolved and keeps holding entries
+                    print(f"intent refused: {exc.code}", flush=True)
             if on_pack_completed is not None:
                 on_pack_completed(armed.pack_id, armed.pair)
 
@@ -1207,6 +1227,17 @@ def _protected_or_flat(home: Path, intent, *, venue: str, snap: Any) -> bool:
 def _fill_evidence(filled: Any) -> bool:
     """True when a venue acknowledgement reports a positive, finite Decimal fill."""
     return isinstance(filled, Decimal) and filled.is_finite() and filled > 0
+
+
+def _venue_refused(exc: VenueRejectedError, coid: str, refusals: list[tuple[str, str]]) -> str:
+    """Note that the venue's documented response refused ``coid``; return the code to journal.
+
+    The intent is resolved as not executed after the tick record carrying the
+    code is journaled. Only the classified code is kept, never venue text.
+    """
+    refusals.append((coid, exc.code))
+    print(f"venue refused: {exc.code}", flush=True)
+    return exc.code
 
 
 def _intent_identity(armed: kb_config.ArmedPack, bar_ts: int) -> dict:

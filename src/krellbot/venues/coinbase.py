@@ -36,6 +36,7 @@ from krellbot.venues.base import (
     PairRules,
     ProtectiveStopRejectedError,
     Truth,
+    VenueRejectedError,
     WithdrawCapableError,
 )
 
@@ -409,6 +410,9 @@ class CoinbaseVenue:
         )
         filled_qty = _entry_filled_qty(entry, requested=lot)
         if filled_qty is None:
+            code = _documented_refusal(entry)
+            if code is not None:
+                raise VenueRejectedError("coinbase", code)
             raise RuntimeError("coinbase entry was not filled; stop not placed")
 
         stop_body = {
@@ -460,6 +464,9 @@ class CoinbaseVenue:
             },
         )
         if not _order_ok(resp):
+            code = _documented_refusal(resp)
+            if code is not None:
+                raise VenueRejectedError("coinbase", code)
             raise RuntimeError("coinbase exit was not accepted")
         return OrderRef(
             id=_extract_order_id(resp),
@@ -678,6 +685,31 @@ def _entry_filled_qty(resp: Any, *, requested: Decimal) -> Decimal | None:
     if filled is None or not filled.is_finite() or not Decimal(0) < filled <= requested:
         return None
     return filled
+
+
+# Documented create-order failures that prove Coinbase refused the order.
+_ORDER_REFUSALS = frozenset(
+    {CoinbaseDocumentedOutcome.INSUFFICIENT_FUNDS, CoinbaseDocumentedOutcome.ORDER_MINIMUM_NOT_MET}
+)
+
+
+def _documented_refusal(resp: Any) -> str | None:
+    """The refusal code when ``resp`` is a documented create-order failure.
+
+    Only ``success: false`` with an ``error_response`` that
+    ``classify_documented_response`` maps to a refusal counts. No response, a
+    request-level error (authentication, rate limit), an unrecognized failure
+    or an accepted order proves nothing about execution: ``None``.
+    """
+    if not isinstance(resp, dict) or resp.get("success") is not False:
+        return None
+    if not isinstance(resp.get("error_response"), dict):
+        return None
+    try:
+        code = classify_documented_response(resp)
+    except (TypeError, ValueError):
+        return None
+    return code if code in _ORDER_REFUSALS else None
 
 
 def _order_ok(resp: Any) -> bool:
