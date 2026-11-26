@@ -25,3 +25,27 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+.kbot-diagnostic-report__operations {
+  display: grid;
+  gap: 0.75rem;
+  min-width: 0;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--line);
+}
+
+.kbot-diagnostic-report h4,
+.kbot-diagnostic-report dl,
+.kbot-diagnostic-report dd {
+  margin: 0;
+}
+
+.kbot-diagnostic-report__summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
+}
+
+.kbot-diagnostic-report__summary dt {
+  color: var(--muted);
+}

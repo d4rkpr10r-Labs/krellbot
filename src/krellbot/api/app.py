@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import ipaddress
 import json
+import re
 import sys
 import time
 import urllib.error
@@ -21,6 +23,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from krellbot import config as kb_config
 from krellbot import release_policy
 from krellbot.api.jobs import (
+    JOB_ERROR_COSTS_UNAVAILABLE,
     JOB_ERROR_FILLS_UNAVAILABLE,
     JOB_ERROR_NOT_FOUND,
     JOB_ERROR_RESULT_UNAVAILABLE,
@@ -509,6 +512,33 @@ def _gate_get(request: Request, s: _AppState) -> Response | None:
     return None
 
 
+def _measured_bind(request: Request) -> str | None:
+    """Return the local address this request actually arrived on.
+
+    Read from the ASGI ``server`` tuple, which uvicorn fills from the
+    accepted socket's own address, so it is measured rather than the
+    literal ``trust.bind``. Behind Tailscale Serve it is still the
+    loopback listener. Anything that is not an IP literal (a test
+    client's placeholder, a Unix socket path, no tuple) is ``None``.
+    """
+
+    server = request.scope.get("server")
+    if not server:
+        return None
+    try:
+        return str(ipaddress.ip_address(str(server[0])))
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def _remote_access_view(tailnet_access: TailnetAccess | None) -> dict[str, object]:
+    """Describe opt-in Tailscale Serve access; never the owner login."""
+
+    if tailnet_access is None:
+        return {"mode": "off", "origin": None}
+    return {"mode": "tailscale_serve", "origin": tailnet_access.origin}
+
+
 def _paper_details_decimal(value: object) -> str | None:
     """Render a finite Decimal without exponent, padding, or precision loss."""
     if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
@@ -629,6 +659,177 @@ def _tick_refusal_code(record: dict) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
+
+
+# ---- diagnostic Operations section (M28.15) --------------------------------
+
+_DIAGNOSTIC_STORE_CODES = frozenset({"store_error", "store_busy", "store_corrupt", "store_full"})
+
+# The closed alert vocabulary of the diagnostic Operations section. Each kind
+# maps to the codes it may export; any other code exports as "other". ``None``
+# marks a kind whose code is an identifier or free text (a client order id, a
+# scheduler error message), so its code is never exported. ``live_refused`` is
+# left out on purpose: live events stay out until a privacy review (D20).
+_DIAGNOSTIC_ALERT_CODES: dict[str, frozenset[str] | None] = {
+    "kill_switch": frozenset({"kill_switch_engaged"}),
+    "restore_fence": frozenset({"restore_fence_engaged"}),
+    "store_fault": _DIAGNOSTIC_STORE_CODES,
+    "store_refused": _DIAGNOSTIC_STORE_CODES,
+    "intent_refused": _DIAGNOSTIC_STORE_CODES | {"ownership_ambiguous"},
+    "metadata_refusal": frozenset(
+        {"metadata_unavailable", "metadata_stale", "metadata_symbol_mismatch", "metadata_invalid", "minimum_not_met"}
+    ),
+    "scheduler_stale": frozenset({"tick_stale"}),
+    "feed_stale": frozenset({"candle_stale"}),
+    "needs_reconcile": None,
+    "unresolved_order_aging": None,
+    "tick_failure": None,
+}
+_DIAGNOSTIC_ALERT_ID = re.compile(r"[0-9a-f]{16}")
+_DIAGNOSTIC_PAIR = re.compile(r"[A-Z0-9-]{3,24}")
+_DIAGNOSTIC_PACK_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+_DIAGNOSTIC_PACK_VERSION = re.compile(r"[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}")
+_DIAGNOSTIC_ROW_LIMIT = 100
+_UNAVAILABLE = "unavailable"
+
+
+def _diagnostic_paper_scope(
+    armed: list[kb_config.ArmedPack], records: list[dict]
+) -> tuple[set[str], set[tuple[str, str]]]:
+    """Return the venues with a paper arm and the feeds with paper-only evidence.
+
+    A feed (venue, pair) is paper-only when a paper arm or a paper tick names
+    it and no other arm or tick does. Ticks without a mode prove nothing.
+    """
+
+    paper_feeds = {(record.venue, record.pair) for record in armed if record.mode == "paper"}
+    other_feeds = {(record.venue, record.pair) for record in armed if record.mode != "paper"}
+    for record in records:
+        venue = record.get("venue")
+        detail = record.get("detail")
+        if record.get("kind") != "tick" or not isinstance(venue, str) or not isinstance(detail, dict):
+            continue
+        pair = detail.get("pair")
+        mode = detail.get("mode")
+        if not isinstance(pair, str) or mode is None:
+            continue
+        (paper_feeds if mode == "paper" else other_feeds).add((venue, pair))
+    paper_venues = {record.venue for record in armed if record.mode == "paper"}
+    return paper_venues, paper_feeds - other_feeds
+
+
+def _diagnostic_alerts(home: Path, *, now: int, armed: list[kb_config.ArmedPack] | None) -> list[dict] | str:
+    """Project current alerts onto the closed diagnostic alert row.
+
+    An alert tied to a feed or venue is kept only when that feed has
+    paper-only evidence or the venue has a paper arm; without a readable
+    config no such alert is kept.
+    """
+
+    from krellbot import secrets as kb_secrets
+
+    try:
+        collected = alerts_app.collect(home, now=now)
+    except Exception:  # noqa: BLE001 — diagnostics must survive an unreadable source.
+        return _UNAVAILABLE
+    paper_venues, paper_feeds = _diagnostic_paper_scope(armed or [], _read_journal_records(home))
+    rows: list[dict] = []
+    for alert in collected:
+        if alert.kind not in _DIAGNOSTIC_ALERT_CODES:
+            continue
+        if alert.pair is not None or alert.venue is not None:
+            if armed is None or alert.venue not in kb_secrets.VENUES:
+                continue
+            if alert.pair is not None and (alert.venue, alert.pair) not in paper_feeds:
+                continue
+            if alert.pair is None and alert.venue not in paper_venues:
+                continue
+        if not isinstance(alert.id, str) or _DIAGNOSTIC_ALERT_ID.fullmatch(alert.id) is None:
+            continue
+        if alert.severity not in {"critical", "warning"}:
+            continue
+        numbers = (alert.count, alert.first_ts, alert.last_ts)
+        if any(type(value) is not int or value < 0 for value in numbers):
+            continue
+        allowed = _DIAGNOSTIC_ALERT_CODES[alert.kind]
+        if allowed is None or not alert.code:
+            code = None
+        else:
+            code = alert.code if alert.code in allowed else "other"
+        rows.append(
+            {
+                "id": alert.id,
+                "kind": alert.kind,
+                "severity": alert.severity,
+                "code": code,
+                "count": alert.count,
+                "first_ts": alert.first_ts,
+                "last_ts": alert.last_ts,
+            }
+        )
+    return rows[:_DIAGNOSTIC_ROW_LIMIT]
+
+
+def _diagnostic_unresolved_orders(home: Path, *, now: int) -> dict | str:
+    """Return how many orders await reconcile and their ages, oldest first."""
+
+    try:
+        rows = operations_view_app.list_unresolved_orders(home, now=now)
+    except Exception:  # noqa: BLE001 — a store failure reads "unavailable", never its text.
+        return _UNAVAILABLE
+    ages = []
+    for row in rows:
+        age = row.get("age_seconds")
+        ages.append(age if type(age) is int and age >= 0 else None)
+    return {"count": len(rows), "ages_seconds": ages[:_DIAGNOSTIC_ROW_LIMIT]}
+
+
+def _diagnostic_paper_runs(armed: list[kb_config.ArmedPack] | None) -> list[dict] | str:
+    """Return pack id, version and mode of every paper arm, per venue and pair."""
+
+    from krellbot import secrets as kb_secrets
+
+    if armed is None:
+        return _UNAVAILABLE
+    rows = []
+    for record in armed:
+        if record.mode != "paper" or record.venue not in kb_secrets.VENUES:
+            continue
+        if _DIAGNOSTIC_PAIR.fullmatch(record.pair) is None:
+            continue
+        rows.append(
+            {
+                "venue": record.venue,
+                "pair": record.pair,
+                "pack_id": record.pack_id if _DIAGNOSTIC_PACK_ID.fullmatch(record.pack_id) else None,
+                "pack_version": record.pack_version
+                if _DIAGNOSTIC_PACK_VERSION.fullmatch(record.pack_version)
+                else None,
+                "mode": "paper",
+            }
+        )
+    rows.sort(key=lambda row: (row["venue"], row["pair"]))
+    return rows[:_DIAGNOSTIC_ROW_LIMIT]
+
+
+def _diagnostic_operations_section(home: Path, *, now: int) -> dict:
+    """Build the allowlisted Operations section of a diagnostic report.
+
+    Only named fields with closed value sets are copied: no keys, balances,
+    quantities, paths, client order ids, free text or live events. Each part
+    that cannot be read is the string ``"unavailable"``.
+    """
+
+    try:
+        armed: list[kb_config.ArmedPack] | None = kb_config.load_config(home).armed
+    except Exception:  # noqa: BLE001 — an unreadable config reads "unavailable".
+        armed = None
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "alerts": _diagnostic_alerts(home, now=now, armed=armed),
+        "unresolved_orders": _diagnostic_unresolved_orders(home, now=now),
+        "paper_runs": _diagnostic_paper_runs(armed),
+    }
 
 
 def _paper_state_fills(home: Path, venue: str) -> list[dict]:
@@ -1016,6 +1217,136 @@ def _fleet_freshness_view(home: Path) -> dict:
             }
         )
     return {"schema_version": SCHEMA_VERSION, "feeds": feeds}
+
+
+# Settings 'Trust & billing' copy for ``GET /api/v1/entitlements`` (M28.14,
+# decision D10). Each key states what the code enforces today and is checked
+# against it in tests/test_entitlement_disclosure_matches_gate.py: the tick
+# gate (``license.entries_allowed`` on armed records whose
+# ``requires_license`` came from ``catalog.requires_license_for``), the
+# paid-install check (``checkout.has_entitlement``), and the export and
+# diagnostics routes, which never read the license. No price or plan is named
+# here until the owner decides one (M28.34).
+_ENTITLEMENT_RULES: tuple[tuple[str, str, str], ...] = (
+    (
+        "paid_catalogue_entries_need_license",
+        "gated",
+        (
+            "In the tick, the license decides one thing: whether packs installed from the paid catalogue "
+            "(packs/catalog/) may open new positions."
+        ),
+    ),
+    (
+        "grace_keeps_entries",
+        "gated",
+        (
+            "While the license is active or past due, those packs keep opening positions until the grace date "
+            "last verified on this computer. The tick does not go online to check."
+        ),
+    ),
+    (
+        "after_grace_entries_stop",
+        "gated",
+        (
+            "After that grace date, or if the license has any other status or was never verified on this "
+            "computer, paid catalogue packs open no new positions."
+        ),
+    ),
+    (
+        "exits_and_stops_continue",
+        "continues",
+        "Exits and protective stops keep running for every pack, paid catalogue packs included.",
+    ),
+    (
+        "nothing_force_closed",
+        "continues",
+        (
+            "A lapse never closes a position. Positions are sold only by the pack's exit rule or its stop "
+            "protection, as before the lapse."
+        ),
+    ),
+    (
+        "export_continues",
+        "continues",
+        "Export does not read the license. Home export and the journal keep working after a lapse.",
+    ),
+    (
+        "diagnostics_continue",
+        "continues",
+        "Diagnostics do not read the license. The diagnostic report keeps working after a lapse.",
+    ),
+    (
+        "own_and_community_packs_never_gated",
+        "never_gated",
+        "Packs you write and community packs never need a license. A lapse does not change how they run.",
+    ),
+    (
+        "paid_install_needs_sku_entitlement",
+        "records",
+        (
+            "Installing a paid catalogue entry from Packs needs its purchase recorded on this computer as a SKU "
+            "entitlement. Checkout records it; a refund removes it."
+        ),
+    ),
+    (
+        "records_can_disagree",
+        "records",
+        (
+            "The license status (new entries) and the SKU entitlements (paid installs) are separate records on "
+            "this computer and can disagree today. A refund removes the SKU entitlement but does not change the "
+            "license status."
+        ),
+    ),
+)
+
+# License cache statuses reported as-is; anything else reads ``other``.
+_LICENSE_STATUSES = frozenset({"active", "past_due", "lapsed", "dead", "revoked"})
+
+
+def _license_int(value: object) -> int | None:
+    """Parse a cache timestamp the way ``license.entries_allowed`` does, or None."""
+
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _entitlements_body(home: Path, *, now: int) -> dict:
+    """Read-only entitlement disclosure: license cache, SKU records, gated packs."""
+
+    from krellbot import catalog as kb_catalog
+    from krellbot import license as kb_license
+    from krellbot.application import checkout as kb_checkout
+
+    cache = kb_license.read_cache(home)
+    if cache is None:
+        status = "missing"
+    else:
+        raw_status = cache.get("status")
+        status = raw_status if isinstance(raw_status, str) and raw_status in _LICENSE_STATUSES else "other"
+    gated: list[str] = []
+    for root in (home / "packs", home / "packs" / "community", home / "packs" / "catalog"):
+        if not root.is_dir():
+            continue
+        for path in sorted(root.glob("*.json")):
+            if path.is_file() and kb_catalog.requires_license_for(path, home) and path.stem not in gated:
+                gated.append(path.stem)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "license": {
+            "status": status,
+            "period_end": None if cache is None else _license_int(cache.get("period_end")),
+            "grace_until": None if cache is None else _license_int(cache.get("grace_until")),
+            "paid_catalogue_entries_allowed": kb_license.entries_allowed(cache, now=int(now)),
+        },
+        "license_gated_packs": sorted(gated),
+        "sku_entitlements": kb_checkout.read_entitlements(home),
+        "records_can_disagree": True,
+        "rules": [{"key": key, "group": group, "text": text} for key, group, text in _ENTITLEMENT_RULES],
+    }
 
 
 def _format_sse(event_id: str, event_name: str, data_payload: dict) -> bytes:
@@ -1998,6 +2329,31 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.get("/api/v1/jobs/{job_id}/costs")
+    async def get_job_costs(request: Request, job_id: str) -> Response:
+        """Serve a succeeded research job's cost assumptions side-car.
+
+        Same session gate as the result route; the stored result and the
+        receipt are untouched. A job without a side-car (not succeeded, or
+        run before costs were recorded) is 404 ``costs_unavailable``.
+        """
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+
+        snap = s.jobs.get(job_id)
+        if snap is None:
+            return JSONResponse(
+                {"code": JOB_ERROR_NOT_FOUND, "message": "job not found"},
+                status_code=404,
+            )
+        costs = s.jobs.costs_for(job_id)
+        if costs is None:
+            return JSONResponse({"code": JOB_ERROR_COSTS_UNAVAILABLE}, status_code=404)
+        return JSONResponse(costs, status_code=200, headers={"Cache-Control": "no-store"})
+
     @app.get("/api/v1/events")
     async def events(request: Request) -> Response:
         s = _state(request.app)
@@ -2292,6 +2648,10 @@ def create_app(
         ``PAPER_ONLY_RELEASE`` is active, ``live_ready`` is always False
         even when a live grant file exists — paper-only release and live
         grant are distinct states.
+
+        ``trust.bind`` stays the literal ``127.0.0.1``. ``bind_measured``
+        is the local address this request arrived on, and
+        ``remote_access`` says whether Tailscale Serve access is on.
         """
 
         s = _state(request.app)
@@ -2320,7 +2680,30 @@ def create_app(
             "trade_only_required": True,
             "license_required_for_exchange": False,
             "keys_leave_machine": False,
+            "bind_measured": _measured_bind(request),
+            "remote_access": _remote_access_view(tailnet_access),
         }
+        return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/entitlements")
+    async def entitlements_get(request: Request) -> Response:
+        """Return what entitlements gate and what continues on lapse (M28.14).
+
+        Same session gate as ``GET /api/v1/trust`` (``_gate_get``): session
+        cookie + loopback Origin + loopback Host, no CSRF for the read.
+        Read-only: reads ``license.read_cache``, ``license.entries_allowed``,
+        ``catalog.requires_license_for`` and ``checkout.read_entitlements``,
+        never refreshes or writes either record, and names no price. The
+        license cache and the SKU entitlement records are reported side by
+        side because they are separate and can disagree.
+        """
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+
+        body = _entitlements_body(s.home, now=_app_now(s))
         return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/v1/demo-fixture")
@@ -3008,6 +3391,23 @@ def create_app(
             "events": events[-100:],
             "reproduction_steps": "",
         }
+        return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/diagnostics/operations")
+    async def diagnostic_operations(request: Request) -> Response:
+        """Return the allowlisted Operations section of a diagnostic report (M28.15).
+
+        Same session gate as ``GET /api/v1/diagnostics/report``
+        (``_gate_get``). Served on its own route so the report's six keys
+        stay unchanged; the web app offers it as a separate, optional
+        download. Read-only: it never acknowledges or notifies an alert.
+        """
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+        body = await asyncio.to_thread(_diagnostic_operations_section, s.home, now=_now_seconds())
         return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/v1/scheduler/install")
