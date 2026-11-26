@@ -1588,7 +1588,35 @@ def _exit_holds(view: kb_obligations.ObligationsView, identity: OwnershipIdentit
 
 
 def _recognized_open_qty(armed: kb_config.ArmedPack, venue: str, candles: list, orders: list) -> Decimal:
-    known = {
+    """What this identity's own resting protective stops show it holds.
+
+    The tick owns ``min(venue_base, max(journal, recognized))``, so a position
+    whose journal write was lost after its send can still be protected and
+    exited. An open order's requested quantity is not executed inventory: an
+    unfilled entry would count units never bought. Only a resting protective
+    stop counts, because the engine places one only for quantity it filled or
+    owns. Entries, exits and orders that cannot be attributed never count.
+
+    A protective stop of this identity is a sell order with a stop price on the
+    armed pair whose client order id is this identity's entry coid (PaperVenue
+    rests an entry's stop under it) or stop coid (a repaired stop) for a bar in
+    ``candles``. Those coids hash the pack, version, venue and pair, so another
+    strategy's, another venue's (KQ-01) and external orders never match. One
+    coid listed twice is one order, counted at its smaller quantity. The
+    identity holds one position at a time (an entry needs ``owned == 0``) and
+    each of its stops covers all of it, so the largest stop counts, never a sum.
+
+    Live arms count nothing. A live venue lists a resting order at its
+    requested quantity (Kraken ``vol``, Coinbase ``base_size``), and
+    ``OpenOrder`` carries no executed quantity, so a live stop that filled in
+    part still shows its full size after its fill was journaled. Kraken's
+    entry-attached stop has no ``cl_ord_id`` either. Live ownership comes from
+    the journal, which venue evidence keeps. PaperVenue fills a stop in full
+    and removes it, so a resting paper stop's quantity is what it still holds.
+    """
+    if armed.mode != "paper":
+        return Decimal(0)
+    stop_coids = {
         coid_for(
             pack_id=armed.pack_id,
             pack_version=armed.pack_version,
@@ -1600,14 +1628,21 @@ def _recognized_open_qty(armed: kb_config.ArmedPack, venue: str, candles: list, 
         for candle in candles
         for intent in ("entry", "stop")
     }
-    total = Decimal(0)
+    resting: dict[str, Decimal] = {}
     for order in orders:
         coid = getattr(order, "coid", None)
-        pair = getattr(order, "pair", None)
-        qty = getattr(order, "qty", None)
-        if coid in known and pair == armed.pair and qty is not None:
-            total += Decimal(str(qty))
-    return total
+        if coid not in stop_coids or getattr(order, "pair", None) != armed.pair:
+            continue
+        if getattr(order, "side", None) != "sell" or getattr(order, "stop_price", None) is None:
+            continue
+        try:
+            qty = Decimal(str(getattr(order, "qty", None)))
+        except (ArithmeticError, ValueError):
+            continue
+        if not qty.is_finite() or qty <= 0:
+            continue
+        resting[coid] = min(qty, resting.get(coid, qty))
+    return max(resting.values(), default=Decimal(0))
 
 
 def _stop_price(pack: dict, last_close: Decimal) -> Decimal:
