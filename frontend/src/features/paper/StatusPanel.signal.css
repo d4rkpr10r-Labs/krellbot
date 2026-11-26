@@ -222,8 +222,10 @@
     min-height: 44px;
   }
 
-  .kbot-paper-status__select,
-  .kbot-paper-status__input {
+  /* Specific enough to beat the shell's compact 34px field rule
+     (.kbot-shell input:not([type="checkbox"]):not([type="radio"])). */
+  .kbot-paper-status label.kbot-paper-status__field select.kbot-paper-status__select,
+  .kbot-paper-status label.kbot-paper-status__field input.kbot-paper-status__input {
     min-height: 44px;
   }
 
@@ -237,13 +239,25 @@
     min-height: 44px;
   }
 
+  /* One stacked column. A wrapping flex column would turn the field's
+     180px basis into height and push the full-width error into a second
+     column beside the panel, widening the page. */
   .kbot-paper-status__raise-stop {
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
     align-items: stretch;
   }
 
   .kbot-paper-status__raise-stop .kbot-paper-status__action {
     width: 100%;
+    min-height: 44px;
+  }
+
+  /* Run-health links (scheduler review, diagnostic report) are whole
+     44px targets instead of a line-wrapped inline link. */
+  .kbot-paper-status__first-viewport > [role="status"] a[href] {
+    display: inline-flex;
+    align-items: center;
     min-height: 44px;
   }
 }

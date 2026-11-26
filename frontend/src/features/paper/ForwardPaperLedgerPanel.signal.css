@@ -138,3 +138,13 @@
   font-family: var(--font-mono, "IBM Plex Mono", ui-monospace, monospace);
   font-size: 11.5px;
 }
+
+/* Phone: Refresh and Retry are 44px touch targets. The event table keeps
+   scrolling inside its own panel. */
+@media (max-width: 640px) {
+  .kbot-paper-ledger .kbot-paper-ledger__refresh,
+  .kbot-paper-ledger .kbot-paper-ledger__error button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
