@@ -6,6 +6,7 @@ v1 API exposes at:
   * ``POST /api/v1/research/jobs``
   * ``GET  /api/v1/jobs/{id}``
   * ``POST /api/v1/jobs/{id}/cancel``
+  * ``GET  /api/v1/jobs/{id}/costs`` (side-car, see ``costs_for``)
   * ``GET  /api/v1/events``
 
 Jobs expose bounded execution and typed observable status.
@@ -22,6 +23,7 @@ import datetime as _dt
 import hashlib
 import json
 import math
+import re
 import secrets
 import threading
 from collections.abc import Callable
@@ -55,6 +57,14 @@ JOB_ERROR_JOB_FAILED = "job_failed"
 JOB_ERROR_MISSING_RESULT_REF = "missing_result_ref"
 JOB_ERROR_NOT_FOUND = "not_found"
 JOB_ERROR_RESULT_UNAVAILABLE = "result_unavailable"
+JOB_ERROR_COSTS_UNAVAILABLE = "costs_unavailable"
+
+# Research cost side-cars live beside, never inside, ``research-jobs/``:
+# ``_restore_jobs`` parses every ``*.json`` file there as a job record.
+COSTS_DIRNAME = "research-costs"
+# Job ids are ``secrets.token_urlsafe`` text; a side-car path is only ever
+# built from such an id, so a restored record cannot point outside the dir.
+_COSTS_JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 CODE_INVALID_DATASET = "invalid_dataset"
 CODE_NO_DATASET_AND_NO_FETCH = "no_dataset_and_no_fetch"
@@ -417,6 +427,27 @@ class JobManager:
         payload = {"job": internal.job.to_dict(), "result": internal.result}
         atomic_write(directory / f"{internal.id}.json", json.dumps(payload).encode("utf-8"))
 
+    def _costs_path(self, job_id: str) -> Path | None:
+        if _COSTS_JOB_ID.fullmatch(job_id) is None:
+            return None
+        return self._home / COSTS_DIRNAME / f"{job_id}.json"
+
+    def _persist_costs(self, internal: _InternalJob, costs: dict) -> None:
+        """Write the research costs side-car for a succeeded job.
+
+        The side-car is evidence beside the stored result, not part of it:
+        a failed write leaves the result untouched and the costs route
+        reports the costs unavailable.
+        """
+        path = self._costs_path(internal.id)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            atomic_write(path, json.dumps(costs).encode("utf-8"))
+        except (OSError, TypeError, ValueError):
+            return
+
     def _restore_jobs(self) -> None:
         records = []
         for path in (self._home / "research-jobs").glob("*.json"):
@@ -552,6 +583,28 @@ class JobManager:
             if internal is None:
                 return None
             return internal.result_snapshot()
+
+    def costs_for(self, job_id: str) -> dict | None:
+        """Return the research costs side-car for ``job_id`` or ``None``.
+
+        Only a known, succeeded job with a stored result has costs. The
+        path is built from the known job's own id, never from the caller's
+        text. Jobs that ran before costs were recorded, injected runners
+        that return none, and unreadable side-cars all read as ``None``.
+        """
+
+        with self._lock:
+            internal = self._jobs.get(job_id)
+            if internal is None or internal.job.state != JOB_STATE_SUCCEEDED or internal.result is None:
+                return None
+            path = self._costs_path(internal.id)
+        if path is None:
+            return None
+        try:
+            costs = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return costs if isinstance(costs, dict) else None
 
     def cancel(self, job_id: str) -> JobV1 | None:
         """Cancel ``job_id`` if known and not already terminal. Idempotent.
@@ -711,6 +764,11 @@ class JobManager:
                         # the runner's output. The result route reads
                         # this object verbatim.
                         internal.result = _extract_result(outcome)
+                        # Costs go to a side-car before the state flips, so
+                        # a reader that sees ``succeeded`` finds them.
+                        costs = outcome.get("costs")
+                        if isinstance(costs, dict):
+                            self._persist_costs(internal, costs)
                         self._finalize_state(internal, JOB_STATE_SUCCEEDED)
                     else:
                         self._finalize_failed(
@@ -847,7 +905,9 @@ class JobManager:
             kwargs["nodes"] = request_payload.get("nodes")
         request = ResearchRequest(**kwargs)
         service = ResearchService(home=self._home)
-        result = service.run(request)
+        # The nominal run is the stored result; the zero-cost and stressed
+        # reruns only complete the costs side-car.
+        result = service.run_with_cost_reruns(request)
         if not result.ok:
             refusal = result.refusal if isinstance(result.refusal, dict) else {}
             code = refusal.get("code") if isinstance(refusal.get("code"), str) else None
@@ -869,10 +929,15 @@ class JobManager:
         legacy_receipt = result.legacy_receipt if isinstance(result.legacy_receipt, dict) else {}
         receipt_bytes = canonical_receipt_bytes(legacy_receipt)
         receipt_digest = hashlib.sha256(receipt_bytes).hexdigest()
-        return {
+        outcome = {
             "ok": True,
             "result_ref": f"backtest:{correlation_id}:{job_id}",
             "legacy_receipt": legacy_receipt,
             "trace": trace,
             "receipt_canonical_sha256": receipt_digest,
         }
+        costs = getattr(result, "costs", None)
+        if isinstance(costs, dict):
+            # The side-car names the receipt it describes.
+            outcome["costs"] = {**costs, "receipt_canonical_sha256": receipt_digest}
+        return outcome

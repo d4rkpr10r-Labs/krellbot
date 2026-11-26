@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from krellbot import config as kb_config
 from krellbot import release_policy
 from krellbot.api.jobs import (
+    JOB_ERROR_COSTS_UNAVAILABLE,
     JOB_ERROR_NOT_FOUND,
     JOB_ERROR_RESULT_UNAVAILABLE,
     JOB_KIND_RESEARCH_BACKTEST,
@@ -1924,6 +1925,31 @@ def create_app(
                 status_code=404,
             )
         return JSONResponse(result, status_code=200)
+
+    @app.get("/api/v1/jobs/{job_id}/costs")
+    async def get_job_costs(request: Request, job_id: str) -> Response:
+        """Serve a succeeded research job's cost assumptions side-car.
+
+        Same session gate as the result route; the stored result and the
+        receipt are untouched. A job without a side-car (not succeeded, or
+        run before costs were recorded) is 404 ``costs_unavailable``.
+        """
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+
+        snap = s.jobs.get(job_id)
+        if snap is None:
+            return JSONResponse(
+                {"code": JOB_ERROR_NOT_FOUND, "message": "job not found"},
+                status_code=404,
+            )
+        costs = s.jobs.costs_for(job_id)
+        if costs is None:
+            return JSONResponse({"code": JOB_ERROR_COSTS_UNAVAILABLE}, status_code=404)
+        return JSONResponse(costs, status_code=200, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/v1/events")
     async def events(request: Request) -> Response:

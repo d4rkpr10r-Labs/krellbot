@@ -7,7 +7,13 @@ import {
   type ChangeEvent,
   type JSX,
 } from "react";
-import type { ResearchClient, StoredResult } from "./client";
+import {
+  RESEARCH_DEFAULT_SLIPPAGE_BPS,
+  RESEARCH_FEE_MODEL_LABEL,
+  type ResearchClient,
+  type ResearchCosts,
+  type StoredResult,
+} from "./client";
 import {
   EquityCurveChart,
   readEquityCurve,
@@ -49,6 +55,13 @@ type MetricCell = {
   source: string;
 };
 
+/** The costs side-car read for the result on screen, if any. */
+type CostsLoad =
+  | { status: "loading" }
+  | { status: "loaded"; costs: ResearchCosts }
+  | { status: "unavailable" }
+  | { status: "failed"; message: string };
+
 const TRACE_ROW_HEIGHT = 24;
 const TRACE_OVERSCAN_ROWS = 8;
 const TRACE_VIEWPORT_HEIGHT = 480;
@@ -65,6 +78,7 @@ const RESEARCH_EXPORT_RESULT_BUSY_LABEL = "Exporting result\u2026";
 const RESEARCH_RUN_BUSY_LABEL = "Running\u2026";
 const SUBMIT_FAILED_COPY =
   "Could not submit research run — check the workstation is running.";
+const SLIPPAGE_ERROR = "Slippage basis points must be a nonnegative integer";
 
 /**
  * KRELL-SIGNAL-20261010 research presentation. Every metric cell names the
@@ -300,6 +314,8 @@ export function ResearchView({
   const [datasetPath, setDatasetPath] = useState("");
   const [packPath, setPackPath] = useState("");
   const [feeBps, setFeeBps] = useState("");
+  // Blank keeps the engine default; the request then names no slippage.
+  const [slippageBps, setSlippageBps] = useState("");
   const [fromMs, setFromMs] = useState("");
   const [toMs, setToMs] = useState("");
   const [holdoutFrom, setHoldoutFrom] = useState("");
@@ -346,6 +362,17 @@ export function ResearchView({
   const [exportResultStatus, setExportResultStatus] = useState("");
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // Cost figures belong to the stored result on screen. Any change of that
+  // result (a new run, another job, a reload) drops them; a late read for
+  // a replaced result is ignored by its token.
+  const [costsLoad, setCostsLoad] = useState<
+    { token: object; load: CostsLoad } | null
+  >(null);
+  const [costsResult, setCostsResult] = useState<StoredResult | null>(null);
+  if (costsResult !== storedResult) {
+    setCostsResult(storedResult);
+    setCostsLoad(null);
+  }
 
   // Explicit Jobs selection replaces the visible result, not the saved
   // strategy or the form. Never submit a new run to reopen stored evidence.
@@ -427,6 +454,21 @@ export function ResearchView({
       setSubmitError("Fee basis points must be a nonnegative integer");
       return;
     }
+    // Optional: blank keeps the engine default; filled must be a
+    // nonnegative safe integer, never coerced or rounded.
+    let slippageBpsValue: number | null = null;
+    if (slippageBps.trim() !== "") {
+      const slippageField = parseRequiredIntegerField(slippageBps, SLIPPAGE_ERROR);
+      if (!slippageField.ok) {
+        setSubmitError(slippageField.error);
+        return;
+      }
+      if (slippageField.value < 0) {
+        setSubmitError(SLIPPAGE_ERROR);
+        return;
+      }
+      slippageBpsValue = slippageField.value;
+    }
     const fromField = parseRequiredIntegerField(
       fromMs,
       "From must be an integer timestamp",
@@ -505,6 +547,9 @@ export function ResearchView({
         fromMs: fromField.value,
         toMs: toField.value,
       };
+      if (slippageBpsValue !== null) {
+        request.slippageBps = slippageBpsValue;
+      }
       // F4 + W1: when a revision is selected, the request carries the
       // revision and never a non-empty packPath, even if the typed
       // packPath state still holds a stale value.
@@ -668,6 +713,29 @@ export function ResearchView({
     }
   };
 
+  const handleLoadCosts = async (): Promise<void> => {
+    // Every path that shows a stored result first pins jobIdRef to the job
+    // that produced it, and Cancel keeps it, so it names this result's job.
+    const id = jobIdRef.current;
+    const getCosts = client.getCosts;
+    if (storedResult === null || id === null || getCosts === undefined) {
+      return;
+    }
+    const token = {};
+    setCostsLoad({ token, load: { status: "loading" } });
+    let load: CostsLoad;
+    try {
+      const costs = await getCosts.call(client, id);
+      load = costs === null ? { status: "unavailable" } : { status: "loaded", costs };
+    } catch (err) {
+      load = {
+        status: "failed",
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+    setCostsLoad((prev) => (prev !== null && prev.token === token ? { token, load } : prev));
+  };
+
   const handleExport = async (): Promise<void> => {
     if (!jobId) {
       return;
@@ -715,6 +783,10 @@ export function ResearchView({
       : packPath;
   const inUseDataset = datasetPath.trim() === "" ? NOT_SET : datasetPath;
   const inUseFee = feeBps.trim() === "" ? NOT_SET : feeBps.trim();
+  const inUseSlippage =
+    slippageBps.trim() === ""
+      ? `default (${RESEARCH_DEFAULT_SLIPPAGE_BPS})`
+      : slippageBps.trim();
   const inUseWindow =
     fromMs.trim() === "" || toMs.trim() === ""
       ? NOT_SET
@@ -934,9 +1006,10 @@ export function ResearchView({
             Costs
           </h2>
           <p className="kbot-research__panel-note">
-            Set the fee on each buy and sell. For example, 40 basis points is
-              0.40% per side. The backtest also models 5 basis points of slippage
-              on each fill.
+            Set the taker fee charged on each buy and sell. For example, 40
+              basis points is 0.40% per side. Slippage moves each simulated fill
+              against the trade; leave it blank to use{" "}
+              {RESEARCH_DEFAULT_SLIPPAGE_BPS} basis points.
           </p>
           <label className="kbot-research__field" htmlFor="kbot-research-fee-bps">
             <span className="kbot-research__field-label">Fee basis points</span>
@@ -947,6 +1020,27 @@ export function ResearchView({
               value={feeBps}
               onChange={(event: ChangeEvent<HTMLInputElement>) =>
                 setFeeBps(event.target.value)
+              }
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </label>
+          <label
+            className="kbot-research__field"
+            htmlFor="kbot-research-slippage-bps"
+          >
+            <span className="kbot-research__field-label">
+              Slippage basis points
+            </span>
+            <input
+              id="kbot-research-slippage-bps"
+              className="kbot-research__input"
+              type="text"
+              inputMode="numeric"
+              value={slippageBps}
+              placeholder={String(RESEARCH_DEFAULT_SLIPPAGE_BPS)}
+              onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                setSlippageBps(event.target.value)
               }
               autoComplete="off"
               spellCheck={false}
@@ -988,6 +1082,15 @@ export function ResearchView({
           <span className="kbot-research__inuse-label">Fee (bps)</span>
           <span className="kbot-research__inuse-value" data-testid="research-inuse-fee">
             {inUseFee}
+          </span>
+        </div>
+        <div className="kbot-research__inuse-item">
+          <span className="kbot-research__inuse-label">Slippage (bps)</span>
+          <span
+            className="kbot-research__inuse-value"
+            data-testid="research-inuse-slippage"
+          >
+            {inUseSlippage}
           </span>
         </div>
       </div>
@@ -1122,6 +1225,11 @@ export function ResearchView({
           selectedBarTs={selectedBarTs}
           onSelectBar={setSelectedBarTs}
           selectedBar={selectedBar}
+          costs={costsLoad?.load ?? null}
+          canLoadCosts={client.getCosts !== undefined}
+          onLoadCosts={() => {
+            void handleLoadCosts();
+          }}
         />
       ) : null}
 
@@ -1205,6 +1313,9 @@ type ResultPanelProps = {
   selectedBarTs: string | null;
   onSelectBar: (barTs: string) => void;
   selectedBar: TraceBar | null;
+  costs: CostsLoad | null;
+  canLoadCosts: boolean;
+  onLoadCosts: () => void;
 };
 
 function ResultPanel({
@@ -1214,6 +1325,9 @@ function ResultPanel({
   selectedBarTs,
   onSelectBar,
   selectedBar,
+  costs,
+  canLoadCosts,
+  onLoadCosts,
 }: ResultPanelProps): JSX.Element {
   const metrics = buildMetricCells(receipt);
   const equitySeries = readEquityCurve(receipt);
@@ -1301,6 +1415,12 @@ function ResultPanel({
           </div>
         ))}
       </dl>
+      <CostsPanel
+        receipt={receipt}
+        load={costs}
+        canLoad={canLoadCosts}
+        onLoad={onLoadCosts}
+      />
       <EquityCurveChart series={equitySeries} />
       <PriceWithTradesChart series={priceSeries} markers={tradeMarkers} />
       <div className="kbot-research__trace" data-testid="research-trace">
@@ -1354,6 +1474,170 @@ function ResultPanel({
         ) : null}
       </div>
     </div>
+  );
+}
+
+const COSTS_NOTE =
+  "What this backtest charged on its fills, and the same run again with no " +
+  "fees or slippage and with twice both. Backtest reruns over the same data " +
+  "— not live trading costs.";
+const COSTS_LOADING_LABEL = "Loading cost figures…";
+
+/** Two-decimal display of exact Decimal text; never a fabricated zero. */
+function formatDecimalAmount(value: string | null): string {
+  if (value === null) {
+    return "unavailable";
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed.toFixed(2) : "unavailable";
+}
+
+function formatDecimalPercent(value: string | null): string {
+  const amount = formatDecimalAmount(value);
+  return amount === "unavailable" ? amount : `${amount}%`;
+}
+
+function buildCostFigureCells(costs: ResearchCosts): MetricCell[] {
+  const fills = `${costs.fill_count} fill${costs.fill_count === 1 ? "" : "s"}`;
+  const stressed = costs.stressed;
+  return [
+    {
+      label: "Total fees",
+      testId: "research-costs-total-fees",
+      value: formatDecimalAmount(costs.total_fees),
+      source: `costs.total_fees · quote currency, summed over ${fills}`,
+    },
+    {
+      label: "Return with these costs (%)",
+      testId: "research-costs-net-return",
+      value: formatDecimalPercent(costs.net_return_pct),
+      source: `costs.net_return_pct · percent, this run at ${costs.fee_bps} bps fee and ${costs.slippage_bps} bps slippage`,
+    },
+    {
+      label: "Return with no fees or slippage (%)",
+      testId: "research-costs-gross-return",
+      value: formatDecimalPercent(costs.gross_return_pct),
+      source: "costs.gross_return_pct · percent, rerun at 0 bps fee and 0 bps slippage",
+    },
+    {
+      label: `Return at ${stressed.factor}x fees and slippage (%)`,
+      testId: "research-costs-stressed-return",
+      value: formatDecimalPercent(stressed.return_pct),
+      source: `costs.stressed.return_pct · percent, rerun at ${stressed.fee_bps} bps fee and ${stressed.slippage_bps} bps slippage`,
+    },
+  ];
+}
+
+function renderMetricCell(metric: MetricCell): JSX.Element {
+  return (
+    <div
+      className={
+        "kbot-research__metric" +
+        (metric.value === "unavailable"
+          ? " kbot-research__metric--unavailable"
+          : "")
+      }
+      key={metric.testId}
+    >
+      <dt className="kbot-research__metric-label">{metric.label}</dt>
+      <dd className="kbot-research__metric-value" data-testid={metric.testId}>
+        {metric.value}
+      </dd>
+      <dd className="kbot-research__metric-source">{metric.source}</dd>
+    </div>
+  );
+}
+
+type CostsPanelProps = {
+  receipt: Record<string, unknown>;
+  load: CostsLoad | null;
+  canLoad: boolean;
+  onLoad: () => void;
+};
+
+/**
+ * Research cost assumptions (KRELL-SIGNAL-20261010). The fee model, fee and
+ * slippage the engine used are always shown; fee totals and the zero-cost
+ * and stressed reruns come from the job's costs side-car, read on request.
+ */
+function CostsPanel({
+  receipt,
+  load,
+  canLoad,
+  onLoad,
+}: CostsPanelProps): JSX.Element {
+  const assumptions: MetricCell[] = [
+    {
+      label: "Fee model",
+      testId: "research-costs-fee-model",
+      value:
+        load?.status === "loaded" ? load.costs.fee_model : RESEARCH_FEE_MODEL_LABEL,
+      source: "engine · the same fee on every buy and every sell",
+    },
+    {
+      label: "Fee (bps)",
+      testId: "research-costs-fee-bps",
+      value: formatMetric(receipt.fee_bps),
+      source: "receipt.fee_bps · basis points per side",
+    },
+    {
+      label: "Slippage (bps)",
+      testId: "research-costs-slippage-bps",
+      value: formatMetric(receipt.slippage_bps),
+      source: "receipt.slippage_bps · basis points against each fill",
+    },
+  ];
+  const figures =
+    load?.status === "loaded" ? buildCostFigureCells(load.costs) : [];
+  const showButton =
+    canLoad &&
+    (load === null || load.status === "loading" || load.status === "failed");
+  const unavailable = !canLoad || load?.status === "unavailable";
+  return (
+    <section
+      className="kbot-research__panel"
+      data-testid="research-costs"
+      aria-labelledby="kbot-research-costs-title"
+    >
+      <h2 className="kbot-research__panel-title" id="kbot-research-costs-title">
+        Costs
+      </h2>
+      <p className="kbot-research__panel-note">{COSTS_NOTE}</p>
+      <dl className="kbot-research__metrics">
+        {assumptions.map(renderMetricCell)}
+        {figures.map(renderMetricCell)}
+      </dl>
+      {load?.status === "failed" ? (
+        <p
+          className="kbot-research__error"
+          role="alert"
+          data-testid="research-costs-error"
+        >
+          Reading cost figures failed ({load.message}) — use Show cost figures
+          to retry
+        </p>
+      ) : null}
+      {unavailable ? (
+        <p
+          className="kbot-research__status"
+          data-testid="research-costs-unavailable"
+        >
+          Cost figures unavailable for this job.
+        </p>
+      ) : null}
+      {showButton ? (
+        <button
+          type="button"
+          className="kbot-research__action"
+          data-testid="research-costs-load"
+          aria-busy={load?.status === "loading"}
+          disabled={load?.status === "loading"}
+          onClick={onLoad}
+        >
+          {load?.status === "loading" ? COSTS_LOADING_LABEL : "Show cost figures"}
+        </button>
+      ) : null}
+    </section>
   );
 }
 

@@ -23,6 +23,11 @@ Strategy compatibility contracts:
   * The trace explains evaluator output, not venue execution or fill
     certainty. Warmup/unknown is a separate state from false and from
     numeric zero. Values only ever come from bars at or before `bar_ts`.
+  * A success also carries `costs`: the fee model, the fee and slippage in
+    force, the Decimal total of every fill fee and the run's exact return.
+    It lives beside `legacy_receipt` and `detail`, never inside them. `run`
+    constructs the backtester once; `run_with_cost_reruns` adds the return
+    of a zero-cost rerun and of a rerun at twice the fee and slippage.
 """
 
 from __future__ import annotations
@@ -31,11 +36,11 @@ import hashlib
 import json
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, DecimalException
 from pathlib import Path
 
-from krellbot.backtest.engine import Backtester
+from krellbot.backtest.engine import Backtester, BarRecord
 from krellbot.backtest.receipt import build_receipt
 from krellbot.data import TF_MS, GapError, check_gaps
 from krellbot.data.cache import _parse_csv, sha256_bytes
@@ -66,6 +71,17 @@ CODE_INVALID_NODES = "invalid_nodes"
 CODE_NUMERIC_OUT_OF_RANGE = "numeric_out_of_range"
 
 NUMERIC_OUT_OF_RANGE_MESSAGE = "backtest equity exceeded the supported numeric range (1e20)"
+
+COSTS_SCHEMA_VERSION = "1"
+# The engine charges the same taker fee on every buy and every sell fill.
+FEE_MODEL = "taker, per side"
+# The stressed rerun multiplies both fee_bps and slippage_bps by this.
+COST_STRESS_FACTOR = 2
+
+_ZERO = Decimal(0)
+_ONE = Decimal(1)
+_HUNDRED = Decimal(100)
+_TEN_THOUSAND = Decimal(10000)
 
 
 FetchFn = Callable[[str, str, str], list[Candle]]
@@ -110,6 +126,10 @@ class ResearchResult:
     legacy_receipt: dict | None
     detail: dict = field(default_factory=dict)
     refusal: dict | None = None
+    # Cost assumptions (see `cost_assumptions`), completed with the reruns by
+    # `run_with_cost_reruns`. ``None`` on a refusal. Never part of
+    # `legacy_receipt` or `detail`.
+    costs: dict | None = None
 
 
 class ResearchService:
@@ -403,7 +423,77 @@ class ResearchService:
             # never live market performance.
             "data_source": "pinned_csv" if request.dataset_csv is not None else "fetch",
         }
-        return ResearchResult(ok=True, legacy_receipt=receipt, detail=detail, refusal=None)
+        costs: dict | None
+        try:
+            costs = cost_assumptions(
+                records,
+                starting_cash=Decimal(request.starting_cash),
+                fee_bps=fee_bps,
+                slippage_bps=slippage_bps,
+                slippage_mult=slippage_mult,
+            )
+        except (DecimalException, OverflowError):
+            # The receipt already stands; costs are then reported unavailable.
+            costs = None
+        return ResearchResult(ok=True, legacy_receipt=receipt, detail=detail, refusal=None, costs=costs)
+
+    def run_with_cost_reruns(self, request: ResearchRequest) -> ResearchResult:
+        """Run ``request``, then rerun it with no costs and with stressed costs.
+
+        The returned result is the nominal run's, with ``costs`` completed by
+        ``gross_return_pct`` (0 bps fee, 0 bps slippage) and ``stressed``
+        (``COST_STRESS_FACTOR`` times the fee and the slippage, same
+        ``slippage_mult``). Each rerun is an ordinary ``run`` of the same
+        request over the same scored window, so signals and stop levels are
+        unchanged; only prices, fees and quantities differ. A rerun that
+        refuses reports its return as ``None``. A nominal refusal is
+        returned as is, with no reruns.
+        """
+
+        result = self.run(request)
+        if not result.ok or result.costs is None:
+            return result
+        fee_bps = int(result.costs["fee_bps"])
+        slippage_bps = int(result.costs["slippage_bps"])
+        stressed_fee_bps = fee_bps * COST_STRESS_FACTOR
+        stressed_slippage_bps = slippage_bps * COST_STRESS_FACTOR
+        gross = self.cost_rerun_return_pct(request, fee_bps=0, slippage_bps=0)
+        stressed = self.cost_rerun_return_pct(
+            request,
+            fee_bps=stressed_fee_bps,
+            slippage_bps=stressed_slippage_bps,
+        )
+        costs = {
+            **result.costs,
+            "gross_return_pct": _decimal_text(gross),
+            "stressed": {
+                "factor": COST_STRESS_FACTOR,
+                "fee_bps": stressed_fee_bps,
+                "slippage_bps": stressed_slippage_bps,
+                "slippage_mult": result.costs["slippage_mult"],
+                "return_pct": _decimal_text(stressed),
+            },
+        }
+        return replace(result, costs=costs)
+
+    def cost_rerun_return_pct(
+        self,
+        request: ResearchRequest,
+        *,
+        fee_bps: int,
+        slippage_bps: int,
+    ) -> Decimal | None:
+        """Rerun ``request`` at another fee and slippage; its exact return in percent.
+
+        ``None`` when the rerun refuses (for example it leaves the engine's
+        numeric range) or reports no return.
+        """
+
+        rerun = self.run(replace(request, fee_bps=int(fee_bps), slippage_bps=int(slippage_bps)))
+        if not rerun.ok or rerun.costs is None:
+            return None
+        net = rerun.costs.get("net_return_pct")
+        return Decimal(net) if isinstance(net, str) else None
 
     # ---- validation ------------------------------------------------------
 
@@ -511,6 +601,116 @@ class ResearchService:
         output, not venue execution or fill certainty.
         """
         return shared_decision_trace(pack, candles)
+
+
+# ---- costs ---------------------------------------------------------------
+
+
+def research_fills(
+    records: list[BarRecord],
+    *,
+    fee_bps: int,
+    slippage_bps: int,
+    slippage_mult: float,
+) -> list[dict]:
+    """Return every fill a backtest made, in bar order, keyed by ``bar_ts``.
+
+    ``BarRecord.fill`` holds one terminal fill per bar. When a fresh long is
+    stopped on the candle that filled it, that slot keeps only the stop and
+    drops the entry leg (``backtest/engine.py``). The entry leg is rebuilt
+    here with the engine's own arithmetic: price ``open * (1 + slip)``, the
+    stop's quantity (the stop sells the whole position), and a fee of
+    ``qty * price * fee_bps / 10000``. A stop can only find the book flat at
+    the start of its bar when the same bar opened the position.
+
+    Each fill is ``{bar_ts, side, price, qty, fee, is_stop}`` with Decimal
+    money fields. A zero-quantity buy (no budget) stays in the list with a
+    zero fee, exactly as the engine recorded it.
+    """
+
+    slip = (Decimal(int(slippage_bps)) / _TEN_THOUSAND) * Decimal(str(slippage_mult))
+    fee_rate = Decimal(int(fee_bps))
+    fills: list[dict] = []
+    qty_before = _ZERO
+    for record in records:
+        fill = record.fill
+        if fill is not None:
+            if fill["is_stop"] and qty_before == _ZERO:
+                price = record.open * (_ONE + slip)
+                qty = fill["qty"]
+                fills.append(
+                    {
+                        "bar_ts": record.ts_ms,
+                        "side": "buy",
+                        "price": price,
+                        "qty": qty,
+                        "fee": qty * price * fee_rate / _TEN_THOUSAND,
+                        "is_stop": False,
+                    }
+                )
+            fills.append(
+                {
+                    "bar_ts": record.ts_ms,
+                    "side": fill["side"],
+                    "price": fill["price"],
+                    "qty": fill["qty"],
+                    "fee": fill["fee"],
+                    "is_stop": fill["is_stop"],
+                }
+            )
+        qty_before = record.qty_after
+    return fills
+
+
+def cost_assumptions(
+    records: list[BarRecord],
+    *,
+    starting_cash: Decimal,
+    fee_bps: int,
+    slippage_bps: int,
+    slippage_mult: float,
+) -> dict:
+    """Build the nominal costs block for one completed backtest.
+
+    ``records`` are the run's bars. The block names the fee model, the fee
+    and slippage in force, the Decimal total of every fill fee (entry legs
+    included, see `research_fills`) and the run's exact return. Money and
+    returns are plain Decimal text (no exponent); counts and basis points
+    are ints. `ResearchService.run_with_cost_reruns` adds the zero-cost and
+    stressed reruns. These are backtest figures, not live trading costs.
+    """
+
+    fills = research_fills(
+        records,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        slippage_mult=slippage_mult,
+    )
+    total_fees = sum((fill["fee"] for fill in fills), _ZERO)
+    net = _return_pct(records[-1].equity, starting_cash) if records else None
+    return {
+        "schema_version": COSTS_SCHEMA_VERSION,
+        "basis": "backtest",
+        "fee_model": FEE_MODEL,
+        "fee_bps": int(fee_bps),
+        "slippage_bps": int(slippage_bps),
+        "slippage_mult": float(slippage_mult),
+        "starting_cash": _decimal_text(starting_cash),
+        "fill_count": sum(1 for fill in fills if fill["qty"] > _ZERO),
+        "total_fees": _decimal_text(total_fees),
+        "net_return_pct": _decimal_text(net),
+    }
+
+
+def _return_pct(final_equity: Decimal, starting_cash: Decimal) -> Decimal:
+    return (final_equity / starting_cash - _ONE) * _HUNDRED
+
+
+def _decimal_text(value: Decimal | None) -> str | None:
+    """Render a Decimal as plain fixed-point text, or ``None``."""
+    if value is None:
+        return None
+    return format(value, "f")
 
 
 def _candles_to_canonical_bytes(candles: list[Candle]) -> bytes:
