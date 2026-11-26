@@ -83,21 +83,30 @@ def test_untrusted_requests_cannot_read_the_shell_or_create_sessions(workstation
     assert request(workstation, "POST", "/login", headers=headers)[0] == 403
 
 
-def test_login_requires_same_origin_and_api_still_requires_session_and_csrf(workstation):
+def test_login_requires_same_origin_and_api_still_requires_session_and_csrf(workstation, tmp_path):
     assert request(workstation, "POST", "/login")[0] == 403
     assert request(workstation, path="/api/v1/session/csrf")[0] == 401
     cookie = login(workstation)
     authenticated = {"Cookie": cookie, "Origin": ORIGIN}
     assert request(workstation, "POST", "/api/v1/commands", headers=authenticated, payload={})[0] == 403
     _, _, body = request(workstation, path="/api/v1/session/csrf", headers=authenticated)
-    authenticated["X-Krellbot-CSRF"] = json.loads(body)["csrf_token"]
-    status, _, body = request(
-        workstation,
-        "POST",
-        "/api/v1/commands",
-        headers=authenticated,
-        payload={"command": "live.arm", "payload": {"mode": "live"}},
-    )
+    csrf = json.loads(body)["csrf_token"]
+    authenticated["X-Krellbot-CSRF"] = csrf
+    arm = {"command": "live.arm", "payload": {"mode": "live"}}
+    # D14: a tailnet session is read-only by default.
+    status, _, body = request(workstation, "POST", "/api/v1/commands", headers=authenticated, payload=arm)
+    assert status == 403
+    assert json.loads(body)["code"] == "remote_read_only"
+    # Under scope `full` (set only from a loopback session; stored in the home),
+    # CSRF is still required and live.arm reaches the paper-only refusal.
+    from krellbot.api.tailnet import write_remote_scope
+
+    write_remote_scope(tmp_path / "home", "full")
+    del authenticated["X-Krellbot-CSRF"]
+    status, _, body = request(workstation, "POST", "/api/v1/commands", headers=authenticated, payload=arm)
+    assert status == 403 and b"csrf required" in body
+    authenticated["X-Krellbot-CSRF"] = csrf
+    status, _, body = request(workstation, "POST", "/api/v1/commands", headers=authenticated, payload=arm)
     assert status == 403
     assert b"live_disabled_paper_only_release" in body or b"paper-only" in body
     assert (

@@ -22,6 +22,7 @@ import {
   createTrustHttpClient,
   type CredentialSource,
   type LiveWizardHonesty,
+  type RemoteScope,
   type TrustClient,
 } from "../onboarding/client";
 import { PaidDisclosuresPanel } from "../packs/PaidDisclosuresPanel";
@@ -258,6 +259,36 @@ export function SettingsView({
       cancelled = true;
     };
   }, [section, sessionReady, trust]);
+
+  // What a Tailscale session may do (D14). Only a local session can change it;
+  // the card shows the scope the server stored, never an optimistic value.
+  const [remoteScopeBusy, setRemoteScopeBusy] = useState(false);
+  const [remoteScopeError, setRemoteScopeError] = useState<string | null>(null);
+
+  const handleSetRemoteScope = useCallback(
+    async (scope: RemoteScope): Promise<void> => {
+      if (!sessionReady || remoteScopeBusy || !trust.setRemoteScope) {
+        return;
+      }
+      setRemoteScopeBusy(true);
+      setRemoteScopeError(null);
+      try {
+        const stored = await trust.setRemoteScope(scope);
+        setLocalTrust((current) =>
+          current.view
+            ? { ...current, view: { ...current.view, remote_scope: stored } }
+            : current,
+        );
+      } catch (error) {
+        setRemoteScopeError(
+          error instanceof Error ? error.message : String(error),
+        );
+      } finally {
+        setRemoteScopeBusy(false);
+      }
+    },
+    [sessionReady, remoteScopeBusy, trust],
+  );
 
   const handleToggleTelemetry = useCallback(
     async (enabled: boolean): Promise<void> => {
@@ -737,6 +768,15 @@ export function SettingsView({
 
             <LocalControlCard
               trust={localTrust}
+              onSetRemoteScope={
+                sessionReady && trust.setRemoteScope
+                  ? (scope) => {
+                      void handleSetRemoteScope(scope);
+                    }
+                  : undefined
+              }
+              remoteScopeBusy={remoteScopeBusy}
+              remoteScopeError={remoteScopeError}
               telemetry={
                 !sessionReady || telemetryError !== null
                   ? "unavailable"
@@ -887,9 +927,15 @@ function overrideWarnings(
 function LocalControlCard({
   trust,
   telemetry,
+  onSetRemoteScope,
+  remoteScopeBusy = false,
+  remoteScopeError = null,
 }: {
   trust: LocalTrustState;
   telemetry: TelemetryReading;
+  onSetRemoteScope?: (scope: RemoteScope) => void;
+  remoteScopeBusy?: boolean;
+  remoteScopeError?: string | null;
 }): JSX.Element {
   const view = trust.status === "ready" ? trust.view : null;
   const missing = trust.status === "loading" ? "checking…" : "unavailable";
@@ -943,6 +989,7 @@ function LocalControlCard({
     }
   }
 
+  const scope = view?.remote_scope ?? null;
   let remote = missing;
   if (view) {
     const access = view.remote_access;
@@ -952,9 +999,35 @@ function LocalControlCard({
       remote = "Off. No Tailscale access is configured.";
     } else {
       const where = access.origin ? ` at ${access.origin}` : "";
-      remote = `On through Tailscale Serve${where}, for the configured owner login only. A remote session has the same controls as a local one.`;
+      // A server that reports no scope predates it and gives full control.
+      const reach =
+        scope === "read_only"
+          ? "A remote session can view but cannot change anything."
+          : "A remote session has the same controls as a local one.";
+      remote = `On through Tailscale Serve${where}, for the configured owner login only. ${reach}`;
     }
   }
+
+  let remoteScope = missing;
+  if (view) {
+    if (scope === "read_only") {
+      remoteScope =
+        "Read only (the default). Arming, the kill switch, pausing, live grants and settings changes are refused.";
+    } else if (scope === "full") {
+      remoteScope =
+        "Full control. A Tailscale session can do everything a local session can.";
+    } else {
+      remoteScope = "unavailable";
+    }
+  }
+  // Every session on a Tailscale-enabled workstation is remote, so only a
+  // workstation started without Tailscale access shows the control.
+  const remoteSession = view?.remote_access?.mode === "tailscale_serve";
+  const scopeControl =
+    view !== null &&
+    view.remote_access?.mode === "off" &&
+    scope !== null &&
+    onSetRemoteScope !== undefined;
 
   const telemetryCopy =
     telemetry === "on"
@@ -1071,6 +1144,44 @@ function LocalControlCard({
       >
         <strong>Remote access:</strong> {remote}
       </p>
+      <p
+        className="kbot-settings__card-copy"
+        data-testid="settings-local-control-remote-scope"
+      >
+        <strong>Tailscale sessions:</strong> {remoteScope}
+      </p>
+      {remoteSession ? (
+        <p
+          className="kbot-settings__card-copy"
+          data-testid="settings-local-control-remote-scope-note"
+        >
+          Only a local session on this computer can change this.
+        </p>
+      ) : null}
+      {scopeControl ? (
+        <button
+          type="button"
+          className="kbot-settings__btn"
+          data-testid="settings-local-control-remote-scope-toggle"
+          disabled={remoteScopeBusy}
+          onClick={() => {
+            onSetRemoteScope?.(scope === "full" ? "read_only" : "full");
+          }}
+        >
+          {scope === "full"
+            ? "Make Tailscale sessions read-only"
+            : "Allow full control from Tailscale"}
+        </button>
+      ) : null}
+      {remoteScopeError !== null ? (
+        <p
+          className="kbot-settings__error"
+          data-testid="settings-local-control-remote-scope-error"
+          role="alert"
+        >
+          Remote access was not changed: {remoteScopeError}
+        </p>
+      ) : null}
     </div>
   );
 }
