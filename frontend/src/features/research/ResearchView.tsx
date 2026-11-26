@@ -137,6 +137,32 @@ function buildMetricCells(receipt: Record<string, unknown>): MetricCell[] {
       source: "metrics.total_return_pct · percent",
     },
     {
+      label: "CAGR (%)",
+      testId: "research-result-cagr-pct",
+      value: readPercentageMetric(receipt, "cagr_pct"),
+      source:
+        "metrics.cagr_pct · percent per year, unavailable under a day or with non-positive equity",
+    },
+    {
+      label: "Exposure (%)",
+      testId: "research-result-exposure-pct",
+      value: readPercentageMetric(receipt, "exposure_pct"),
+      source: "metrics.exposure_pct · percent of bars ending with a position",
+    },
+    {
+      label: "Buy and hold return (%)",
+      testId: "research-result-buy-and-hold-return-pct",
+      value: readBuyAndHoldMetric(receipt, "total_return_pct"),
+      source:
+        "metrics.buy_and_hold.total_return_pct · percent, bought at the second bar's open with this run's fee and slippage, held to the last close",
+    },
+    {
+      label: "Buy and hold CAGR (%)",
+      testId: "research-result-buy-and-hold-cagr-pct",
+      value: readBuyAndHoldMetric(receipt, "cagr_pct"),
+      source: "metrics.buy_and_hold.cagr_pct · percent per year",
+    },
+    {
       label: "Fee basis points",
       testId: "research-result-fee-bps",
       value: feeBps,
@@ -252,6 +278,68 @@ function readPercentageMetric(
     return String(value);
   }
   return "unavailable";
+}
+
+function readObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function readBuyAndHold(receipt: Record<string, unknown>): Record<string, unknown> | null {
+  return readObject(readMetrics(receipt)?.buy_and_hold);
+}
+
+/** A finite ``metrics.buy_and_hold`` percentage, else unavailable. */
+function readBuyAndHoldMetric(receipt: Record<string, unknown>, key: string): string {
+  const value = readBuyAndHold(receipt)?.[key];
+  return typeof value === "number" && Number.isFinite(value)
+    ? String(value)
+    : "unavailable";
+}
+
+type PerYearRow = { year: string; strategy: string; buyAndHold: string };
+
+function formatYearPct(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value.toFixed(2)
+    : "unavailable";
+}
+
+/**
+ * One row per UTC calendar year either ``per_year`` series names, oldest
+ * first. A year a series lacks, or a value that is not a finite number,
+ * reads unavailable — never zero.
+ */
+function readPerYearRows(receipt: Record<string, unknown>): PerYearRow[] {
+  const strategy = readObject(readMetrics(receipt)?.per_year) ?? {};
+  const buyAndHold = readObject(readBuyAndHold(receipt)?.per_year) ?? {};
+  const years = new Set(
+    [...Object.keys(strategy), ...Object.keys(buyAndHold)].filter((key) =>
+      /^\d{4}$/.test(key),
+    ),
+  );
+  return [...years].sort().map((year) => ({
+    year,
+    strategy: formatYearPct(strategy[year]),
+    buyAndHold: formatYearPct(buyAndHold[year]),
+  }));
+}
+
+/**
+ * The round-trip sample behind the figures. Only the engine's own
+ * ``metrics.trade_count`` (closed round trips) counts; a ``trades`` array
+ * lists fill legs and is never read as round trips.
+ */
+function describeSample(receipt: Record<string, unknown>): string {
+  const count = readMetrics(receipt)?.trade_count;
+  const trips =
+    typeof count === "number" && Number.isSafeInteger(count) && count >= 0
+      ? `${count} round trip${count === 1 ? "" : "s"}`
+      : "Round trips unavailable";
+  const date = (value: unknown) =>
+    typeof value === "string" && value ? value : "unavailable";
+  return `${trips}, ${date(receipt.from)} to ${date(receipt.to)}; no statistical confidence computed`;
 }
 
 function readEquity(receipt: Record<string, unknown>): string {
@@ -1688,6 +1776,13 @@ function ResultPanel({
           </div>
         ))}
       </dl>
+      <p
+        className="kbot-research__panel-note"
+        data-testid="research-result-sample"
+      >
+        {describeSample(receipt)}
+      </p>
+      <PerYearPanel rows={readPerYearRows(receipt)} />
       <CostsPanel
         receipt={receipt}
         load={costs}
@@ -1813,6 +1908,79 @@ function SelectedBarDetail({
         )}
       </div>
     </div>
+  );
+}
+
+const PER_YEAR_NOTE =
+  "Each value compares equity at the end of a UTC calendar year with equity " +
+  "where it began: the first bar for the first year, the previous year's " +
+  "last bar after that. A negative Strategy value marks a year this " +
+  "backtest lost. Buy and hold is one buy at the second bar's open with " +
+  "this run's fee and slippage, held to the end.";
+
+/**
+ * Where a strategy lost (KRELL-SIGNAL-20261010): ``metrics.per_year`` beside
+ * ``metrics.buy_and_hold.per_year``, read from the receipt unchanged.
+ */
+function PerYearPanel({ rows }: { rows: PerYearRow[] }): JSX.Element {
+  return (
+    <section
+      className="kbot-research__panel"
+      data-testid="research-per-year"
+      aria-labelledby="kbot-research-per-year-title"
+    >
+      <h2 className="kbot-research__panel-title" id="kbot-research-per-year-title">
+        Per calendar year
+      </h2>
+      <p className="kbot-research__panel-note">{PER_YEAR_NOTE}</p>
+      {rows.length === 0 ? (
+        <p
+          className="kbot-research__status"
+          data-testid="research-per-year-unavailable"
+        >
+          Per-year results unavailable for this run.
+        </p>
+      ) : (
+        <div className="kbot-research__per-year-scroll">
+          <table className="kbot-research__per-year-table">
+            <thead>
+              <tr>
+                <th scope="col">Year (UTC)</th>
+                <th scope="col">Strategy (%)</th>
+                <th scope="col">Buy and hold (%)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.year} data-testid={`research-per-year-${row.year}`}>
+                  <th scope="row">{row.year}</th>
+                  <td
+                    className={
+                      row.strategy === "unavailable"
+                        ? "kbot-research__per-year-value--unavailable"
+                        : undefined
+                    }
+                    data-testid={`research-per-year-${row.year}-strategy`}
+                  >
+                    {row.strategy}
+                  </td>
+                  <td
+                    className={
+                      row.buyAndHold === "unavailable"
+                        ? "kbot-research__per-year-value--unavailable"
+                        : undefined
+                    }
+                    data-testid={`research-per-year-${row.year}-buy-and-hold`}
+                  >
+                    {row.buyAndHold}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   );
 }
 

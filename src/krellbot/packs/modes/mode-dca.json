@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "label": "DCA",
   "author": "krellbot",
-  "origin": "Built-in DCA mode. Interval=timeframe; slice=risk.max_account_pct. Wave XXBTZUSD. Not live performance.",
+  "origin": "Built-in DCA mode. Buys max_account_pct while flat, then holds; no repeat buy each timeframe bar. Not live performance.",
   "timeframe": "1d",
   "indicators": {
     "anchor": {"fn": "sma", "src": "close", "len": 2}
