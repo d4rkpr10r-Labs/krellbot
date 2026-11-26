@@ -6,9 +6,11 @@
     2. Loads the license cache + armed packs config.
     3. Snapshots the venue.
     4. For each armed pack on the venue: ensure a resting stop if owned > 0
-       (the venue's ``place_stop``). If the venue refuses the stop or has no
-       ``place_stop``, market-exit the owned qty in the same tick, journaling
-       only what the venue shows executed.
+       (the venue's ``place_stop``), priced by the pack's own stop rule
+       (``_stop_price``). When that rule gives no price, no stop is placed
+       and the tick journals ``stop_price_unavailable``. If the venue refuses
+       the stop or has no ``place_stop``, market-exit the owned qty in the
+       same tick, journaling only what the venue shows executed.
     5. Acts on the latest closed bar only. Missed bars are coalesced by
        feeding every candle up to and including the latest into evaluate.run
        so indicator state includes them.
@@ -677,6 +679,8 @@ def tick(
             # Intents the venue's documented response refused, as (coid, code).
             venue_refusals: list[tuple[str, str]] = []
             ensure_stop_failed = False
+            # Set when this tick's stop repair found no price to place.
+            stop_price_unavailable = False
             ensure_stop_entry = ""
             exit_qty = Decimal(0)
             # Set when the repair below falls back to an exit: nothing else is
@@ -692,7 +696,6 @@ def tick(
                 and not exits_held
                 and target.reason != "exit"
             ):
-                repair = _stop_price(pack, Decimal(str(latest.close)))
                 stop_refused = False
                 if not callable(getattr(venue_obj, "place_stop", None)):
                     # This adapter cannot rest a stop on its own. No stop intent
@@ -709,35 +712,46 @@ def tick(
                         bar_ts=bar_ts,
                         intent="stop",
                     )
-                    stop_body = json.dumps(
-                        {"kind": "stop", "qty": str(owned), "stop": str(repair), "pair": armed.pair},
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    )
                     try:
-                        # The stop coid is committed before the send and never
-                        # sent again: a stop whose reply is lost stays an
-                        # obligation until the venue's record shows it resting.
-                        stop_state, _stop_ref = _dispatch_place(
-                            home=home,
-                            mode=armed.mode,
-                            venue=venue,
-                            identity=_intent_identity(armed, bar_ts),
-                            coid=stop_coid,
-                            body=stop_body,
-                            venue_obj=venue_obj,
-                        )
-                        if stop_state == "sent":
-                            ensure_stop_entry = stop_coid
-                        if ensure_stop_entry:
-                            fill_context[ensure_stop_entry] = {
-                                "pack_id": armed.pack_id,
-                                "pack_version": armed.pack_version,
-                                "bar_ts": bar_ts,
-                                "modeled_px": str(repair),
-                                "fee_bps": _fee_bps_for_venue(venue),
-                                "kind": "stop",
-                            }
+                        # The pack's own stop rule over this tick's candles, never
+                        # below the stop recorded with the position's entry.
+                        repair = _stop_price(pack, candles, home=home, identity=identity)
+                        if repair is None:
+                            # No price can be computed. Nothing is guessed and
+                            # nothing is sold: the tick journals the gap and
+                            # Operations raises a critical alert.
+                            print("ensure_stop failed: the pack's stop rule gives no price", flush=True)
+                            stop_price_unavailable = True
+                            ensure_stop_failed = True
+                        else:
+                            stop_body = json.dumps(
+                                {"kind": "stop", "qty": str(owned), "stop": str(repair), "pair": armed.pair},
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            )
+                            # The stop coid is committed before the send and never
+                            # sent again: a stop whose reply is lost stays an
+                            # obligation until the venue's record shows it resting.
+                            stop_state, _stop_ref = _dispatch_place(
+                                home=home,
+                                mode=armed.mode,
+                                venue=venue,
+                                identity=_intent_identity(armed, bar_ts),
+                                coid=stop_coid,
+                                body=stop_body,
+                                venue_obj=venue_obj,
+                            )
+                            if stop_state == "sent":
+                                ensure_stop_entry = stop_coid
+                            if ensure_stop_entry:
+                                fill_context[ensure_stop_entry] = {
+                                    "pack_id": armed.pack_id,
+                                    "pack_version": armed.pack_version,
+                                    "bar_ts": bar_ts,
+                                    "modeled_px": str(repair),
+                                    "fee_bps": _fee_bps_for_venue(venue),
+                                    "kind": "stop",
+                                }
                     except StoreError as exc:
                         pack_intent_refused[armed.pack_id] = exc.code
                         any_refused = True
@@ -1043,6 +1057,7 @@ def tick(
                     "entries_paused": entries_suppressed,
                     "kill_switch": kill_engaged,
                     "ensure_stop_failed": ensure_stop_failed,
+                    **({"stop_price_unavailable": True} if stop_price_unavailable else {}),
                     "entry_coid": ensure_stop_entry or entry_coid_for_signal,
                     "no_double_order": bool(ensure_stop_entry),
                     "metadata_refusal": metadata_refusal,
@@ -1766,13 +1781,74 @@ def _recognized_open_qty(armed: kb_config.ArmedPack, venue: str, candles: list, 
     return max(resting.values(), default=Decimal(0))
 
 
-def _stop_price(pack: dict, last_close: Decimal) -> Decimal:
+def _stop_price(pack: dict, candles: list, *, home: Path, identity: OwnershipIdentity) -> Decimal | None:
+    """The price a missing stop is re-placed at, or ``None`` when there is none.
+
+    A percentage stop is re-placed ``pct`` below the latest close, as before.
+    Every other stop uses the rule the entry uses, ``pack/evaluate.stop_price``
+    over the tick's candles (an ATR stop: the latest close minus ``mult`` x
+    ATR), and is never placed below the stop the arm recorded for the position
+    (``_recorded_entry_stop``). When the rule gives no price (too few candles
+    for the ATR, a stop rule the engine cannot read) or only a non-positive
+    one, this is ``None`` and no stop is placed: a stop is never guessed.
+    ``StoreError`` from reading the recorded stop propagates.
+    """
     stop = (pack.get("risk") or {}).get("stop") or {}
     if stop.get("type") == "pct":
+        last_close = Decimal(str(candles[-1].close))
         return last_close * (Decimal(1) - Decimal(str(stop["pct"])) / Decimal(100))
-    if last_close > 0:
-        return last_close / Decimal(2)
-    return Decimal(0)
+    price = kb_evaluate.stop_price(pack, candles)
+    if price is None:
+        return None
+    recorded = _recorded_entry_stop(home, identity)
+    if recorded is not None and price < recorded:
+        price = recorded
+    if not price.is_finite() or price <= 0:
+        return None
+    return price
+
+
+def _recorded_entry_stop(home: Path, identity: OwnershipIdentity) -> Decimal | None:
+    """The stop recorded with the entry that opened ``identity``'s position.
+
+    The source is the Outbox: every entry intent is committed to
+    ``<home>/ops.sqlite`` before it is sent, with the stop the entry rule
+    computed on the signal bar, so it survives restarts and does not depend on
+    a venue still listing the stop. An intent counts only when its record
+    names this identity's venue and mode and its body this identity's pack and
+    pair; earlier rows without that context are never attributed. An identity
+    enters only when flat, so its latest entry intent opened the position it
+    holds. ``None`` when there is no such intent or its stop is not a positive
+    number. ``StoreError`` propagates.
+    """
+    path = Path(home) / "ops.sqlite"
+    if not path.exists():
+        return None
+    recorded: Decimal | None = None
+    for _row_id, kind, payload in OperationalStore(path).read_ledger():
+        if kind != "outbox":
+            continue
+        try:
+            record = json.loads(payload)
+            body = json.loads(record["body"])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+        if not isinstance(body, dict):
+            continue
+        if (
+            record.get("venue") != identity.venue
+            or record.get("mode") != identity.mode
+            or body.get("kind") != "entry"
+            or body.get("pair") != identity.pair
+            or body.get("pack_id") != identity.pack_id
+        ):
+            continue
+        try:
+            stop = Decimal(str(body.get("stop")))
+        except (InvalidOperation, ValueError):
+            stop = None
+        recorded = stop if stop is not None and stop.is_finite() and stop > 0 else None
+    return recorded
 
 
 def _fee_bps_for_venue(venue: str) -> int:

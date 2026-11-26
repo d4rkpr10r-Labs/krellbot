@@ -47,6 +47,34 @@ def run_series(pack: dict, candles: list[Candle]) -> list[Target]:
     return [_decide(pack, computed, candles, atr_series, t) for t in range(len(candles))]
 
 
+def stop_price(pack: dict, candles: list[Candle]) -> Decimal | None:
+    """The pack's entry stop rule applied to the last of ``candles``.
+
+    This is the price ``run`` sets when the entry fires on that bar, from the
+    same code: ``close x (1 - pct/100)`` for a percentage stop, ``close - mult
+    x ATR(len)`` from these candles for an ATR stop. ``None`` when no price
+    can be computed: no candles, an ATR without a value on the last bar, or a
+    stop rule this engine cannot read. Never a fallback price.
+    """
+    if not candles or not isinstance(pack, dict):
+        return None
+    risk = pack.get("risk")
+    stop = risk.get("stop") if isinstance(risk, dict) else None
+    if not isinstance(stop, dict) or stop.get("type") not in ("pct", "atr"):
+        return None
+    try:
+        return _stop_at(stop, candles, _atr_series(stop, candles), len(candles) - 1)
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        return None
+
+
+def _atr_series(stop: dict, candles: list[Candle]) -> list[float | None] | None:
+    """The ATR series an ATR stop reads; ``None`` for any other stop."""
+    if stop.get("type") == "atr":
+        return ind.compute(candles, {"fn": "atr", "len": int(stop["len"])})
+    return None
+
+
 def _compute_all(pack: dict, candles: list[Candle]) -> tuple[dict[str, list[float | None]], list[float | None] | None]:
     """Compute every pack indicator plus the ATR stop series (if any) once."""
     indicators_map: dict[str, dict] = pack.get("indicators", {})
@@ -55,10 +83,21 @@ def _compute_all(pack: dict, candles: list[Candle]) -> tuple[dict[str, list[floa
     }
     risk = pack.get("risk") or {}
     stop = risk.get("stop") or {}
-    atr_series: list[float | None] | None = None
-    if stop.get("type") == "atr":
-        atr_series = ind.compute(candles, {"fn": "atr", "len": int(stop["len"])})
-    return computed, atr_series
+    return computed, _atr_series(stop, candles)
+
+
+def _stop_at(stop: dict, candles: list[Candle], atr_series: list[float | None] | None, t: int) -> Decimal | None:
+    """The stop price on bar ``t``; ``None`` while the ATR has no value there."""
+    last_close = candles[t].close
+    if stop["type"] == "pct":
+        pct = Decimal(str(stop["pct"]))
+        return last_close * (Decimal(1) - pct / Decimal(100))
+    # atr
+    mult = Decimal(str(stop["mult"]))
+    atr_val = atr_series[t] if atr_series is not None else None
+    if atr_val is None:
+        return None
+    return last_close - Decimal(str(atr_val)) * mult
 
 
 def _decide(
@@ -89,19 +128,10 @@ def _decide(
         return Target(long=False, stop_price=None, reason="flat")
 
     # Entry fired: compute stop.
-    risk = pack["risk"]
-    stop = risk["stop"]
-    last_close = candles[t].close
-    if stop["type"] == "pct":
-        pct = Decimal(str(stop["pct"]))
-        stop_price = last_close * (Decimal(1) - pct / Decimal(100))
-    else:  # atr
-        mult = Decimal(str(stop["mult"]))
-        atr_val = atr_series[t] if atr_series is not None else None
-        if atr_val is None:
-            return Target(long=False, stop_price=None, reason="warmup")
-        stop_price = last_close - Decimal(str(atr_val)) * mult
-    return Target(long=True, stop_price=stop_price, reason="entry")
+    entry_stop = _stop_at(pack["risk"]["stop"], candles, atr_series, t)
+    if entry_stop is None:
+        return Target(long=False, stop_price=None, reason="warmup")
+    return Target(long=True, stop_price=entry_stop, reason="entry")
 
 
 def _used_indicators(condition: Any) -> set[str]:
