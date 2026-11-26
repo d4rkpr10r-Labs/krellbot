@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from krellbot import config as kb_config
 from krellbot import release_policy
 from krellbot.api.jobs import (
+    JOB_ERROR_FILLS_UNAVAILABLE,
     JOB_ERROR_NOT_FOUND,
     JOB_ERROR_RESULT_UNAVAILABLE,
     JOB_KIND_RESEARCH_BACKTEST,
@@ -1912,6 +1913,43 @@ def create_app(
                 status_code=404,
             )
         return JSONResponse(result, status_code=200)
+
+    @app.get("/api/v1/jobs/{job_id}/fills")
+    async def get_job_fills(request: Request, job_id: str) -> Response:
+        """Return a succeeded research job's simulated fills keyed by ``bar_ts``.
+
+        Same session gate as the result route (``_gate_get``). The fills
+        come from the job's side-car, never from the stored
+        ``{legacy_receipt, trace}`` result, which stays unchanged. Each leg
+        is ``{side, price, qty, fee, is_stop}`` with exact decimal strings.
+        They are backtest fills, not venue fills. A run that recorded no
+        fills is 404 ``fills_unavailable``; nothing is reconstructed here.
+        """
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+
+        snap = s.jobs.get(job_id)
+        if snap is None:
+            return JSONResponse(
+                {"code": JOB_ERROR_NOT_FOUND, "message": "job not found"},
+                status_code=404,
+            )
+        if snap.state != "succeeded":
+            return JSONResponse({"code": JOB_ERROR_RESULT_UNAVAILABLE}, status_code=404)
+        fills = s.jobs.fills_for(job_id)
+        if fills is None:
+            return JSONResponse(
+                {"code": JOB_ERROR_FILLS_UNAVAILABLE, "message": "this run has no recorded fills"},
+                status_code=404,
+            )
+        return JSONResponse(
+            {"schema_version": SCHEMA_VERSION, "job_id": job_id, "fills": fills},
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/v1/events")
     async def events(request: Request) -> Response:
