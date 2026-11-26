@@ -332,6 +332,31 @@
   color: var(--danger-text, #cc9689);
 }
 
+/* Local-control card (This computer): caution lines and inline paths. */
+.kbot-settings__caution {
+  color: var(--caution-text, #e2c193);
+}
+
+.kbot-settings__caution-box {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--caution-border, #736044);
+  border-radius: var(--radius-control, 6px);
+  background: var(--caution-bg, #2b271f);
+}
+
+.kbot-settings__caution-box .kbot-settings__card-copy {
+  color: var(--caution-text, #e2c193);
+}
+
+.kbot-settings__inline-code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  color: var(--text, #e9f0f5);
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 780px) {
   .kbot-settings__layout {
     grid-template-columns: minmax(0, 1fr);

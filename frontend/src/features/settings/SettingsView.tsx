@@ -18,7 +18,12 @@ import { DiagnosticReport } from "../diagnostics/DiagnosticReport";
 import { KeysOnboardingPanel } from "../keys/KeysOnboardingPanel";
 import { createKeysHttpClient, type KeysClient } from "../keys/client";
 import { LiveWizardPanel } from "../onboarding/LiveWizardPanel";
-import { createTrustHttpClient, type TrustClient } from "../onboarding/client";
+import {
+  createTrustHttpClient,
+  type CredentialSource,
+  type LiveWizardHonesty,
+  type TrustClient,
+} from "../onboarding/client";
 import { PaidDisclosuresPanel } from "../packs/PaidDisclosuresPanel";
 import { PackBillingForms, type PackBillingClient } from "../packs/PackBillingForms";
 import {
@@ -31,6 +36,11 @@ import {
   createReferralHttpClient,
   type ReferralClient,
 } from "../referral/client";
+import {
+  createEntitlementsHttpClient,
+  EntitlementsCard,
+  type EntitlementsClient,
+} from "./EntitlementsCard";
 import "./SettingsView.signal.css";
 
 type SectionMeta = {
@@ -38,6 +48,30 @@ type SectionMeta = {
   label: string;
   shortNote: string;
 };
+
+type LocalTrustState = {
+  status: "idle" | "loading" | "ready" | "failed";
+  view: LiveWizardHonesty | null;
+};
+
+type TelemetryReading = "checking" | "on" | "off" | "unavailable";
+
+/** Venues with an Exchange keys form; always listed on the local-control card. */
+const KEY_FORM_VENUES: ReadonlyArray<string> = ["kraken", "coinbase"];
+
+const VENUE_LABELS: Readonly<Record<string, string>> = {
+  kraken: "Kraken",
+  coinbase: "Coinbase",
+};
+
+const CREDENTIAL_SOURCE_COPY: Readonly<Record<CredentialSource, string>> = {
+  keychain: "OS keychain",
+  env_override: "Environment variables (override the OS keychain)",
+  keyfile_fallback: "OS keychain, then a plaintext key file",
+};
+
+const KEYS_DESTINATION_COPY =
+  "Keys are sent only to the exchange, never to Krellbot.";
 
 export const SETTINGS_NAV_ITEMS: ReadonlyArray<SectionMeta> = [
   {
@@ -89,6 +123,7 @@ export type SettingsViewProps = {
   versionClient?: VersionClient;
   packsClient?: Pick<PacksClient, "getTelemetryConsent" | "setTelemetryConsent"> &
     Partial<Pick<PacksClient, "redeemActivation" | "requestRefund">>;
+  entitlementsClient?: EntitlementsClient;
 };
 
 export function SettingsView({
@@ -105,6 +140,7 @@ export function SettingsView({
   referralClient,
   versionClient,
   packsClient,
+  entitlementsClient,
 }: SettingsViewProps): JSX.Element {
   const sessionReady = !sessionPending && !sessionFailed;
 
@@ -125,6 +161,15 @@ export function SettingsView({
     fallbackReferralRef.current = createReferralHttpClient();
   }
   const referral = referralClient ?? fallbackReferralRef.current!;
+
+  const fallbackEntitlementsRef = useRef<EntitlementsClient | null>(null);
+  if (
+    fallbackEntitlementsRef.current === null &&
+    entitlementsClient === undefined
+  ) {
+    fallbackEntitlementsRef.current = createEntitlementsHttpClient();
+  }
+  const entitlements = entitlementsClient ?? fallbackEntitlementsRef.current!;
 
   const fallbackPacksRef = useRef<PacksClient | null>(null);
   if (
@@ -148,14 +193,14 @@ export function SettingsView({
           : undefined,
   };
 
-  // Privacy & telemetry consent (loaded only when Privacy section is active).
+  // Telemetry consent: the Privacy toggle and the This computer card read it.
   const [telemetry, setTelemetry] = useState<TelemetryConsent | null>(null);
   const [telemetryLoading, setTelemetryLoading] = useState(false);
   const [telemetryBusy, setTelemetryBusy] = useState(false);
   const [telemetryError, setTelemetryError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (section !== "privacy" || !sessionReady) {
+    if ((section !== "privacy" && section !== "computer") || !sessionReady) {
       return;
     }
     let cancelled = false;
@@ -184,6 +229,35 @@ export function SettingsView({
       cancelled = true;
     };
   }, [section, sessionReady, telemetryApi]);
+
+  // This computer: where credentials and data live (GET /api/v1/trust).
+  const [localTrust, setLocalTrust] = useState<LocalTrustState>({
+    status: "idle",
+    view: null,
+  });
+
+  useEffect(() => {
+    if (section !== "computer" || !sessionReady) {
+      return;
+    }
+    let cancelled = false;
+    setLocalTrust({ status: "loading", view: null });
+    void trust
+      .getTrust()
+      .then((view) => {
+        if (!cancelled) {
+          setLocalTrust({ status: "ready", view });
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setLocalTrust({ status: "failed", view: null });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [section, sessionReady, trust]);
 
   const handleToggleTelemetry = useCallback(
     async (enabled: boolean): Promise<void> => {
@@ -380,11 +454,12 @@ export function SettingsView({
                 Trust &amp; billing
               </h2>
               <p className="kbot-settings__panel-note">
-                Honest disclosures, activation keys, refunds, and exchange
-                referral attribution. The engine is free and open-source; packs
-                are optional.
+                What a license gates, honest disclosures, activation keys,
+                refunds, and exchange referral attribution. The engine is free
+                and open-source; packs are optional.
               </p>
             </header>
+            <EntitlementsCard client={entitlements} enabled={sessionReady} />
             <PaidDisclosuresPanel variant="settings" />
             <PackBillingForms client={billingApi} />
             <ReferralDisclosurePanel
@@ -480,8 +555,8 @@ export function SettingsView({
                 This computer
               </h2>
               <p className="kbot-settings__panel-note">
-                Loopback session controls, second-browser reconnect, and opt-in
-                local demo fixtures.
+                Where your keys and data live, loopback session controls,
+                second-browser reconnect, and opt-in local demo fixtures.
               </p>
             </header>
 
@@ -660,6 +735,19 @@ export function SettingsView({
               ) : null}
             </div>
 
+            <LocalControlCard
+              trust={localTrust}
+              telemetry={
+                !sessionReady || telemetryError !== null
+                  ? "unavailable"
+                  : telemetryLoading || telemetry === null
+                    ? "checking"
+                    : telemetry.enabled
+                      ? "on"
+                      : "off"
+              }
+            />
+
             <DisclosureSection
               title="Demo fixture seed"
               summary="Opt-in labeled fixture/demo rows for local preview — never live P&L or soak proof."
@@ -753,6 +841,236 @@ export function SettingsView({
           {renderSectionBody(section)}
         </div>
       </div>
+    </div>
+  );
+}
+
+function isLoopbackAddress(address: string): boolean {
+  return (
+    address.startsWith("127.") ||
+    address === "::1" ||
+    address.startsWith("::ffff:127.")
+  );
+}
+
+function venueLabel(venue: string): string {
+  return VENUE_LABELS[venue] ?? venue;
+}
+
+function overrideWarnings(
+  sources: Readonly<Record<string, CredentialSource>>,
+): string[] {
+  const lines: string[] = [];
+  for (const venue of Object.keys(sources).sort()) {
+    const label = venueLabel(venue);
+    const ven = venue.toUpperCase();
+    if (sources[venue] === "env_override") {
+      lines.push(
+        `${label}: KRELLBOT_${ven}_KEY or KRELLBOT_${ven}_SECRET is set, so the OS keychain is not used for this venue.`,
+      );
+    } else if (sources[venue] === "keyfile_fallback") {
+      lines.push(
+        `${label}: KRELLBOT_${ven}_KEYFILE is set. When the OS keychain has no ${label} key, Krellbot reads one from that plaintext file.`,
+      );
+    }
+  }
+  return lines;
+}
+
+/**
+ * Settings → This computer: where credentials and data live (M28.13).
+ *
+ * Every line is read from ``/api/v1/trust`` or the telemetry consent; a
+ * missing reading says 'unavailable'. Only the source kind of each venue's
+ * keys is shown — never a key, a secret or a key file path.
+ */
+function LocalControlCard({
+  trust,
+  telemetry,
+}: {
+  trust: LocalTrustState;
+  telemetry: TelemetryReading;
+}): JSX.Element {
+  const view = trust.status === "ready" ? trust.view : null;
+  const missing = trust.status === "loading" ? "checking…" : "unavailable";
+  const snap = view?.trust ?? null;
+  const sources = snap?.credential_source;
+
+  const listedVenues = [
+    ...KEY_FORM_VENUES,
+    ...Object.keys(sources ?? {})
+      .filter(
+        (venue) =>
+          !KEY_FORM_VENUES.includes(venue) && sources?.[venue] !== "keychain",
+      )
+      .sort(),
+  ];
+  const warnings = sources ? overrideWarnings(sources) : [];
+
+  let homeMode = missing;
+  if (snap) {
+    if (snap.home_mode === null) {
+      homeMode = "unavailable";
+    } else if (snap.home_mode_ok) {
+      homeMode = `${snap.home_mode} (owner only)`;
+    } else {
+      homeMode = `${snap.home_mode}. Other local users may be able to read this folder.`;
+    }
+  }
+
+  let keychain = missing;
+  if (snap) {
+    if (snap.keychain_backend === null) {
+      keychain = "unavailable";
+    } else {
+      keychain = snap.keychain_ok
+        ? snap.keychain_backend
+        : `${snap.keychain_backend} (not persistent)`;
+    }
+  }
+
+  let bind = missing;
+  let bindCaution = false;
+  if (view) {
+    const measured = view.bind_measured;
+    if (typeof measured === "string" && measured) {
+      bindCaution = !isLoopbackAddress(measured);
+      bind = bindCaution
+        ? `${measured} (measured on this connection). This is not a loopback address.`
+        : `${measured} (measured on this connection)`;
+    } else {
+      bind = "unavailable";
+    }
+  }
+
+  let remote = missing;
+  if (view) {
+    const access = view.remote_access;
+    if (!access) {
+      remote = "unavailable";
+    } else if (access.mode === "off") {
+      remote = "Off. No Tailscale access is configured.";
+    } else {
+      const where = access.origin ? ` at ${access.origin}` : "";
+      remote = `On through Tailscale Serve${where}, for the configured owner login only. A remote session has the same controls as a local one.`;
+    }
+  }
+
+  const telemetryCopy =
+    telemetry === "on"
+      ? "On (you opted in)"
+      : telemetry === "off"
+        ? "Off"
+        : telemetry === "checking"
+          ? "checking…"
+          : "unavailable";
+
+  const homeModeCaution =
+    snap !== null && snap.home_mode !== null && !snap.home_mode_ok;
+  const keychainCaution = snap !== null && !snap.keychain_ok;
+
+  return (
+    <div className="kbot-settings__card" data-testid="settings-local-control">
+      <h3 className="kbot-settings__subhead">Where your keys and data live</h3>
+      <p
+        className="kbot-settings__card-copy"
+        data-testid="settings-local-control-keys-destination"
+      >
+        {KEYS_DESTINATION_COPY}
+      </p>
+
+      <p
+        className="kbot-settings__card-copy"
+        data-testid="settings-local-control-home"
+      >
+        <strong>Data folder:</strong>{" "}
+        {snap && snap.home ? (
+          <code className="kbot-settings__inline-code">{snap.home}</code>
+        ) : (
+          missing
+        )}
+      </p>
+      <p
+        className="kbot-settings__card-copy"
+        data-testid="settings-local-control-data"
+      >
+        The journal (journal/), the operations store (ops.sqlite), receipts and
+        packs are kept in this folder on this computer.
+      </p>
+      <p
+        className={
+          homeModeCaution
+            ? "kbot-settings__card-copy kbot-settings__caution"
+            : "kbot-settings__card-copy"
+        }
+        data-testid="settings-local-control-home-mode"
+      >
+        <strong>Folder access:</strong> {homeMode}
+      </p>
+      <p
+        className={
+          keychainCaution
+            ? "kbot-settings__card-copy kbot-settings__caution"
+            : "kbot-settings__card-copy"
+        }
+        data-testid="settings-local-control-keychain"
+      >
+        <strong>Keychain:</strong> {keychain}
+      </p>
+
+      {listedVenues.map((venue) => {
+        const kind = sources?.[venue];
+        return (
+          <p
+            key={venue}
+            className="kbot-settings__card-copy"
+            data-testid={`settings-local-control-source-${venue}`}
+          >
+            <strong>{venueLabel(venue)} keys:</strong>{" "}
+            {kind ? CREDENTIAL_SOURCE_COPY[kind] : missing}
+          </p>
+        );
+      })}
+
+      {warnings.length > 0 ? (
+        <div
+          className="kbot-settings__caution-box"
+          data-testid="settings-local-control-override-warning"
+        >
+          {warnings.map((line) => (
+            <p key={line} className="kbot-settings__card-copy">
+              {line}
+            </p>
+          ))}
+          <p className="kbot-settings__card-copy">
+            Checked in this workstation&apos;s environment. The scheduled tick
+            starts with its own environment, which may differ.
+          </p>
+        </div>
+      ) : null}
+
+      <p
+        className="kbot-settings__card-copy"
+        data-testid="settings-local-control-telemetry"
+      >
+        <strong>Telemetry:</strong> {telemetryCopy}
+      </p>
+      <p
+        className={
+          bindCaution
+            ? "kbot-settings__card-copy kbot-settings__caution"
+            : "kbot-settings__card-copy"
+        }
+        data-testid="settings-local-control-bind"
+      >
+        <strong>Workstation address:</strong> {bind}
+      </p>
+      <p
+        className="kbot-settings__card-copy"
+        data-testid="settings-local-control-remote"
+      >
+        <strong>Remote access:</strong> {remote}
+      </p>
     </div>
   );
 }
