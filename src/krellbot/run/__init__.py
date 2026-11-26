@@ -521,16 +521,20 @@ def tick(
             return 0
 
         # A1: live gate comes BEFORE any venue_obj attribute access.
-        # Kill alone still hard-refuses (rc=1). Kill + entries_paused is the
-        # restore fence: nothing sends, tick succeeds (rc=0).
+        # The kill switch alone lets the tick run as paper does: entries are
+        # suppressed below while exits, stop repair, raise_stop and reconcile
+        # run. A kill-switch refusal here is the restore fence: nothing
+        # sends, tick succeeds (rc=0).
         fenced_live = False
         for live_armed in armed_for_venue:
             if live_armed.mode != "live":
                 continue
-            gate_result = live_gate.check_live_send(home, venue=venue, pair=live_armed.pair)
+            gate_result = live_gate.check_live_tick(
+                home, venue=venue, pair=live_armed.pair, entries_paused=live_armed.entries_paused
+            )
             if gate_result.ok:
                 continue
-            if gate_result.code == live_gate.CODE_KILL_SWITCH and live_armed.entries_paused:
+            if gate_result.code == live_gate.CODE_KILL_SWITCH:
                 _record_tick(
                     journal,
                     now=int(now),

@@ -85,6 +85,40 @@ reported as the env gate. Paper ticks stay on this machine. If a Kraken key
 is stored, paper ticks still use public data and simulate orders locally.
 The signed Kraken validate-only check is a separate diagnostic.
 
+## Kill switch
+
+The kill switch stops new entries. It does not sell or disarm. While it is
+engaged, a live tick behaves like a paper tick:
+
+* No new entry is sent. The tick record carries `kill_switch: true`.
+* Exits on the pack's exit signal are sent.
+* A missing protective stop is re-placed through `place_stop`.
+* `raise_stop` still raises the resting stop.
+* Unresolved orders are reconciled from the venue's record, and nothing is
+  resubmitted.
+
+The tick still needs `KRELLBOT_ENABLE_LIVE=1`, an operator grant for the
+venue+pair and a trade-only key. Without them it sends nothing.
+`check_live_tick` gates the tick in the scheduler's venue setup and in
+`run.tick`, and the tick reads the kill switch again before each entry.
+
+These stay refused with `kill_switch_engaged`:
+
+* live arm and web `live.arm`;
+* promotion;
+* live preflight;
+* paper arm.
+
+The restore fence is stricter. A home restore pauses every live arm's
+entries and engages the kill switch with a `home restored` reason. While
+that kill switch is engaged, nothing is sent and the scheduler does not
+build the live venue. A later operator kill does not lift the fence, and
+neither does clearing the entries pause. Only releasing the kill switch
+does.
+
+This release is paper-only, so every live tick is refused with
+`live_disabled_paper_only_release` before the kill switch is read.
+
 ## Live-only invariants
 
 * The engine never sells more base than this pack's journal says it
