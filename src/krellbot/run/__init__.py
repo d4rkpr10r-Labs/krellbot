@@ -826,19 +826,31 @@ def tick(
                                 )
                                 if entry_state == "sent":
                                     ref_filled = getattr(entry_ref, "filled_qty", None)
-                                    filled = ref_filled if isinstance(ref_filled, Decimal) else qty
-                                    if filled < qty:
-                                        owned = filled
-                                        entry_qty = filled
-                                        audit_partial_fill(
-                                            OperationalStore(home / "ops.sqlite"),
-                                            coid=entry_coid_for_signal,
-                                            requested=str(qty),
-                                            filled=str(filled),
+                                    if armed.mode == "live" and not _fill_evidence(ref_filled):
+                                        # A live acknowledgement without an executed
+                                        # quantity credits nothing. The entry becomes an
+                                        # obligation that holds entries on this venue and
+                                        # mode until order_outcome reports what executed;
+                                        # _resolve_obligations journals that once by
+                                        # resolved_coid. The coid is never resent.
+                                        audit_needs_reconcile(
+                                            OperationalStore(home / "ops.sqlite"), coid=entry_coid_for_signal
                                         )
+                                        obligations_view = kb_obligations.read_obligations(home)
                                     else:
-                                        entry_qty = qty
-                                        owned = qty
+                                        filled = ref_filled if isinstance(ref_filled, Decimal) else qty
+                                        if filled < qty:
+                                            owned = filled
+                                            entry_qty = filled
+                                            audit_partial_fill(
+                                                OperationalStore(home / "ops.sqlite"),
+                                                coid=entry_coid_for_signal,
+                                                requested=str(qty),
+                                                filled=str(filled),
+                                            )
+                                        else:
+                                            entry_qty = qty
+                                            owned = qty
                                     fill_context[entry_coid_for_signal] = {
                                         "pack_id": armed.pack_id,
                                         "pack_version": armed.pack_version,
@@ -1190,6 +1202,11 @@ def _protected_or_flat(home: Path, intent, *, venue: str, snap: Any) -> bool:
         return True
     identity = OwnershipIdentity(pack_id=intent.pack_id, venue=venue, pair=intent.pair, mode=intent.mode)
     return project_ownership(home, identity).attributable_qty == 0
+
+
+def _fill_evidence(filled: Any) -> bool:
+    """True when a venue acknowledgement reports a positive, finite Decimal fill."""
+    return isinstance(filled, Decimal) and filled.is_finite() and filled > 0
 
 
 def _intent_identity(armed: kb_config.ArmedPack, bar_ts: int) -> dict:

@@ -28,6 +28,7 @@ from typing import Any, Protocol
 
 from krellbot import journal, paths, release_policy, sanitize
 from krellbot.venues.base import (
+    UNKNOWN_OUTCOME,
     Balance,
     Fill,
     KeyMalformedError,
@@ -36,6 +37,7 @@ from krellbot.venues.base import (
     KeyUnverifiableError,
     KrakenKeyUnknownPermissionError,
     OpenOrder,
+    OrderOutcome,
     OrderRef,
     PairRules,
     Truth,
@@ -499,6 +501,34 @@ class KrakenVenue:
                 return order
         return None
 
+    def order_outcome(self, coid: str, *, pair: str) -> OrderOutcome:
+        """Report what Kraken's own record of ``coid``'s order says executed.
+
+        Finds the order through the same userref lookup that stops ``place_*``
+        from resending a coid, and reads its executed volume (``vol_exec``),
+        never its requested ``vol``. Still on the book: ``open`` with nothing
+        executed, else ``partial``. Closed, cancelled or expired: ``filled``
+        at the executed volume, or ``absent`` when nothing executed. No match,
+        or an unreadable executed volume, is ``unknown``: the open and closed
+        lists are not a complete record, so a miss proves nothing and the
+        caller keeps its hold. Never sends an order.
+        """
+        del pair  # the coid's own cl_ord_id / userref identify the order
+        found = self._lookup(coid, own_only=True)
+        if found is None:
+            return UNKNOWN_OUTCOME
+        bucket, _order_id, raw = found
+        executed = _executed_qty(raw)
+        if executed is None:
+            return UNKNOWN_OUTCOME
+        if bucket == "open":
+            if executed > 0:
+                return OrderOutcome(status="partial", filled_qty=executed, authoritative=True)
+            return OrderOutcome(status="open", authoritative=True)
+        if executed > 0:
+            return OrderOutcome(status="filled", filled_qty=executed, authoritative=True)
+        return OrderOutcome(status="absent", authoritative=True)
+
     def check_key(self) -> KeyPerms:
         # Strictly validate the key against `GetApiKeyInfo` permissions.
         # See https://docs.kraken.com/api-reference/account-data/get-api-key-info.
@@ -574,12 +604,37 @@ class KrakenVenue:
         )
 
     def _existing(self, coid: str) -> OrderRef | None:
+        # Any order on the coid's userref suppresses a resend. Its executed
+        # volume, not its requested one, is what the caller may credit.
+        found = self._lookup(coid, own_only=False)
+        if found is None:
+            return None
+        _bucket, order_id, raw = found
+        order = _open_order(order_id, raw)
+        if order is None:
+            return None
+        return OrderRef(
+            id=order.id,
+            coid=coid,
+            pair=order.pair,
+            side=order.side,
+            qty=order.qty,
+            filled_qty=_executed_qty(raw) or Decimal(0),
+            stop_price=order.stop_price,
+        )
+
+    def _lookup(self, coid: str, *, own_only: bool) -> tuple[str, str, dict] | None:
+        """Find ``coid``'s order in Kraken's open, then closed, orders.
+
+        Returns ``(bucket, order_id, row)``. Queries by the coid's userref;
+        ``own_only`` is as in ``_match_userref``.
+        """
         userref = coid_userref(coid)
         for endpoint, bucket in (("OpenOrders", "open"), ("ClosedOrders", "closed")):
             payload = self._private(endpoint, {"userref": str(userref)})
-            found = _match_userref(payload, bucket, coid, userref)
+            found = _match_userref(payload, bucket, coid, userref, own_only=own_only)
             if found is not None:
-                return found
+                return bucket, found[0], found[1]
         return None
 
     def _last_price(self, pair: str) -> Decimal:
@@ -731,33 +786,47 @@ def _open_order(order_id: str, raw: Any) -> OpenOrder | None:
     )
 
 
-def _match_userref(payload: Any, bucket: str, coid: str, userref: int) -> OrderRef | None:
+def _match_userref(payload: Any, bucket: str, coid: str, userref: int, *, own_only: bool) -> tuple[str, dict] | None:
+    """Return ``(order_id, row)`` of the listed order for ``coid``, if any.
+
+    A row whose ``cl_ord_id`` is ``coid`` wins; otherwise the first row with
+    the coid's ``userref``. With ``own_only``, a userref row counts only when
+    nothing says it is another order: no other ``cl_ord_id`` and no ``refid``
+    (an order created by another one, such as an entry's conditional close).
+    Without it (the resend guard), a row ``_open_order`` cannot read is
+    skipped and the scan goes on, so a readable listed order still blocks a
+    second send.
+    """
     book = _result(payload).get(bucket)
     if not isinstance(book, dict):
         return None
+    by_userref: tuple[str, dict] | None = None
     for order_id, raw in book.items():
         if not isinstance(raw, dict):
             continue
+        if not own_only and _open_order(str(order_id), raw) is None:
+            continue
         stored = str(raw.get("cl_ord_id") or "")
+        if stored == coid:
+            return str(order_id), raw
         try:
             stored_ref = int(raw.get("userref") or 0)
         except (TypeError, ValueError):
             stored_ref = 0
-        if stored != coid and stored_ref != userref:
+        if by_userref is not None or stored_ref != userref:
             continue
-        order = _open_order(str(order_id), raw)
-        if order is None:
+        if own_only and (stored or raw.get("refid")):
             continue
-        return OrderRef(
-            id=order.id,
-            coid=coid,
-            pair=order.pair,
-            side=order.side,
-            qty=order.qty,
-            filled_qty=order.qty,
-            stop_price=order.stop_price,
-        )
-    return None
+        by_userref = (str(order_id), raw)
+    return by_userref
+
+
+def _executed_qty(raw: dict) -> Decimal | None:
+    """The order's executed volume (``vol_exec``), or None when unreadable."""
+    executed = _optional_decimal(raw.get("vol_exec"))
+    if executed is None or not executed.is_finite() or executed < 0:
+        return None
+    return executed
 
 
 def _parse_recent_trades(payload: Any) -> list[Fill]:
