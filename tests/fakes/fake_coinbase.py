@@ -2,6 +2,7 @@
 
 Records every GET and POST. `product` is the public product payload. `orders`
 is the list-orders payload. `key_permissions` is what `check_key` sees.
+`order_record` builds one documented order row for that payload.
 """
 
 from __future__ import annotations
@@ -16,6 +17,48 @@ _DEFAULT_PRODUCT = {
     "quote_min_size": "1",
     "price": "100000",
 }
+
+
+def order_record(
+    *,
+    client_order_id: str,
+    status: str,
+    filled_size: str | None,
+    base_size: str = "1",
+    product_id: str = "BTC-USD",
+    side: str = "BUY",
+    stop_price: str | None = None,
+) -> dict:
+    """One documented Coinbase order row (List Orders ``orders[]`` / Get Order).
+
+    ``base_size`` is the requested size and ``filled_size`` the executed size;
+    ``filled_size=None`` leaves the field out. With ``stop_price`` the row is
+    a stop-limit GTC order (a protective stop), otherwise a market IOC.
+    """
+    if stop_price is None:
+        order_type, config = "MARKET", {"market_market_ioc": {"base_size": base_size}}
+    else:
+        order_type = "STOP_LIMIT"
+        config = {
+            "stop_limit_stop_limit_gtc": {
+                "base_size": base_size,
+                "stop_price": stop_price,
+                "limit_price": stop_price,
+                "stop_direction": "STOP_DIRECTION_STOP_DOWN",
+            }
+        }
+    row: dict = {
+        "order_id": f"order-{client_order_id}",
+        "client_order_id": client_order_id,
+        "product_id": product_id,
+        "side": side,
+        "status": status,
+        "order_type": order_type,
+        "order_configuration": config,
+    }
+    if filled_size is not None:
+        row["filled_size"] = filled_size
+    return row
 
 
 @dataclass
