@@ -28,16 +28,21 @@ Sources (all read-only):
      older than two timeframes ⇒ ``feed_stale``. The rule
      (:func:`candle_is_fresh`) is the one ``/api/v1/paper/health`` and
      ``/api/v1/paper/fleet/freshness`` use.
+  8. Stop repair without a rule price (M28.29): journal ticks that carry
+     ``stop_price_unavailable`` (an owned position had no resting stop and
+     the pack's stop rule gave no price, so the stop recorded at entry was
+     re-placed, or none) ⇒ one critical ``stop_price_unavailable`` alert per
+     (venue, pair), listed until acknowledged.
 
 Alerts are deduped, severity-sorted (critical first), and ordered by
 ``last_ts`` descending inside each severity band. Acknowledgements
 persist in ``<home>/run/alerts-ack.json`` keyed by alert id; a new
 occurrence with a greater ``last_ts`` un-acknowledges the alert. For the
-ongoing ``scheduler_stale``, ``unresolved_order_aging`` and ``feed_stale``
-conditions the occurrence is ``first_ts``, so an ack holds until the
-condition clears and recurs. ``tick_failure`` is dated from its
-``last_error`` write. A corrupt ack file is treated as empty and
-overwritten on the next ack.
+ongoing ``scheduler_stale``, ``unresolved_order_aging``, ``feed_stale``
+and ``stop_price_unavailable`` conditions the occurrence is ``first_ts``,
+so an ack holds until the condition clears and recurs. ``tick_failure``
+is dated from its ``last_error`` write. A corrupt ack file is treated as
+empty and overwritten on the next ack.
 """
 
 from __future__ import annotations
@@ -69,6 +74,13 @@ KIND_UNRESOLVED_ORDER_AGING = "unresolved_order_aging"
 KIND_RESTORE_FENCE = "restore_fence"
 KIND_FEED_STALE = "feed_stale"
 FEED_STALE_CODE = "candle_stale"
+# The tick-detail key ``run.tick`` journals when a stop repair has no price,
+# and the kind and code of the alert it raises.
+KIND_STOP_PRICE_UNAVAILABLE = "stop_price_unavailable"
+STOP_PRICE_UNAVAILABLE_KEY = "stop_price_unavailable"
+# ``run.RECONCILED_REASON``: a record that accounts a reconciled intent's
+# outcome, not a tick that maintained a stop.
+_RECONCILED_REASON = "reconciled"
 
 # Unresolved orders older than this surface as operator-supervision alerts.
 UNRESOLVED_AGING_SECONDS = 3600
@@ -81,8 +93,11 @@ STALE_CANDLE_TIMEFRAMES = 2
 # Conditions that stay true between reads. Their ``last_ts`` is the read time
 # (``now``) or the latest read that still shows them; the occurrence began at
 # ``first_ts`` (the venue's last tick, the order's first stamp, the tick that
-# first read a stale candle) and lasts until the condition clears.
-_ONGOING_KINDS = frozenset({KIND_SCHEDULER_STALE, KIND_UNRESOLVED_ORDER_AGING, KIND_FEED_STALE})
+# first read a stale candle, the tick that first found no stop price) and
+# lasts until the condition clears.
+_ONGOING_KINDS = frozenset(
+    {KIND_SCHEDULER_STALE, KIND_UNRESOLVED_ORDER_AGING, KIND_FEED_STALE, KIND_STOP_PRICE_UNAVAILABLE}
+)
 
 RESTORE_FENCE_REASON_PREFIX = "home restored"
 
@@ -799,6 +814,64 @@ def _collect_feed_stale(home: Path) -> list[Alert]:
     return out
 
 
+def _collect_stop_price_unavailable(home: Path) -> list[Alert]:
+    """Raise a critical alert for each pair whose stop repair had no rule price.
+
+    ``run.tick`` journals ``stop_price_unavailable`` when a position it owns
+    has no resting stop and the pack's stop rule gives no price on the tick's
+    candles; it then re-placed the stop recorded at entry, or no stop when
+    none was recorded. One occurrence runs from the first such tick of a
+    (venue, pair) until a later tick of that pair reads a bar without the
+    flag (a stop rests or was priced, or nothing is owned). A tick that read
+    no bar, and a record that accounts a reconciled intent, neither starts
+    nor ends it. The pair's latest occurrence stays listed after it ends,
+    because a re-placed recorded stop ends it on the next tick and a critical
+    alert must not vanish unseen; an ack retires it. ``first_ts`` dates the
+    occurrence, so repeated ticks notify once, an ack holds, and only a new
+    occurrence notifies again.
+    """
+
+    latest: dict[tuple[str, str], dict[str, int]] = {}
+    ended: set[tuple[str, str]] = set()
+    for record in _read_journal_dicts(home):
+        ts = record.get("ts")
+        venue = record.get("venue")
+        detail = record.get("detail")
+        if record.get("kind") != "tick" or not isinstance(ts, int) or not isinstance(venue, str):
+            continue
+        if not isinstance(detail, dict) or detail.get("reason") == _RECONCILED_REASON:
+            continue
+        pair = detail.get("pair")
+        if not isinstance(pair, str) or not pair:
+            continue
+        key = (venue, pair)
+        if detail.get(STOP_PRICE_UNAVAILABLE_KEY) is True:
+            if key in ended or key not in latest:
+                ended.discard(key)
+                latest[key] = {"first_ts": ts, "last_ts": ts, "count": 0}
+            occurrence = latest[key]
+            occurrence["last_ts"] = max(occurrence["last_ts"], ts)
+            occurrence["count"] += 1
+        elif key in latest and _read_candle(record) is not None:
+            ended.add(key)
+
+    return [
+        Alert(
+            id=_alert_id(KIND_STOP_PRICE_UNAVAILABLE, KIND_STOP_PRICE_UNAVAILABLE, venue, pair),
+            kind=KIND_STOP_PRICE_UNAVAILABLE,
+            severity=SEVERITY_CRITICAL,
+            code=KIND_STOP_PRICE_UNAVAILABLE,
+            venue=venue,
+            pair=pair,
+            count=occurrence["count"],
+            first_ts=occurrence["first_ts"],
+            last_ts=occurrence["last_ts"],
+            acknowledged=False,
+        )
+        for (venue, pair), occurrence in latest.items()
+    ]
+
+
 def collect(home: Path, *, now: int) -> list[Alert]:
     """Collect alerts from every read-only source and return them in a
     stable order.
@@ -816,6 +889,8 @@ def collect(home: Path, *, now: int) -> list[Alert]:
       * aged unresolved orders (``unresolved_order_aging``)
       * restore-fence kill reason (``restore_fence``)
       * armed feeds whose latest candle read was stale (``feed_stale``)
+      * stop repairs the pack's stop rule could not price
+        (``stop_price_unavailable``)
 
     The function never creates any file. An empty home yields ``[]``
     and leaves the filesystem untouched.
@@ -826,6 +901,7 @@ def collect(home: Path, *, now: int) -> list[Alert]:
     alerts.extend(_collect_restore_fence(Path(home), now=now))
     alerts.extend(_collect_needs_reconcile(Path(home)))
     alerts.extend(_collect_journal_refusals(Path(home)))
+    alerts.extend(_collect_stop_price_unavailable(Path(home)))
     alerts.extend(_collect_tick_failure(Path(home), now=now))
     alerts.extend(_collect_scheduler_stale(Path(home), now=now))
     alerts.extend(_collect_unresolved_order_aging(Path(home), now=now))
@@ -891,6 +967,7 @@ __all__ = [
     "KIND_FEED_STALE",
     "KIND_RESTORE_FENCE",
     "KIND_SCHEDULER_STALE",
+    "KIND_STOP_PRICE_UNAVAILABLE",
     "KIND_TICK_FAILURE",
     "KIND_UNRESOLVED_ORDER_AGING",
     "SCHEDULER_KINDS",
