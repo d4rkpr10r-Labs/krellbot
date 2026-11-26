@@ -397,6 +397,7 @@ def _dispatch_place(
     body: str,
     venue_obj: Any,
     identity: dict | None = None,
+    track: bool = False,
 ) -> tuple[str, OrderRef | None]:
     """Commit-before-send dispatch for every ``place_*`` call.
 
@@ -407,10 +408,18 @@ def _dispatch_place(
     ``"needs_reconcile"`` without invoking ``venue_obj``. ``StoreError``
     is propagated; the caller is responsible for refusing before any
     venue call.
+
+    ``track`` marks the committed intent for reconcile after its commit and
+    before the venue call, for an order whose acknowledgement proves nothing
+    about what executed. It is then an obligation until ``order_outcome`` (or
+    the operator) settles it, wherever the process stops after the send.
     """
     captured: list[OrderRef | None] = [None]
+    store = OperationalStore(home / "ops.sqlite")
 
     def _send(c: str, b: str) -> None:
+        if track:
+            audit_needs_reconcile(store, coid=c)
         payload = json.loads(b)
         kind = str(payload.get("kind", ""))
         if kind == "entry":
@@ -434,7 +443,6 @@ def _dispatch_place(
         # Owner context travels in the committed intent itself, durable before
         # any send, so a later process can attribute the outcome.
         body = json.dumps({**json.loads(body), **identity}, separators=(",", ":"), sort_keys=True)
-    store = OperationalStore(home / "ops.sqlite")
     try:
         state = Outbox(store).dispatch(coid, body, _send, mode=mode, venue=venue)
     except ProtectiveStopRejectedError:
@@ -791,6 +799,9 @@ def tick(
                         separators=(",", ":"),
                         sort_keys=True,
                     )
+                    # A live exit is an obligation from its commit: its
+                    # acknowledgement proves nothing about what executed.
+                    exit_tracked = armed.mode != "paper"
                     try:
                         exit_state, exit_ref = _dispatch_place(
                             home=home,
@@ -800,6 +811,7 @@ def tick(
                             coid=exit_coid,
                             body=exit_body,
                             venue_obj=venue_obj,
+                            track=exit_tracked,
                         )
                         if exit_state == "sent":
                             fill_context[exit_coid] = {
@@ -817,8 +829,10 @@ def tick(
                                 # obligation that holds this identity's exits and
                                 # repair (and entries on this venue and mode) until
                                 # order_outcome settles it, journaled once by
-                                # resolved_coid. Ownership stays as recorded.
-                                audit_needs_reconcile(OperationalStore(home / "ops.sqlite"), coid=exit_coid)
+                                # resolved_coid. Ownership stays as recorded. A
+                                # tracked exit was marked before its send.
+                                if not exit_tracked:
+                                    audit_needs_reconcile(OperationalStore(home / "ops.sqlite"), coid=exit_coid)
                             else:
                                 exit_qty = sold
                                 owned -= sold
@@ -1009,6 +1023,16 @@ def tick(
                     separators=(",", ":"),
                     sort_keys=True,
                 )
+                # A live acknowledgement is not an executed quantity: Kraken's
+                # reports none and Coinbase's echoes the requested size. So a
+                # live exit is an obligation from its commit, before the send,
+                # and journals exit_qty 0 here. Ownership stays as recorded,
+                # which holds this identity's exits and stop repair (and entries
+                # on this venue and mode) until order_outcome reports what
+                # executed; _resolve_obligations journals that once by
+                # resolved_coid. A residual stays strategy-owned, and the repair
+                # above re-protects it on a later bar. The coid is never resent.
+                exit_tracked = armed.mode != "paper"
                 try:
                     exit_state, _exit_ref = _dispatch_place(
                         home=home,
@@ -1018,10 +1042,14 @@ def tick(
                         coid=exit_coid,
                         body=exit_body,
                         venue_obj=venue_obj,
+                        track=exit_tracked,
                     )
-                    if exit_state == "sent":
+                    if exit_state == "sent" and not exit_tracked:
+                        # The paper venue sells exactly the quantity it is
+                        # asked to: its acknowledgement is its whole record.
                         exit_qty = owned
                         owned = Decimal(0)
+                    if exit_state == "sent":
                         fill_context[exit_coid] = {
                             "pack_id": armed.pack_id,
                             "pack_version": armed.pack_version,
@@ -1038,6 +1066,8 @@ def tick(
                     pack_intent_refused[armed.pack_id] = _venue_refused(exc, exit_coid, venue_refusals)
                 except (RuntimeError, ValueError):
                     pass
+                if exit_tracked:
+                    obligations_view = kb_obligations.read_obligations(home)
             elif target.long and owned > Decimal(0) and target.stop_price is not None and not repair_exited:
                 cur_stop = resting
                 if cur_stop is None or target.stop_price > cur_stop:
