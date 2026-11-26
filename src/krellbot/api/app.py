@@ -1019,6 +1019,136 @@ def _fleet_freshness_view(home: Path) -> dict:
     return {"schema_version": SCHEMA_VERSION, "feeds": feeds}
 
 
+# Settings 'Trust & billing' copy for ``GET /api/v1/entitlements`` (M28.14,
+# decision D10). Each key states what the code enforces today and is checked
+# against it in tests/test_entitlement_disclosure_matches_gate.py: the tick
+# gate (``license.entries_allowed`` on armed records whose
+# ``requires_license`` came from ``catalog.requires_license_for``), the
+# paid-install check (``checkout.has_entitlement``), and the export and
+# diagnostics routes, which never read the license. No price or plan is named
+# here until the owner decides one (M28.34).
+_ENTITLEMENT_RULES: tuple[tuple[str, str, str], ...] = (
+    (
+        "paid_catalogue_entries_need_license",
+        "gated",
+        (
+            "In the tick, the license decides one thing: whether packs installed from the paid catalogue "
+            "(packs/catalog/) may open new positions."
+        ),
+    ),
+    (
+        "grace_keeps_entries",
+        "gated",
+        (
+            "While the license is active or past due, those packs keep opening positions until the grace date "
+            "last verified on this computer. The tick does not go online to check."
+        ),
+    ),
+    (
+        "after_grace_entries_stop",
+        "gated",
+        (
+            "After that grace date, or if the license has any other status or was never verified on this "
+            "computer, paid catalogue packs open no new positions."
+        ),
+    ),
+    (
+        "exits_and_stops_continue",
+        "continues",
+        "Exits and protective stops keep running for every pack, paid catalogue packs included.",
+    ),
+    (
+        "nothing_force_closed",
+        "continues",
+        (
+            "A lapse never closes a position. Positions are sold only by the pack's exit rule or its stop "
+            "protection, as before the lapse."
+        ),
+    ),
+    (
+        "export_continues",
+        "continues",
+        "Export does not read the license. Home export and the journal keep working after a lapse.",
+    ),
+    (
+        "diagnostics_continue",
+        "continues",
+        "Diagnostics do not read the license. The diagnostic report keeps working after a lapse.",
+    ),
+    (
+        "own_and_community_packs_never_gated",
+        "never_gated",
+        "Packs you write and community packs never need a license. A lapse does not change how they run.",
+    ),
+    (
+        "paid_install_needs_sku_entitlement",
+        "records",
+        (
+            "Installing a paid catalogue entry from Packs needs its purchase recorded on this computer as a SKU "
+            "entitlement. Checkout records it; a refund removes it."
+        ),
+    ),
+    (
+        "records_can_disagree",
+        "records",
+        (
+            "The license status (new entries) and the SKU entitlements (paid installs) are separate records on "
+            "this computer and can disagree today. A refund removes the SKU entitlement but does not change the "
+            "license status."
+        ),
+    ),
+)
+
+# License cache statuses reported as-is; anything else reads ``other``.
+_LICENSE_STATUSES = frozenset({"active", "past_due", "lapsed", "dead", "revoked"})
+
+
+def _license_int(value: object) -> int | None:
+    """Parse a cache timestamp the way ``license.entries_allowed`` does, or None."""
+
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _entitlements_body(home: Path, *, now: int) -> dict:
+    """Read-only entitlement disclosure: license cache, SKU records, gated packs."""
+
+    from krellbot import catalog as kb_catalog
+    from krellbot import license as kb_license
+    from krellbot.application import checkout as kb_checkout
+
+    cache = kb_license.read_cache(home)
+    if cache is None:
+        status = "missing"
+    else:
+        raw_status = cache.get("status")
+        status = raw_status if isinstance(raw_status, str) and raw_status in _LICENSE_STATUSES else "other"
+    gated: list[str] = []
+    for root in (home / "packs", home / "packs" / "community", home / "packs" / "catalog"):
+        if not root.is_dir():
+            continue
+        for path in sorted(root.glob("*.json")):
+            if path.is_file() and kb_catalog.requires_license_for(path, home) and path.stem not in gated:
+                gated.append(path.stem)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "license": {
+            "status": status,
+            "period_end": None if cache is None else _license_int(cache.get("period_end")),
+            "grace_until": None if cache is None else _license_int(cache.get("grace_until")),
+            "paid_catalogue_entries_allowed": kb_license.entries_allowed(cache, now=int(now)),
+        },
+        "license_gated_packs": sorted(gated),
+        "sku_entitlements": kb_checkout.read_entitlements(home),
+        "records_can_disagree": True,
+        "rules": [{"key": key, "group": group, "text": text} for key, group, text in _ENTITLEMENT_RULES],
+    }
+
+
 def _format_sse(event_id: str, event_name: str, data_payload: dict) -> bytes:
     """Render a single SSE frame. JSON-encode the payload as ``data:``."""
 
@@ -2347,6 +2477,27 @@ def create_app(
             "license_required_for_exchange": False,
             "keys_leave_machine": False,
         }
+        return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/entitlements")
+    async def entitlements_get(request: Request) -> Response:
+        """Return what entitlements gate and what continues on lapse (M28.14).
+
+        Same session gate as ``GET /api/v1/trust`` (``_gate_get``): session
+        cookie + loopback Origin + loopback Host, no CSRF for the read.
+        Read-only: reads ``license.read_cache``, ``license.entries_allowed``,
+        ``catalog.requires_license_for`` and ``checkout.read_entitlements``,
+        never refreshes or writes either record, and names no price. The
+        license cache and the SKU entitlement records are reported side by
+        side because they are separate and can disagree.
+        """
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+
+        body = _entitlements_body(s.home, now=_app_now(s))
         return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/v1/demo-fixture")
