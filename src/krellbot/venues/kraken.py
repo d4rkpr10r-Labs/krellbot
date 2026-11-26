@@ -42,6 +42,7 @@ from krellbot.venues.base import (
     OrderRef,
     PairRules,
     Truth,
+    VenueRejectedError,
     WithdrawCapableError,
 )
 
@@ -208,6 +209,34 @@ def classify_documented_response(payload: object) -> str:
                 return KrakenDocumentedOutcome.PARTIALLY_FILLED
 
     raise ValueError("unrecognized documented kraken response shape")
+
+
+# Documented AddOrder errors that prove Kraken refused the order.
+_ORDER_REFUSALS = frozenset(
+    {
+        KrakenDocumentedOutcome.INSUFFICIENT_FUNDS,
+        KrakenDocumentedOutcome.ORDER_MINIMUM_NOT_MET,
+        KrakenDocumentedOutcome.INVALID_NONCE,
+    }
+)
+
+
+def _documented_refusal(errors: list) -> str | None:
+    """The refusal code when every error Kraken returned is one documented order refusal.
+
+    An error ``classify_documented_response`` does not recognize, a documented
+    error that is not a refusal (a rate limit), or a mix of codes proves
+    nothing about execution: ``None``, and the send's outcome stays unknown.
+    """
+    codes: set[str] = set()
+    for item in errors:
+        try:
+            codes.add(classify_documented_response({"error": [item]}))
+        except (TypeError, ValueError):
+            return None
+    if len(codes) != 1 or not codes <= _ORDER_REFUSALS:
+        return None
+    return codes.pop()
 
 
 class Transport(Protocol):
@@ -646,7 +675,7 @@ class KrakenVenue:
         qty: Decimal,
         stop: Decimal | None,
     ) -> OrderRef:
-        payload = self._private(endpoint, form)
+        payload = self._private(endpoint, form, order_send=True)
         order_id = ""
         if isinstance(payload, dict):
             result = payload.get("result")
@@ -814,7 +843,11 @@ class KrakenVenue:
         url = f"{BASE_URL}{PUBLIC_PATH}/{endpoint}?{urllib.parse.urlencode(query)}"
         return self._transport.get(url, {})
 
-    def _private(self, endpoint: str, form: dict[str, str]) -> Any:
+    def _private(self, endpoint: str, form: dict[str, str], *, order_send: bool = False) -> Any:
+        """POST one private call; ``order_send`` marks the call that places an order.
+
+        Only an order send turns a documented refusal into ``VenueRejectedError``.
+        """
         for _attempt in range(3):
             payload = self._send_once(endpoint, form)
             err = payload.get("error") if isinstance(payload, dict) else None
@@ -824,6 +857,9 @@ class KrakenVenue:
                     continue
                 if any("Permission" in str(item) or "Invalid key" in str(item) for item in err):
                     raise _PermissionDenied("kraken permission denied")
+                code = _documented_refusal(err) if order_send else None
+                if code is not None:
+                    raise VenueRejectedError("kraken", code)
                 raise RuntimeError(f"kraken {endpoint} rejected the request")
             self._rate_failures = 0
             return payload
