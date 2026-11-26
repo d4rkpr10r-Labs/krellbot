@@ -109,12 +109,19 @@ def _journal(*, venue: str, pair: str, mode: str, **fields: object) -> None:
     kb_journal.append({"ts": 1, "kind": "tick", "venue": venue, "pack": PACK, "bar_ts": ENTRY_BAR, "detail": detail})
 
 
-def _journaled(home: Path, bar_ts: int, field: str) -> Decimal:
-    """``field`` of the one tick record this pack journaled for ``bar_ts``."""
+def _journaled(home: Path, bar_ts: int, field: str, *, resolved_coid: str | None = None) -> Decimal:
+    """``field`` of the one tick record this pack journaled for ``bar_ts``.
+
+    That is the bar's own record, or with ``resolved_coid`` the one record that
+    later reconciled that intent's outcome (it carries the intent's bar).
+    """
     [record] = [
         r["detail"]
         for r in kb_journal.read_records_lenient(home)
-        if r.get("kind") == "tick" and r.get("pack") == PACK and r.get("bar_ts") == bar_ts
+        if r.get("kind") == "tick"
+        and r.get("pack") == PACK
+        and r.get("bar_ts") == bar_ts
+        and (r.get("detail") or {}).get("resolved_coid") == resolved_coid
     ]
     return Decimal(record[field])
 
@@ -566,7 +573,44 @@ def test_live_stop_listed_at_its_requested_size_does_not_undo_a_journaled_partia
     _live_tick(live, EXIT_BARS)
 
     assert live.sells() == [Decimal(3)]
-    assert _journaled(live.home, 3 * H, "exit_qty") == 3
+    # A live acknowledgement is not an executed quantity: ownership stays as recorded.
+    assert _journaled(live.home, 3 * H, "exit_qty") == 0
+    assert _journaled(live.home, 3 * H, "owned_qty_after") == 3
+
+    # The venue's own record now shows the exit sold 3 (and the stop cancelled).
+    exit_coid = run.coid_for(
+        pack_id=PACK, pack_version=VERSION, venue=live.venue, pair=live.pair, bar_ts=3 * H, intent="exit"
+    )
+    if live.venue == "kraken":
+        exit_row = order_info(
+            vol="3",
+            vol_exec="3",
+            status="closed",
+            pair=live.pair,
+            side="sell",
+            cl_ord_id=exit_coid,
+            userref=coid_userref(exit_coid),
+        )
+        live.transport.balances = {"USD": "100", live.base: str(EXTERNAL)}
+        live.transport.set_order_books(closed_rows={"OEXIT-EEEEE-FFFFFF": exit_row})
+    else:
+        live.hold(
+            EXTERNAL,
+            [
+                order_record(
+                    client_order_id=exit_coid,
+                    status="FILLED",
+                    filled_size="3",
+                    base_size="3",
+                    product_id=live.pair,
+                    side="SELL",
+                )
+            ],
+        )
+    _live_tick(live, [*EXIT_BARS, _candle(4 * H, "9")])
+
+    assert _journaled(live.home, 3 * H, "exit_qty", resolved_coid=exit_coid) == 3  # once, from order_outcome
+    assert live.sells() == [Decimal(3)]
 
 
 def test_live_resting_stop_keeps_protecting_a_journaled_position_after_restart(live):
@@ -582,4 +626,41 @@ def test_live_resting_stop_keeps_protecting_a_journaled_position_after_restart(l
     _live_tick(live, HOLD_THEN_EXIT_BARS)
 
     assert live.sells() == [Decimal(5)]
-    assert _journaled(live.home, 4 * H, "exit_qty") == 5
+    # A live acknowledgement is not an executed quantity: ownership stays as recorded.
+    assert _journaled(live.home, 4 * H, "exit_qty") == 0
+    assert _journaled(live.home, 4 * H, "owned_qty_after") == 5
+
+    # The venue's own record now shows the exit sold 5 (and the stop cancelled).
+    exit_coid = run.coid_for(
+        pack_id=PACK, pack_version=VERSION, venue=live.venue, pair=live.pair, bar_ts=4 * H, intent="exit"
+    )
+    if live.venue == "kraken":
+        exit_row = order_info(
+            vol="5",
+            vol_exec="5",
+            status="closed",
+            pair=live.pair,
+            side="sell",
+            cl_ord_id=exit_coid,
+            userref=coid_userref(exit_coid),
+        )
+        live.transport.balances = {"USD": "100", live.base: str(EXTERNAL)}
+        live.transport.set_order_books(closed_rows={"OEXIT-EEEEE-FFFFFF": exit_row})
+    else:
+        live.hold(
+            EXTERNAL,
+            [
+                order_record(
+                    client_order_id=exit_coid,
+                    status="FILLED",
+                    filled_size="5",
+                    base_size="5",
+                    product_id=live.pair,
+                    side="SELL",
+                )
+            ],
+        )
+    _live_tick(live, [*HOLD_THEN_EXIT_BARS, _candle(5 * H, "9")])
+
+    assert _journaled(live.home, 4 * H, "exit_qty", resolved_coid=exit_coid) == 5  # once, from order_outcome
+    assert live.sells() == [Decimal(5)]
