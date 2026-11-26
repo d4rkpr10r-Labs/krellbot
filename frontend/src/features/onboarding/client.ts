@@ -5,6 +5,15 @@
  * the API ever claimed live_ready, the client forces it false.
  */
 
+/** Where ``secrets.get`` takes a venue's credentials from (kind only, never a value). */
+export type CredentialSource = "keychain" | "env_override" | "keyfile_fallback";
+
+const CREDENTIAL_SOURCES: ReadonlySet<string> = new Set<CredentialSource>([
+  "keychain",
+  "env_override",
+  "keyfile_fallback",
+]);
+
 export type TrustSnapshot = {
   home: string;
   home_mode: string | null;
@@ -16,6 +25,14 @@ export type TrustSnapshot = {
   bind: string;
   live_arm_ui_allowed: boolean;
   trade_only_required: boolean;
+  /** Per venue; absent when the server does not report it. */
+  credential_source?: Record<string, CredentialSource>;
+};
+
+/** Opt-in Tailscale Serve access as reported by ``/api/v1/trust``. */
+export type RemoteAccess = {
+  mode: "off" | "tailscale_serve";
+  origin: string | null;
 };
 
 export type LiveGrantState = {
@@ -38,6 +55,9 @@ export type LiveWizardHonesty = {
   trade_only_required: boolean;
   license_required_for_exchange: boolean;
   keys_leave_machine: boolean;
+  /** Local address the request arrived on; null when not measurable. */
+  bind_measured?: string | null;
+  remote_access?: RemoteAccess | null;
 };
 
 export type TrustClient = {
@@ -64,9 +84,42 @@ function asGrant(raw: unknown): LiveGrantState {
   };
 }
 
+function asCredentialSources(
+  raw: unknown,
+): Record<string, CredentialSource> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+  const out: Record<string, CredentialSource> = {};
+  for (const [venue, kind] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof kind === "string" && CREDENTIAL_SOURCES.has(kind)) {
+      out[venue] = kind as CredentialSource;
+    }
+  }
+  return out;
+}
+
+function asRemoteAccess(raw: unknown): RemoteAccess | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const body = raw as Record<string, unknown>;
+  if (body.mode === "off") {
+    return { mode: "off", origin: null };
+  }
+  if (body.mode === "tailscale_serve") {
+    return {
+      mode: "tailscale_serve",
+      origin: typeof body.origin === "string" ? body.origin : null,
+    };
+  }
+  return null;
+}
+
 function asTrust(raw: unknown): TrustSnapshot {
   const body =
     raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const credentialSource = asCredentialSources(body.credential_source);
   return {
     home: typeof body.home === "string" ? body.home : "",
     home_mode: typeof body.home_mode === "string" ? body.home_mode : null,
@@ -80,6 +133,9 @@ function asTrust(raw: unknown): TrustSnapshot {
     bind: typeof body.bind === "string" ? body.bind : "127.0.0.1",
     live_arm_ui_allowed: body.live_arm_ui_allowed === true,
     trade_only_required: body.trade_only_required !== false,
+    ...(credentialSource !== undefined
+      ? { credential_source: credentialSource }
+      : {}),
   };
 }
 
@@ -110,6 +166,9 @@ export function parseLiveWizardHonesty(
     trade_only_required: body.trade_only_required !== false,
     license_required_for_exchange: body.license_required_for_exchange === true,
     keys_leave_machine: body.keys_leave_machine === true,
+    bind_measured:
+      typeof body.bind_measured === "string" ? body.bind_measured : null,
+    remote_access: asRemoteAccess(body.remote_access),
   };
 }
 
