@@ -166,7 +166,7 @@ jobs:
         env:
           KRELLBOT_E2E_SKIP_BUILD: "1"
           PLAYWRIGHT_JSON_OUTPUT_NAME: journeys-results.json
-        run: npm run test:journeys -- --reporter=list,json
+        run: npm run test:journeys -- --reporter=list,json,./journeys/helpers/journeyOutcomes.ts
       - name: Preserve public journey outcomes
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2 (Node 24)
