@@ -41,7 +41,7 @@ from krellbot.api.security import (
     reconnect_offer_valid,
     reconnect_redeem_path,
 )
-from krellbot.api.tailnet import TailnetAccess
+from krellbot.api.tailnet import REMOTE_SCOPES, TailnetAccess, read_remote_scope, write_remote_scope
 from krellbot.application import alerts as alerts_app
 from krellbot.application import live_gate, live_guardrails
 from krellbot.application import operations as operations_view_app
@@ -52,6 +52,7 @@ from krellbot.application.live_preflight import evaluate as live_preflight_evalu
 from krellbot.application.paper import (
     project_forward_paper_ledger,
     project_owned_position,
+    project_paper_assumptions,
     project_paper_pnl_position_chart,
     project_portfolio_history,
 )
@@ -1433,7 +1434,13 @@ def create_app(
         return await call_next(request)
 
     if tailnet_access is not None:
-        tailnet_access.install(app, state.sessions, port=port, dist_dir=_resolve_dist_dir(dist_dir))
+        tailnet_access.install(
+            app,
+            state.sessions,
+            port=port,
+            dist_dir=_resolve_dist_dir(dist_dir),
+            home=state.home,
+        )
 
     @app.post("/api/v1/session/bootstrap")
     async def bootstrap(request: Request) -> Response:
@@ -2686,6 +2693,9 @@ def create_app(
         ``trust.bind`` stays the literal ``127.0.0.1``. ``bind_measured``
         is the local address this request arrived on, and
         ``remote_access`` says whether Tailscale Serve access is on.
+        ``remote_scope`` is the stored tailnet scope (``read_only`` unless a
+        loopback session stored ``full``); it sits beside ``remote_access``,
+        whose two keys stay as they are.
         """
 
         s = _state(request.app)
@@ -2716,8 +2726,60 @@ def create_app(
             "keys_leave_machine": False,
             "bind_measured": _measured_bind(request),
             "remote_access": _remote_access_view(tailnet_access),
+            "remote_scope": read_remote_scope(s.home),
         }
         return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @app.put("/api/v1/remote-access/scope")
+    async def remote_scope_put(request: Request) -> Response:
+        """Set what a Tailscale session may do (D14): ``read_only`` or ``full``.
+
+        Same state-change gate as other PUTs (session cookie + CSRF +
+        loopback Origin). Only a loopback session may change it: a server
+        started with Tailscale access admits only tailnet sessions, so it
+        refuses every write here with ``remote_scope_loopback_only``. Under
+        ``read_only`` the Tailscale middleware refuses the write before it
+        arrives. There is no CLI flag for this.
+        """
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        if tailnet_access is not None:
+            message = "Change remote access from a local session on this computer."
+            return JSONResponse(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "code": "remote_scope_loopback_only",
+                    "ok": False,
+                    "effect": "refused",
+                    "message": message,
+                    "detail": message,
+                },
+                status_code=403,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            return JSONResponse({"detail": "invalid body"}, status_code=400)
+        scope = payload.get("scope") if isinstance(payload, dict) else None
+        if scope not in REMOTE_SCOPES:
+            return JSONResponse({"detail": "scope must be 'read_only' or 'full'"}, status_code=400)
+
+        stored = write_remote_scope(s.home, scope)
+        return JSONResponse(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "ok": True,
+                "code": "remote_scope_updated",
+                "remote_scope": stored,
+            },
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/v1/entitlements")
     async def entitlements_get(request: Request) -> Response:
@@ -3711,6 +3773,34 @@ def create_app(
             },
             headers={"Cache-Control": "no-store"},
         )
+
+    @app.get("/api/v1/paper/assumptions")
+    async def paper_assumptions(request: Request) -> Response:
+        """What a paper run on one venue assumes, as the paper engine uses it.
+
+        Same session gate as ``GET /api/v1/paper/status`` (``_gate_get``):
+        session cookie + loopback Origin + loopback Host, no CSRF. ``venue``
+        is required. The body gives that venue's taker fee and the paper
+        slippage, with the research fee-model label. An optional ``pair``
+        adds the paper-mode armed record's timeframe, stop rule and starting
+        cash. A value the engine does not give is null. Read-only: never
+        constructs a venue, writes, or reaches the network.
+        """
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+
+        venue = (request.query_params.get("venue") or "").strip()
+        if not venue:
+            return JSONResponse(
+                {"detail": "venue required"},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        pair = (request.query_params.get("pair") or "").strip() or None
+        body = project_paper_assumptions(s.home, venue=venue, pair=pair)
+        return JSONResponse(body, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/v1/paper/position")
     async def paper_position(request: Request) -> Response:
