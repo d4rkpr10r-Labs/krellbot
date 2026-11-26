@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import base64
 import json
+import urllib.parse
 from collections.abc import Callable
+from dataclasses import replace
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Protocol
 
@@ -28,14 +30,17 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 
 from krellbot import release_policy, sanitize
 from krellbot.venues.base import (
+    UNKNOWN_OUTCOME,
     Balance,
     Fill,
     KeyPerms,
     OpenOrder,
+    OrderOutcome,
     OrderRef,
     PairRules,
     ProtectiveStopRejectedError,
     Truth,
+    VenueRejectedError,
     WithdrawCapableError,
 )
 
@@ -44,6 +49,14 @@ BASE_URL = f"https://{API_HOST}"
 DEFAULT_LOT_DECIMALS = 8
 DEFAULT_PRICE_DECIMALS = 5
 STOP_BUFFER = Decimal("0.005")  # limit = stop * (1 - 0.5%)
+# A protective stop's client_order_id is its entry's coid plus this suffix.
+STOP_COID_SUFFIX = "_stop"
+# Order-history pages read for one lookup: a bound, never full pagination.
+ORDER_HISTORY_PAGES = 5
+# Documented order statuses. A working order can still execute; a final one
+# cannot. Any other status (UNKNOWN_ORDER_STATUS, a new one) proves nothing.
+_WORKING_ORDER_STATUSES = frozenset({"PENDING", "QUEUED", "OPEN", "CANCEL_QUEUED"})
+_FINAL_ORDER_STATUSES = frozenset({"FILLED", "CANCELLED", "EXPIRED", "FAILED"})
 
 
 class CoinbaseDocumentedOutcome:
@@ -350,6 +363,8 @@ class CoinbaseVenue:
         self._nonce_fn = nonce_fn or _default_nonce
         self._recent: dict[str, OrderRef] = {}
         self._prices: dict[str, Decimal] = {}
+        # Order records read for sell fills, by order_id (None: not shown).
+        self._fill_orders: dict[str, dict | None] = {}
 
     # ---- public protocol surface ----------------------------------------
 
@@ -374,7 +389,7 @@ class CoinbaseVenue:
         return Truth(
             balances=_parse_coinbase_balances(accounts),
             open_orders=_parse_coinbase_orders(orders),
-            recent_fills=_parse_coinbase_fills(fills),
+            recent_fills=self._link_sell_fills(_parse_coinbase_fills(fills)),
         )
 
     def place_entry_with_stop(self, coid: str, qty: Decimal, stop: Decimal, *, pair: str) -> OrderRef:
@@ -409,6 +424,9 @@ class CoinbaseVenue:
         )
         filled_qty = _entry_filled_qty(entry, requested=lot)
         if filled_qty is None:
+            code = _documented_refusal(entry)
+            if code is not None:
+                raise VenueRejectedError("coinbase", code)
             raise RuntimeError("coinbase entry was not filled; stop not placed")
 
         stop_body = {
@@ -460,6 +478,9 @@ class CoinbaseVenue:
             },
         )
         if not _order_ok(resp):
+            code = _documented_refusal(resp)
+            if code is not None:
+                raise VenueRejectedError("coinbase", code)
             raise RuntimeError("coinbase exit was not accepted")
         return OrderRef(
             id=_extract_order_id(resp),
@@ -469,6 +490,62 @@ class CoinbaseVenue:
             qty=lot,
             filled_qty=lot,
             stop_price=None,
+        )
+
+    def place_stop(self, coid: str, qty: Decimal, stop: Decimal, *, pair: str) -> OrderRef:
+        """Rest a stop-limit GTC sell for ``qty`` at ``stop`` whose ``client_order_id`` is ``coid``.
+
+        Create Order
+        (https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/orders/create-order)
+        with ``stop_limit_stop_limit_gtc``: the same order the entry's protective
+        stop is, limit ``STOP_BUFFER`` under the stop, ``STOP_DIRECTION_STOP_DOWN``.
+        The coid itself is the ``client_order_id``, so ``order_outcome`` finds it
+        by exact match and ``_link_sell_fills`` names its fills by it. An order the
+        bounded history already shows under the coid is returned and nothing is
+        sent. Only ``base_min_size`` is checked here. A documented create-order
+        refusal raises ``VenueRejectedError``; any other failure ``RuntimeError``.
+        """
+        release_policy.ensure_live_orders_allowed()
+        product = pair or self._product_id
+        if not product:
+            raise ValueError("coinbase stop requires a pair")
+        found = self._find_order(coid, product)
+        if found is not None:
+            return found
+        rules = self.rules(product)
+        lot = _quantize_qty(qty, rules.lot_decimals)
+        price_stop = _quantize_price(stop, rules.price_decimals)
+        _reject_size(lot, rules, None)
+        limit_price = _quantize_price(price_stop * (Decimal(1) - STOP_BUFFER), rules.price_decimals)
+        resp = self._post(
+            "/api/v3/brokerage/orders",
+            {
+                "client_order_id": coid,
+                "product_id": product,
+                "side": "SELL",
+                "order_configuration": {
+                    "stop_limit_stop_limit_gtc": {
+                        "base_size": format(lot, "f"),
+                        "stop_price": format(price_stop, "f"),
+                        "limit_price": format(limit_price, "f"),
+                        "stop_direction": "STOP_DIRECTION_STOP_DOWN",
+                    },
+                },
+            },
+        )
+        if not _order_ok(resp):
+            code = _documented_refusal(resp)
+            if code is not None:
+                raise VenueRejectedError("coinbase", code)
+            raise RuntimeError("coinbase stop was not accepted")
+        return OrderRef(
+            id=_extract_order_id(resp),
+            coid=coid,
+            pair=product,
+            side="sell",
+            qty=lot,
+            filled_qty=Decimal(0),
+            stop_price=price_stop,
         )
 
     def cancel_stops(self, pair: str) -> None:
@@ -510,6 +587,43 @@ class CoinbaseVenue:
             qty=ref.qty,
             stop_price=ref.stop_price,
         )
+
+    def order_outcome(self, coid: str, *, pair: str) -> OrderOutcome:
+        """Report what Coinbase's own record of ``coid``'s order says executed.
+
+        Finds the order by exact ``client_order_id`` through the bounded
+        order-history lookup that stops ``place_entry_with_stop`` from
+        resending a coid (``_find_order``), so the coid's ``<coid>_stop`` or
+        any other order never stands in for it. Reads the executed size
+        (``filled_size``), never the requested ``base_size``. Still working:
+        ``open`` with nothing executed, else ``partial``. Filled, cancelled,
+        expired or failed: ``filled`` at the executed size, or ``absent`` when
+        the record shows nothing executed, as for an IOC that found no
+        liquidity. No match in the five bounded pages (a rejected entry is
+        never recorded), an unreadable executed size or status, or ``FILLED``
+        with nothing executed is ``unknown``: the history is not a complete
+        record, so the caller keeps its hold. Never sends an order.
+        """
+        product = pair or self._product_id
+        if not product:
+            return UNKNOWN_OUTCOME
+        raw = self._find_order_record(coid, product)
+        if raw is None:
+            return UNKNOWN_OUTCOME
+        executed = _executed_qty(raw)
+        if executed is None:
+            return UNKNOWN_OUTCOME
+        status = str(raw.get("status") or "").upper()
+        if status in _WORKING_ORDER_STATUSES:
+            if executed > 0:
+                return OrderOutcome(status="partial", filled_qty=executed, authoritative=True)
+            return OrderOutcome(status="open", authoritative=True)
+        if status in _FINAL_ORDER_STATUSES:
+            if executed > 0:
+                return OrderOutcome(status="filled", filled_qty=executed, authoritative=True)
+            if status != "FILLED":
+                return OrderOutcome(status="absent", authoritative=True)
+        return UNKNOWN_OUTCOME
 
     def check_key(self) -> KeyPerms:
         perms = self._get("/api/v3/brokerage/key_permissions")
@@ -558,25 +672,81 @@ class CoinbaseVenue:
         return self._transport.get(f"{BASE_URL}{path}", {})
 
     def _find_order(self, coid: str, pair: str) -> OrderRef | None:
+        raw = self._find_order_record(coid, pair)
+        return _ref_from_coinbase(raw, coid) if raw is not None else None
+
+    def _find_order_record(self, coid: str, pair: str) -> dict | None:
+        """The order row whose ``client_order_id`` is ``coid``, from at most five pages."""
+        rows = self._order_history_rows(f"product_ids={pair}")
+        return next((raw for raw in rows if str(raw.get("client_order_id") or "") == coid), None)
+
+    def _order_history_rows(self, query: str):
+        """Yield List Orders rows for ``query`` from at most ``ORDER_HISTORY_PAGES`` pages, lazily."""
         cursor = ""
-        for _page in range(5):
-            path = f"/api/v3/brokerage/orders/historical/batch?product_ids={pair}"
+        for _page in range(ORDER_HISTORY_PAGES):
+            path = f"/api/v3/brokerage/orders/historical/batch?{query}"
             if cursor:
                 path = f"{path}&cursor={cursor}"
             payload = self._get(path)
             if not isinstance(payload, dict):
-                return None
+                return
             orders = payload.get("orders")
             if isinstance(orders, list):
-                for raw in orders:
-                    if isinstance(raw, dict) and str(raw.get("client_order_id") or "") == coid:
-                        return _ref_from_coinbase(raw, coid)
+                yield from (raw for raw in orders if isinstance(raw, dict))
             if payload.get("has_next") is not True:
-                return None
+                return
             cursor = str(payload.get("cursor") or "")
             if not cursor:
-                return None
-        return None
+                return
+
+    def _link_sell_fills(self, fills: list[tuple[Fill, str]]) -> list[Fill]:
+        """Name the client order behind each sell fill, from documented fields only.
+
+        A List Fills row names the order it executed by ``order_id`` and
+        carries no client order id
+        (https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/orders/list-fills).
+        The order record, read through the documented ``order_ids`` filter of
+        List Orders within the same five-page bound as ``_find_order``
+        (https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/orders/list-orders),
+        carries ``client_order_id``. ``place_entry_with_stop`` gives the
+        protective stop ``<entry coid>_stop``, and Edit Order keeps the order
+        and its ids, so the fill's ``order_coid`` is the entry coid. Any other
+        order is named by its own ``client_order_id``. An order the bounded
+        lookup does not show, or a record without a ``client_order_id``, is
+        ``order_unknown``. Buys are never a protective stop and are not looked
+        up. Each order is read once per adapter instance; a failed read raises,
+        as any other snapshot read does.
+        """
+        wanted = {oid for fill, oid in fills if fill.side == "sell" and oid and oid not in self._fill_orders}
+        if wanted:
+            found = self._order_records_by_id(wanted)
+            self._fill_orders.update({oid: found.get(oid) for oid in wanted})
+        linked: list[Fill] = []
+        for fill, order_id in fills:
+            if fill.side != "sell":
+                linked.append(fill)
+                continue
+            raw = self._fill_orders.get(order_id) if order_id else None
+            client = str(raw.get("client_order_id") or "") if raw is not None else ""
+            if not client:
+                linked.append(replace(fill, order_unknown=True))
+                continue
+            if client.endswith(STOP_COID_SUFFIX) and len(client) > len(STOP_COID_SUFFIX):
+                client = client[: -len(STOP_COID_SUFFIX)]
+            linked.append(replace(fill, order_coid=client))
+        return linked
+
+    def _order_records_by_id(self, order_ids: set[str]) -> dict[str, dict]:
+        """The order row for each of ``order_ids`` that the bounded lookup shows."""
+        query = "&".join(f"order_ids={urllib.parse.quote(oid, safe='')}" for oid in sorted(order_ids))
+        found: dict[str, dict] = {}
+        for raw in self._order_history_rows(query):
+            order_id = str(raw.get("order_id") or "")
+            if order_id in order_ids:
+                found.setdefault(order_id, raw)
+                if len(found) == len(order_ids):
+                    break
+        return found
 
 
 def _decimals(increment: str) -> int:
@@ -664,6 +834,14 @@ def _optional_decimal(raw: Any) -> Decimal | None:
         return None
 
 
+def _executed_qty(raw: dict) -> Decimal | None:
+    """The order's executed size (``filled_size``), or None when unreadable."""
+    executed = _optional_decimal(raw.get("filled_size"))
+    if executed is None or not executed.is_finite() or executed < 0:
+        return None
+    return executed
+
+
 def _entry_filled_qty(resp: Any, *, requested: Decimal) -> Decimal | None:
     """Read the confirmed IOC fill, using FILLED only when size is omitted."""
     if not isinstance(resp, dict) or resp.get("success") is not True:
@@ -678,6 +856,31 @@ def _entry_filled_qty(resp: Any, *, requested: Decimal) -> Decimal | None:
     if filled is None or not filled.is_finite() or not Decimal(0) < filled <= requested:
         return None
     return filled
+
+
+# Documented create-order failures that prove Coinbase refused the order.
+_ORDER_REFUSALS = frozenset(
+    {CoinbaseDocumentedOutcome.INSUFFICIENT_FUNDS, CoinbaseDocumentedOutcome.ORDER_MINIMUM_NOT_MET}
+)
+
+
+def _documented_refusal(resp: Any) -> str | None:
+    """The refusal code when ``resp`` is a documented create-order failure.
+
+    Only ``success: false`` with an ``error_response`` that
+    ``classify_documented_response`` maps to a refusal counts. No response, a
+    request-level error (authentication, rate limit), an unrecognized failure
+    or an accepted order proves nothing about execution: ``None``.
+    """
+    if not isinstance(resp, dict) or resp.get("success") is not False:
+        return None
+    if not isinstance(resp.get("error_response"), dict):
+        return None
+    try:
+        code = classify_documented_response(resp)
+    except (TypeError, ValueError):
+        return None
+    return code if code in _ORDER_REFUSALS else None
 
 
 def _order_ok(resp: Any) -> bool:
@@ -719,11 +922,12 @@ def _parse_coinbase_balances(payload: Any) -> list[Balance]:
     return out
 
 
-def _parse_coinbase_fills(payload: Any) -> list[Fill]:
+def _parse_coinbase_fills(payload: Any) -> list[tuple[Fill, str]]:
+    """Each List Fills row as a ``Fill`` and the ``order_id`` of the order it executed."""
     fills = payload.get("fills") if isinstance(payload, dict) else None
     if not isinstance(fills, list):
         return []
-    out: list[Fill] = []
+    out: list[tuple[Fill, str]] = []
     for raw in fills:
         if not isinstance(raw, dict):
             continue
@@ -731,17 +935,17 @@ def _parse_coinbase_fills(payload: Any) -> list[Fill]:
         price = _optional_decimal(raw.get("price"))
         if qty is None or price is None:
             continue
-        out.append(
-            Fill(
-                id=str(raw.get("entry_id", "")),
-                coid=str(raw.get("client_order_id", "")),
-                pair=str(raw.get("product_id", "")),
-                side=str(raw.get("side", "")),
-                qty=qty,
-                price=price,
-                ts_ms=_fill_ts(raw.get("trade_time")),
-            )
+        fill = Fill(
+            id=str(raw.get("entry_id", "")),
+            coid=str(raw.get("client_order_id", "")),
+            pair=str(raw.get("product_id", "")),
+            # Documented as BUY / SELL; the engine compares lowercase sides.
+            side=str(raw.get("side", "")).lower(),
+            qty=qty,
+            price=price,
+            ts_ms=_fill_ts(raw.get("trade_time")),
         )
+        out.append((fill, str(raw.get("order_id") or "")))
     return out
 
 

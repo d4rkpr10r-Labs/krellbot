@@ -15,6 +15,13 @@ When live is re-enabled, order paths require THREE things, all of them true:
 3. The kill switch file under ``<home>/run/kill-switch.json`` is not
    engaged.
 
+The kill switch stops new entries only, as on paper. ``check_live_send``
+refuses under it, so live arm, web live arm and promotion stay refused.
+``check_live_tick`` lets a killed live tick run its exits, stop repair,
+``raise_stop`` and reconcile once the paper-only release, the environment
+variable and the grant allow it. The restore fence (a home restore's kill
+switch and entries pause) still refuses every send.
+
 This module is the ONLY place that reads or writes the authorization
 record. The workstation grants and revokes it through
 :func:`grant_authorization` / :func:`revoke_authorization` behind a typed
@@ -58,6 +65,10 @@ CODE_CONFIRMATION_REQUIRED = "confirmation_required"
 CODE_AUTHORIZED = "live_authorized"
 CODE_REVOKED = "live_authorization_revoked"
 CODE_LIVE_ARM_VENUE_UNSUPPORTED = "live_arm_venue_unsupported"
+
+# ``storage.home_backup`` engages the kill switch with a reason that starts
+# with this when it fences a restored home.
+RESTORE_FENCE_REASON_PREFIX = "home restored"
 
 
 @dataclass(frozen=True)
@@ -411,19 +422,15 @@ def _refusal(code: str, message: str) -> LiveGateResult:
     return LiveGateResult(code=code, ok=False, message=message)
 
 
-def check_live_send(
+def _check_operator_authorization(
     home: Path,
     *,
     venue: str,
     pair: str,
-    env: Mapping[str, str] | None = None,
-    now: int | None = None,
+    env: Mapping[str, str] | None,
+    now: int | None,
 ) -> LiveGateResult:
-    """Authorize (or refuse) a single live send."""
-    if release_policy.paper_only_release_active():
-        return _refusal(CODE_PAPER_ONLY_RELEASE, release_policy.paper_only_message())
-    if kill_state(home).engaged:
-        return _refusal(CODE_KILL_SWITCH, "kill switch engaged; live send refused")
+    """``KRELLBOT_ENABLE_LIVE`` and an operator grant for the exact venue/pair."""
     if _resolve_env(env, "KRELLBOT_ENABLE_LIVE") != "1":
         return _refusal(CODE_LIVE_DISABLED, "KRELLBOT_ENABLE_LIVE is not '1'; live send refused")
     grants = read_authorization(home, now=_resolve_now(now))
@@ -433,6 +440,75 @@ def check_live_send(
             "live send not authorized for venue/pair",
         )
     return LiveGateResult(CODE_OK, True, "live send authorized")
+
+
+def check_live_send(
+    home: Path,
+    *,
+    venue: str,
+    pair: str,
+    env: Mapping[str, str] | None = None,
+    now: int | None = None,
+) -> LiveGateResult:
+    """Authorize (or refuse) a single live send, a new entry included.
+
+    The kill switch refuses here, so live arm, web live arm and promotion stay
+    refused while it is engaged. A live tick is gated by
+    :func:`check_live_tick`, which keeps exits and stops running.
+    """
+    if release_policy.paper_only_release_active():
+        return _refusal(CODE_PAPER_ONLY_RELEASE, release_policy.paper_only_message())
+    if kill_state(home).engaged:
+        return _refusal(CODE_KILL_SWITCH, "kill switch engaged; live send refused")
+    return _check_operator_authorization(home, venue=venue, pair=pair, env=env, now=now)
+
+
+def restore_fence_engaged(state: KillState, *, entries_paused: bool) -> bool:
+    """True when the kill switch and a live arm are behind the home-restore fence.
+
+    A restore pauses every live arm's entries and engages the kill switch
+    with a ``home restored`` reason (``storage.home_backup``). While the kill
+    switch is engaged, either mark keeps the fence, so a later operator kill
+    or a cleared entries pause does not lift it. Only releasing the kill
+    switch does.
+    """
+    if not state.engaged:
+        return False
+    return entries_paused or (state.reason or "").startswith(RESTORE_FENCE_REASON_PREFIX)
+
+
+def check_live_tick(
+    home: Path,
+    *,
+    venue: str,
+    pair: str,
+    entries_paused: bool,
+    env: Mapping[str, str] | None = None,
+    now: int | None = None,
+) -> LiveGateResult:
+    """Authorize (or refuse) one live arm's tick.
+
+    ``ok`` lets the tick run. With the kill switch released the code is
+    ``ok`` and the tick may send anything :func:`check_live_send` allows.
+    With it engaged the code is ``kill_switch_engaged``: the tick sends no
+    new entry, while exits, stop repair, ``raise_stop`` and the reconcile of
+    unresolved orders run, as on paper. The tick reads the kill switch again
+    before each entry.
+
+    The kill switch never stands in for the rest of the gate. The paper-only
+    release, ``KRELLBOT_ENABLE_LIVE`` and the operator grant still refuse
+    every send. The restore fence (:func:`restore_fence_engaged`) refuses
+    with ``kill_switch_engaged``: it sends nothing.
+    """
+    if release_policy.paper_only_release_active():
+        return _refusal(CODE_PAPER_ONLY_RELEASE, release_policy.paper_only_message())
+    kill = kill_state(home)
+    if restore_fence_engaged(kill, entries_paused=entries_paused):
+        return _refusal(CODE_KILL_SWITCH, "restore fence engaged; live send refused")
+    authorized = _check_operator_authorization(home, venue=venue, pair=pair, env=env, now=now)
+    if not authorized.ok or not kill.engaged:
+        return authorized
+    return LiveGateResult(CODE_KILL_SWITCH, True, "kill switch engaged; no new entry, exits and stops run")
 
 
 def check_web_live_arm(

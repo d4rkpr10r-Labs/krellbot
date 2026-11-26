@@ -129,6 +129,26 @@ export type CommandResult = {
   kill_switch?: { engaged: boolean; reason: string | null; engaged_at: number | null };
 };
 
+/**
+ * ``operations.resolve_order`` payload. Without ``outcome`` the server settles
+ * the order from its recorded venue lookup. With one, the operator asserts what
+ * happened and must type the client order ID back as ``confirmation``.
+ */
+export type ResolveOrderRequest = {
+  client_order_id: string;
+  outcome?: "executed" | "not_executed";
+  executed_qty?: string;
+  confirmation?: string;
+};
+
+export type ResolveOrderResult = CommandResult & {
+  client_order_id?: string;
+  outcome?: string | null;
+  filled_qty?: string | null;
+  evidence?: string | null;
+  attributed?: boolean;
+};
+
 export type OperationsClient = {
   getOperations(): Promise<OperationsViewModel>;
   promote(venue: string, pair: string, revisionId: string): Promise<CommandResult>;
@@ -140,6 +160,7 @@ export type OperationsClient = {
   listDeploymentRecords?(): Promise<DeploymentRecordRow[]>;
   getDeploymentRecord?(deploymentId: string): Promise<DeploymentRecordRow>;
   listUnresolvedOrders?(): Promise<UnresolvedOrderRow[]>;
+  resolveOrder?(request: ResolveOrderRequest): Promise<ResolveOrderResult>;
   listJournal?(query?: JournalBrowseQuery): Promise<JournalRecordRow[]>;
   getLiveAuthorization?(): Promise<LiveAuthorizationView>;
   grantLiveAuthorization?(
@@ -550,6 +571,9 @@ export function createHttpClient(): OperationsClient {
           .map(adaptUnresolvedOrder)
           .filter((row): row is UnresolvedOrderRow => row !== null);
       });
+    },
+    resolveOrder(request: ResolveOrderRequest): Promise<ResolveOrderResult> {
+      return postCommand("operations.resolve_order", { ...request }) as Promise<ResolveOrderResult>;
     },
     listJournal(query?: JournalBrowseQuery): Promise<JournalRecordRow[]> {
       return getOperationsReadJson(journalBrowseUrl(query), "journal").then((raw) => {

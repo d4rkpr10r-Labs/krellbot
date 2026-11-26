@@ -55,8 +55,13 @@ class Fill:
     price: Decimal
     ts_ms: int
     # Client order id of the resting order this fill executed, when the venue
-    # reports it (paper stop fills do). ``coid`` stays the fill's own id.
+    # reports it (paper stop fills do). A live protective stop's fill names the
+    # entry coid that placed the stop. ``coid`` stays the fill's own id.
     order_coid: str | None = None
+    # True when the venue looked up which order executed this sell and could
+    # not establish it from documented fields, so the fill cannot be shown not
+    # to be a strategy's protective stop. ``order_coid`` is then None.
+    order_unknown: bool = False
 
 
 @dataclass(frozen=True)
@@ -227,6 +232,29 @@ class ProtectiveStopRejectedError(RuntimeError):
     """The venue filled an entry and refused the protective stop."""
 
 
+# Codes from the adapters' ``classify_documented_response`` that mean the
+# venue refused an order outright, so nothing executed.
+VENUE_REFUSAL_CODES = frozenset({"insufficient_funds", "order_minimum_not_met", "invalid_nonce"})
+
+
+class VenueRejectedError(RuntimeError):
+    """The venue's documented response refused the order: nothing executed.
+
+    ``code`` is one of ``VENUE_REFUSAL_CODES``. The message names only the
+    venue and the code, never the venue's own text. A response that does not
+    prove a refusal (no response, a transport error, an unrecognized error,
+    an order accepted without fill evidence) is never this error, so its
+    outcome stays unknown.
+    """
+
+    def __init__(self, venue: str, code: str) -> None:
+        if code not in VENUE_REFUSAL_CODES:
+            raise ValueError("not a documented venue refusal code")
+        super().__init__(f"{venue} refused the order: {code}")
+        self.venue = venue
+        self.code = code
+
+
 class WithdrawCapableError(RuntimeError):
     """Raised when `check_key` finds the key can withdraw. Engine refuses it.
 
@@ -292,6 +320,18 @@ class Venue(Protocol):
     def place_entry_with_stop(self, coid: str, qty: Decimal, stop: Decimal, *, pair: str) -> OrderRef: ...
 
     def place_exit(self, coid: str, qty: Decimal, *, pair: str) -> OrderRef: ...
+
+    def place_stop(self, coid: str, qty: Decimal, stop: Decimal, *, pair: str) -> OrderRef | None:
+        """Rest a sell stop for ``qty`` at ``stop`` under ``coid``, with no entry.
+
+        The run repairs a missing protective stop with it. An order already
+        resting under ``coid`` is not sent again. A refusal raises. The order
+        must be findable again by ``coid`` (the venue's outcome lookup) and
+        its fills must name ``coid`` as ``Fill.order_coid``. An adapter that
+        cannot rest a stop on its own leaves the method out; the run then
+        protects the position by exiting it.
+        """
+        ...
 
     def cancel_stops(self, pair: str) -> None: ...
 

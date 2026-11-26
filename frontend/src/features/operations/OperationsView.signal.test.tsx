@@ -26,7 +26,7 @@ const DISABLED_TEXT =
 const NO_GRANTS_TEXT =
   "No operator grant is on file.";
 const PROMO_DEFERRED_TEXT = "Changing settings or adding an operator grant cannot enable live orders.";
-const KILL_HELPER = "Engaging stops new entries and all live sends. It does not sell or disarm.";
+const KILL_HELPER = "Engaging stops new entries. Strategy exits and protective stops keep running. Engaging it does not sell or disarm.";
 const KILL_RELEASED_TEXT = "Kill switch: released";
 const NO_ALERTS_TEXT = "No alerts.";
 const NO_ALERTS_MATCH_TEXT = "No alerts match the current filters.";

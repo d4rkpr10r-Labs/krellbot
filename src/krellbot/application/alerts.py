@@ -24,15 +24,19 @@ Sources (all read-only):
      ``unresolved_order_aging``.
   6. Restore fence (M16.3): kill switch engaged with the home-restore
      reason ⇒ typed ``restore_fence`` (in addition to ``kill_switch``).
+  7. Feed freshness (M28.4): an armed feed whose latest candle read was
+     older than two timeframes ⇒ ``feed_stale``. The rule
+     (:func:`candle_is_fresh`) is the one ``/api/v1/paper/health`` and
+     ``/api/v1/paper/fleet/freshness`` use.
 
 Alerts are deduped, severity-sorted (critical first), and ordered by
 ``last_ts`` descending inside each severity band. Acknowledgements
 persist in ``<home>/run/alerts-ack.json`` keyed by alert id; a new
 occurrence with a greater ``last_ts`` un-acknowledges the alert. For the
-ongoing ``scheduler_stale`` and ``unresolved_order_aging`` conditions,
-whose ``last_ts`` is the read time, the occurrence is ``first_ts``, so an
-ack holds until the condition clears and recurs. ``tick_failure`` is dated
-from its ``last_error`` write. A corrupt ack file is treated as empty and
+ongoing ``scheduler_stale``, ``unresolved_order_aging`` and ``feed_stale``
+conditions the occurrence is ``first_ts``, so an ack holds until the
+condition clears and recurs. ``tick_failure`` is dated from its
+``last_error`` write. A corrupt ack file is treated as empty and
 overwritten on the next ack.
 """
 
@@ -41,9 +45,11 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Iterable
 from collections.abc import Mapping as _Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from krellbot import paths as kb_paths
 from krellbot.application import live_gate
@@ -61,14 +67,22 @@ KIND_TICK_FAILURE = "tick_failure"
 KIND_SCHEDULER_STALE = "scheduler_stale"
 KIND_UNRESOLVED_ORDER_AGING = "unresolved_order_aging"
 KIND_RESTORE_FENCE = "restore_fence"
+KIND_FEED_STALE = "feed_stale"
+FEED_STALE_CODE = "candle_stale"
 
 # Unresolved orders older than this surface as operator-supervision alerts.
 UNRESOLVED_AGING_SECONDS = 3600
 
+# Pack timeframes the tick reads, in seconds. A candle read more than
+# ``STALE_CANDLE_TIMEFRAMES`` timeframes after it opened is stale.
+TIMEFRAME_SECONDS = {"1h": 3600, "4h": 14400, "1d": 86400}
+STALE_CANDLE_TIMEFRAMES = 2
+
 # Conditions that stay true between reads. Their ``last_ts`` is the read time
-# (``now``); the occurrence began at ``first_ts`` (the venue's last tick, the
-# order's first stamp) and lasts until the condition clears.
-_ONGOING_KINDS = frozenset({KIND_SCHEDULER_STALE, KIND_UNRESOLVED_ORDER_AGING})
+# (``now``) or the latest read that still shows them; the occurrence began at
+# ``first_ts`` (the venue's last tick, the order's first stamp, the tick that
+# first read a stale candle) and lasts until the condition clears.
+_ONGOING_KINDS = frozenset({KIND_SCHEDULER_STALE, KIND_UNRESOLVED_ORDER_AGING, KIND_FEED_STALE})
 
 RESTORE_FENCE_REASON_PREFIX = "home restored"
 
@@ -251,18 +265,18 @@ def _collect_needs_reconcile(home: Path) -> list[Alert]:
     return out
 
 
-def _iter_journal_records(home: Path) -> list[tuple[int, str, dict]]:
-    """Read every line of every ``<home>/journal/*.jsonl`` file.
+def _read_journal_dicts(home: Path) -> list[dict]:
+    """Read every JSON object line of every ``<home>/journal/*.jsonl`` file.
 
-    Unparseable lines are skipped silently; the file must not be
-    created on a missing home. Returns ``(ts, venue, detail_dict)``
-    tuples in the order the journal wrote them.
+    Unreadable files and unparseable lines are skipped silently; nothing is
+    created on a missing home. Records come back in the order the journal
+    wrote them.
     """
 
     journal_dir = Path(home) / "journal"
     if not journal_dir.exists():
         return []
-    out: list[tuple[int, str, dict]] = []
+    out: list[dict] = []
     files = sorted(p for p in journal_dir.iterdir() if p.is_file() and p.suffix == ".jsonl")
     for file_path in files:
         try:
@@ -276,21 +290,34 @@ def _iter_journal_records(home: Path) -> list[tuple[int, str, dict]]:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if not isinstance(record, dict):
-                continue
-            ts_raw = record.get("ts")
-            kind = record.get("kind")
-            venue = record.get("venue")
-            detail = record.get("detail")
-            if not isinstance(ts_raw, int):
-                continue
-            if kind != "tick":
-                continue
-            if not isinstance(venue, str):
-                continue
-            if not isinstance(detail, dict):
-                continue
-            out.append((ts_raw, venue, detail))
+            if isinstance(record, dict):
+                out.append(record)
+    return out
+
+
+def _iter_journal_records(home: Path) -> list[tuple[int, str, dict]]:
+    """Read every tick of every ``<home>/journal/*.jsonl`` file.
+
+    Unparseable lines are skipped silently; the file must not be
+    created on a missing home. Returns ``(ts, venue, detail_dict)``
+    tuples in the order the journal wrote them.
+    """
+
+    out: list[tuple[int, str, dict]] = []
+    for record in _read_journal_dicts(home):
+        ts_raw = record.get("ts")
+        kind = record.get("kind")
+        venue = record.get("venue")
+        detail = record.get("detail")
+        if not isinstance(ts_raw, int):
+            continue
+        if kind != "tick":
+            continue
+        if not isinstance(venue, str):
+            continue
+        if not isinstance(detail, dict):
+            continue
+        out.append((ts_raw, venue, detail))
     return out
 
 
@@ -585,6 +612,193 @@ def _collect_restore_fence(home: Path, *, now: int) -> list[Alert]:
     ]
 
 
+class ArmedFeed(Protocol):
+    """The armed-record fields that identify one feed and its current arm."""
+
+    venue: str
+    pack_id: str
+    pair: str
+    armed_at_ts: int
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def pack_timeframe_seconds(pack_path: str | Path) -> int | None:
+    """The armed pack's timeframe in seconds, or ``None`` when unreadable."""
+
+    try:
+        pack = json.loads(Path(pack_path).read_text(encoding="utf-8"))
+        return TIMEFRAME_SECONDS.get(pack.get("timeframe"))
+    except (OSError, ValueError, AttributeError, TypeError, RecursionError):
+        return None
+
+
+def candle_is_fresh(*, bar_ts_ms: object, read_at: object, timeframe_seconds: int | None) -> bool:
+    """The stale-candle rule, shared by paper health, fleet freshness and
+    ``feed_stale``.
+
+    A tick read a fresh candle when the candle opened (``bar_ts_ms``) no
+    more than ``STALE_CANDLE_TIMEFRAMES`` timeframes before the tick
+    (``read_at``, unix seconds) and not after it. Without a known timeframe
+    or a valid bar time nothing is fresh.
+    """
+
+    return (
+        timeframe_seconds is not None
+        and _is_number(bar_ts_ms)
+        and _is_number(read_at)
+        and 0 <= bar_ts_ms < 1_000_000_000_000_000
+        and 0 <= read_at * 1000 - bar_ts_ms <= timeframe_seconds * STALE_CANDLE_TIMEFRAMES * 1000
+    )
+
+
+def current_arm_ticks(records: Iterable[object], armed: ArmedFeed) -> list[dict]:
+    """Tick records of ``armed``'s current arm, oldest first.
+
+    A tick counts when it has the arm's venue, pack and pair and was written
+    after the arm. A legacy arm without a start time has none, so it never
+    claims earlier evidence.
+    """
+
+    armed_at = armed.armed_at_ts
+    out: list[dict] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        detail = record.get("detail")
+        ts = record.get("ts")
+        if (
+            record.get("kind") == "tick"
+            and record.get("venue") == armed.venue
+            and record.get("pack") == armed.pack_id
+            and isinstance(detail, dict)
+            and detail.get("pair") == armed.pair
+            and _is_number(ts)
+            and 0 < ts < 1_000_000_000_000
+            and armed_at > 0
+            and ts > armed_at
+        ):
+            out.append(record)
+    out.sort(key=lambda rec: rec["ts"])
+    return out
+
+
+def _read_candle(record: dict) -> int | float | None:
+    """The ``bar_ts`` of the candle a tick read, or ``None`` when it read none.
+
+    The tick journals ``bar_ts`` 0 when it fetched no candle (a feed error,
+    no candles, a refusal before any fetch).
+    """
+
+    bar = record.get("bar_ts")
+    if not _is_number(bar) or not 0 < bar < 1_000_000_000_000_000:
+        return None
+    return bar
+
+
+@dataclass(frozen=True)
+class FeedFreshness:
+    """Candle evidence of one armed feed.
+
+    ``last_bar_ts_ms``, ``candle_age_s`` and ``candle_stale`` describe the
+    candle the current arm's latest tick read, measured when it was read.
+    They are ``None`` when that tick read no candle; ``candle_stale`` is also
+    ``None`` when the timeframe is unreadable, and ``candle_age_s`` when the
+    candle is dated after the tick.
+
+    ``stale_*`` describe the open stale occurrence: the stale reads since the
+    last fresh one, dated by the tick that first read a stale candle. A tick
+    that read no candle neither starts nor ends it.
+    """
+
+    last_bar_ts_ms: int | None = None
+    candle_age_s: int | None = None
+    candle_stale: bool | None = None
+    stale_first_ts: int | None = None
+    stale_last_ts: int | None = None
+    stale_count: int = 0
+
+
+def feed_freshness(ticks: list[dict], *, timeframe_seconds: int | None) -> FeedFreshness:
+    """Judge one feed from its current arm's ticks (``current_arm_ticks``)."""
+
+    stale_first: int | None = None
+    stale_last: int | None = None
+    stale_count = 0
+    if timeframe_seconds is not None:
+        for record in ticks:
+            bar = _read_candle(record)
+            if bar is None:
+                continue
+            if candle_is_fresh(bar_ts_ms=bar, read_at=record["ts"], timeframe_seconds=timeframe_seconds):
+                stale_first, stale_last, stale_count = None, None, 0
+                continue
+            if stale_first is None:
+                stale_first = int(record["ts"])
+            stale_last = int(record["ts"])
+            stale_count += 1
+
+    latest = ticks[-1] if ticks else None
+    bar = _read_candle(latest) if latest is not None else None
+    if latest is None or bar is None:
+        return FeedFreshness(stale_first_ts=stale_first, stale_last_ts=stale_last, stale_count=stale_count)
+    age_ms = latest["ts"] * 1000 - bar
+    return FeedFreshness(
+        last_bar_ts_ms=int(bar),
+        candle_age_s=int(age_ms // 1000) if age_ms >= 0 else None,
+        candle_stale=None
+        if timeframe_seconds is None
+        else not candle_is_fresh(bar_ts_ms=bar, read_at=latest["ts"], timeframe_seconds=timeframe_seconds),
+        stale_first_ts=stale_first,
+        stale_last_ts=stale_last,
+        stale_count=stale_count,
+    )
+
+
+def _collect_feed_stale(home: Path) -> list[Alert]:
+    """Warn for each armed feed whose latest candle read was stale.
+
+    One occurrence runs from the tick that first read a stale candle until a
+    fresh candle is read, so the alert keeps that ``first_ts`` across later
+    reads and notifies once.
+    """
+
+    from krellbot import config as kb_config
+
+    try:
+        cfg = kb_config.load_config(home)
+    except (OSError, ValueError):
+        return []
+    if not cfg.armed:
+        return []
+    records = _read_journal_dicts(home)
+    out: list[Alert] = []
+    for armed in cfg.armed:
+        freshness = feed_freshness(
+            current_arm_ticks(records, armed),
+            timeframe_seconds=pack_timeframe_seconds(armed.pack_path),
+        )
+        if freshness.stale_first_ts is None or freshness.stale_last_ts is None:
+            continue
+        out.append(
+            Alert(
+                id=_alert_id(KIND_FEED_STALE, FEED_STALE_CODE, armed.venue, armed.pair),
+                kind=KIND_FEED_STALE,
+                severity=SEVERITY_WARNING,
+                code=FEED_STALE_CODE,
+                venue=armed.venue,
+                pair=armed.pair,
+                count=freshness.stale_count,
+                first_ts=freshness.stale_first_ts,
+                last_ts=freshness.stale_last_ts,
+                acknowledged=False,
+            )
+        )
+    return out
+
+
 def collect(home: Path, *, now: int) -> list[Alert]:
     """Collect alerts from every read-only source and return them in a
     stable order.
@@ -601,6 +815,7 @@ def collect(home: Path, *, now: int) -> list[Alert]:
         gaps (``scheduler_stale``)
       * aged unresolved orders (``unresolved_order_aging``)
       * restore-fence kill reason (``restore_fence``)
+      * armed feeds whose latest candle read was stale (``feed_stale``)
 
     The function never creates any file. An empty home yields ``[]``
     and leaves the filesystem untouched.
@@ -614,9 +829,29 @@ def collect(home: Path, *, now: int) -> list[Alert]:
     alerts.extend(_collect_tick_failure(Path(home), now=now))
     alerts.extend(_collect_scheduler_stale(Path(home), now=now))
     alerts.extend(_collect_unresolved_order_aging(Path(home), now=now))
+    alerts.extend(_collect_feed_stale(Path(home)))
     acks = _load_acks(Path(home))
     alerts = _apply_acks(alerts, acks)
     return _order(alerts)
+
+
+# The kinds the scheduler heartbeat (``krellbot service heartbeat``) checks.
+SCHEDULER_KINDS = frozenset({KIND_TICK_FAILURE, KIND_SCHEDULER_STALE})
+
+
+def collect_scheduler(home: Path, *, now: int) -> list[Alert]:
+    """The ``tick_failure`` and ``scheduler_stale`` alerts, as ``collect`` builds them.
+
+    Same ids, occurrence times and acknowledgements as ``collect``, so a
+    notification pass over these and one over ``collect`` share each
+    occurrence. Reads only the scheduler's ``last_error``, the armed venues,
+    the journal and the ack file; it opens no store, venue or key and never
+    creates a file.
+    """
+
+    home = Path(home)
+    alerts = [*_collect_tick_failure(home, now=now), *_collect_scheduler_stale(home, now=now)]
+    return _order(_apply_acks(alerts, _load_acks(home)))
 
 
 def acknowledge(home: Path, alert_id: str, *, now: int) -> Alert:
@@ -652,14 +887,26 @@ def acknowledge(home: Path, alert_id: str, *, now: int) -> Alert:
 
 __all__ = [
     "ACK_FILE",
+    "FEED_STALE_CODE",
+    "KIND_FEED_STALE",
     "KIND_RESTORE_FENCE",
     "KIND_SCHEDULER_STALE",
     "KIND_TICK_FAILURE",
     "KIND_UNRESOLVED_ORDER_AGING",
+    "SCHEDULER_KINDS",
     "SEVERITY_CRITICAL",
     "SEVERITY_WARNING",
+    "STALE_CANDLE_TIMEFRAMES",
+    "TIMEFRAME_SECONDS",
     "UNRESOLVED_AGING_SECONDS",
     "Alert",
+    "ArmedFeed",
+    "FeedFreshness",
     "acknowledge",
+    "candle_is_fresh",
     "collect",
+    "collect_scheduler",
+    "current_arm_ticks",
+    "feed_freshness",
+    "pack_timeframe_seconds",
 ]

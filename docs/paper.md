@@ -107,11 +107,14 @@ This is what the engine does today.
 - **Kill switch, paper.** New paper arms are refused with
   `kill_switch_engaged`. Every paper tick suppresses entries and journals
   `kill_switch: true`, while exits, stop repair and `raise_stop` run.
-- **Kill switch, live.** The whole live tick halts. `check_live_send`
-  refuses with `kill_switch_engaged` before any venue call, in the
-  scheduler's venue setup and in `run.tick`, so no entry, exit, stop repair
-  or stop raise is sent. This release is paper-only, so the same check
-  refuses a live tick before it reaches the kill switch, with
+- **Kill switch, live.** A live tick does what a paper tick does: it sends
+  no new entry and journals `kill_switch: true`, while exits, stop repair,
+  `raise_stop` and reconcile run. The tick still needs
+  `KRELLBOT_ENABLE_LIVE=1` and an operator grant. Live arms, promotion and
+  live preflight are refused with `kill_switch_engaged`. After a home
+  restore, the restore fence sends nothing at all until you release the
+  kill switch. This release is paper-only, so `check_live_tick` refuses a
+  live tick before it reaches the kill switch, with
   `live_disabled_paper_only_release`.
 
 ## Costs

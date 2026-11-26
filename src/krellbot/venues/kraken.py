@@ -7,7 +7,8 @@ Docs:
 
 Auth: HMAC-SHA512 over `path + SHA256(nonce + postdata)`, key =
 base64decode(secret); the signature is base64 and goes in `API-Sign`. Tests
-inject `now_ns` for monotonic nonces and `min_interval_ns` for the 1-per-second
+inject the epoch-microsecond clock (`now_ms`, a historical name) that feeds
+the monotonic nonces, a `sleep`, and `min_interval_ms` for the 1-per-second
 private-call budget; the journal is appended only on the third rate-limit
 failure.
 """
@@ -21,7 +22,7 @@ import json
 import time
 import urllib.parse
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Any, Protocol
@@ -41,6 +42,7 @@ from krellbot.venues.base import (
     OrderRef,
     PairRules,
     Truth,
+    VenueRejectedError,
     WithdrawCapableError,
 )
 
@@ -49,7 +51,15 @@ PUBLIC_PATH = "/0/public"
 PRIVATE_PATH = "/0/private"
 GET_API_KEY_INFO = "GetApiKeyInfo"
 ADD_ORDER = "AddOrder"
-TIME_MS = 1000
+QUERY_ORDERS = "QueryOrders"
+# Query Orders Info takes a comma-delimited list of at most 50 txids.
+QUERY_ORDERS_MAX_TXIDS = 50
+# Orders followed through ``refid`` from a sell's own order towards the order
+# that created it. An entry's conditional close is one hop from the entry.
+MAX_REFERRAL_HOPS = 3
+NS_PER_US = 1_000
+US_PER_MS = 1_000
+US_PER_S = 1_000_000
 
 # `GetApiKeyInfo` permissions as documented at
 # https://docs.kraken.com/api-reference/account-data/get-api-key-info.
@@ -100,7 +110,8 @@ ALL_KNOWN_PERMISSIONS = REQUIRED_PERMISSIONS | FORBIDDEN_PERMISSIONS | DOCUMENTE
 
 
 def _default_now_us() -> int:
-    return time.time_ns() // TIME_MS
+    """Wall clock in epoch microseconds: the nonce scale Kraken has accepted."""
+    return time.time_ns() // NS_PER_US
 
 
 NONCE_FILENAME = "kraken.nonce"
@@ -200,6 +211,34 @@ def classify_documented_response(payload: object) -> str:
     raise ValueError("unrecognized documented kraken response shape")
 
 
+# Documented AddOrder errors that prove Kraken refused the order.
+_ORDER_REFUSALS = frozenset(
+    {
+        KrakenDocumentedOutcome.INSUFFICIENT_FUNDS,
+        KrakenDocumentedOutcome.ORDER_MINIMUM_NOT_MET,
+        KrakenDocumentedOutcome.INVALID_NONCE,
+    }
+)
+
+
+def _documented_refusal(errors: list) -> str | None:
+    """The refusal code when every error Kraken returned is one documented order refusal.
+
+    An error ``classify_documented_response`` does not recognize, a documented
+    error that is not a refusal (a rate limit), or a mix of codes proves
+    nothing about execution: ``None``, and the send's outcome stays unknown.
+    """
+    codes: set[str] = set()
+    for item in errors:
+        try:
+            codes.add(classify_documented_response({"error": [item]}))
+        except (TypeError, ValueError):
+            return None
+    if len(codes) != 1 or not codes <= _ORDER_REFUSALS:
+        return None
+    return codes.pop()
+
+
 class Transport(Protocol):
     """Anything with a `post(url, form)` returning a parsed JSON dict."""
 
@@ -290,6 +329,25 @@ def build_entry_with_stop_form(
     }
 
 
+def build_stop_form(coid: str, qty: Decimal, stop: Decimal, *, pair: str) -> dict[str, str]:
+    """Build the AddOrder form for a standalone sell stop-loss (a repaired protective stop).
+
+    Per the AddOrder reference (https://docs.kraken.com/api-reference/trading/add-order),
+    ``ordertype=stop-loss`` is a market order triggered at ``price``, the same order
+    type as the entry's conditional close. The coid goes in ``cl_ord_id`` and no
+    ``userref`` is sent: the reference documents the two as mutually exclusive.
+    ``qty`` and ``stop`` are already quantized by the caller.
+    """
+    return {
+        "pair": pair,
+        "type": "sell",
+        "ordertype": "stop-loss",
+        "price": format(stop, "f"),
+        "volume": format(qty, "f"),
+        "cl_ord_id": coid,
+    }
+
+
 def require_validate_true(body: dict[str, str]) -> None:
     """Refuse any request body that is not explicitly validate-only."""
     if body.get("validate") != "true":
@@ -312,8 +370,10 @@ def _quantize_price(value: Decimal, price_decimals: int) -> Decimal:
 class _NonceStore:
     """Monotonic nonce counter, persisted at `paths.home()/run/kraken.nonce`.
 
-    `now_ms()` returns the current time in milliseconds; tests inject a clock
-    so the nonce never reuses across simulated restarts.
+    `next(now_us)` takes the current time in epoch microseconds. Nonces stay
+    on that scale so a fresh home never sends one below a nonce Kraken
+    already accepted for the key; tests inject a clock so the nonce never
+    reuses across simulated restarts.
     """
 
     home: Path
@@ -334,9 +394,9 @@ class _NonceStore:
         target = self._path()
         paths.atomic_write(target, f"{nonce}\n".encode())
 
-    def next(self, now_ms: int) -> int:
+    def next(self, now_us: int) -> int:
         last = self._read_last()
-        nonce = max(last + 1, now_ms)
+        nonce = max(last + 1, now_us)
         self._write(nonce)
         return nonce
 
@@ -348,8 +408,11 @@ class RateLimitStop(RuntimeError):
 class KrakenVenue:
     """Kraken spot adapter.
 
-    `transport` is injected; tests pass a fake. `now_ms`/`min_interval_ms`
-    allow tests to drive the nonce clock and the 1-per-second rate budget.
+    `transport` is injected; tests pass a fake. `now_ms` is the clock and,
+    despite its historical name, returns epoch microseconds: it feeds the
+    nonce, the private-call spacing and the journal's seconds. Private calls
+    are spaced `min_interval_ms` real milliseconds apart through `sleep`
+    (seconds); tests inject all three.
     """
 
     def __init__(
@@ -367,12 +430,14 @@ class KrakenVenue:
         self._api_key = api_key
         self._secret = secret_b64
         self._transport = transport
-        self._now_ms = now_ms or _default_now_us
+        self._now_us = now_ms or _default_now_us
         self._min_interval_ms = min_interval_ms
         self._nonce = _NonceStore(home if home is not None else paths.home())
-        self._last_call_ms: int = 0
+        self._last_call_us: int | None = None
         self._rate_failures: int = 0
         self._sleep = sleep or time.sleep
+        # Query Orders Info rows read for sell fills, by txid (None: not shown).
+        self._order_rows: dict[str, dict | None] = {}
 
     # ---- public protocol surface ----------------------------------------
 
@@ -400,7 +465,7 @@ class KrakenVenue:
         return Truth(
             balances=_parse_balances(balances_data),
             open_orders=_parse_open_orders(open_orders_data),
-            recent_fills=_parse_recent_trades(recent_trades_data),
+            recent_fills=self._link_sell_fills(_parse_recent_trades(recent_trades_data)),
         )
 
     def place_entry_with_stop(self, coid: str, qty: Decimal, stop: Decimal, *, pair: str) -> OrderRef:
@@ -469,6 +534,40 @@ class KrakenVenue:
         }
         return self._place(ADD_ORDER, form, coid=coid, side="sell", qty=lot, stop=None)
 
+    def place_stop(self, coid: str, qty: Decimal, stop: Decimal, *, pair: str) -> OrderRef:
+        """Rest a sell stop-loss for ``qty`` triggered at ``stop``, under ``cl_ord_id=coid``.
+
+        See ``build_stop_form`` for the request. An order Kraken already lists
+        under the coid's ``cl_ord_id`` is returned and nothing is sent. Its
+        fills name the coid through ``_link_sell_fills`` (the order carries
+        ``cl_ord_id``), and ``stop_outcome`` finds it again. Only ``ordermin``
+        is checked here: whether the stop's cost is acceptable is Kraken's to
+        say. The send goes through ``_place``, so a documented refusal raises
+        ``VenueRejectedError`` and any other error ``RuntimeError``.
+        """
+        release_policy.ensure_live_orders_allowed()
+        if not pair:
+            raise ValueError("kraken stop requires a pair")
+        found = self._lookup_client_order(coid)
+        if found is not None:
+            _bucket, order_id, raw = found
+            order = _open_order(order_id, raw)
+            return OrderRef(
+                id=order_id,
+                coid=coid,
+                pair=order.pair if order is not None else pair,
+                side="sell",
+                qty=order.qty if order is not None else Decimal(0),
+                filled_qty=_executed_qty(raw) or Decimal(0),
+                stop_price=order.stop_price if order is not None else None,
+            )
+        rules = self.rules(pair)
+        lot = _quantize_qty(qty, rules.lot_decimals)
+        price = _quantize_price(stop, rules.price_decimals)
+        _reject_size(lot, rules, None)
+        form = build_stop_form(coid, lot, price, pair=pair)
+        return self._place(ADD_ORDER, form, coid=coid, side="sell", qty=lot, stop=price)
+
     def cancel_stops(self, pair: str) -> None:
         release_policy.ensure_live_orders_allowed()
         # Refuse to cancel the whole account. Cancel open orders tagged as stop
@@ -514,20 +613,19 @@ class KrakenVenue:
         caller keeps its hold. Never sends an order.
         """
         del pair  # the coid's own cl_ord_id / userref identify the order
-        found = self._lookup(coid, own_only=True)
-        if found is None:
-            return UNKNOWN_OUTCOME
-        bucket, _order_id, raw = found
-        executed = _executed_qty(raw)
-        if executed is None:
-            return UNKNOWN_OUTCOME
-        if bucket == "open":
-            if executed > 0:
-                return OrderOutcome(status="partial", filled_qty=executed, authoritative=True)
-            return OrderOutcome(status="open", authoritative=True)
-        if executed > 0:
-            return OrderOutcome(status="filled", filled_qty=executed, authoritative=True)
-        return OrderOutcome(status="absent", authoritative=True)
+        return _outcome_of(self._lookup(coid, own_only=True))
+
+    def stop_outcome(self, coid: str, *, pair: str) -> OrderOutcome:
+        """``order_outcome`` for a stop ``place_stop`` rested, found by its ``cl_ord_id``.
+
+        ``place_stop`` sends no ``userref``, so the userref lookup cannot find
+        it; this reads the same open and closed lists through their documented
+        ``cl_ord_id`` filter (``_lookup_client_order``). The answer is mapped as
+        in ``order_outcome``: resting with nothing executed is ``open``, and a
+        miss is ``unknown``. Never sends an order.
+        """
+        del pair  # the cl_ord_id identifies the order
+        return _outcome_of(self._lookup_client_order(coid))
 
     def check_key(self) -> KeyPerms:
         # Strictly validate the key against `GetApiKeyInfo` permissions.
@@ -578,7 +676,7 @@ class KrakenVenue:
         qty: Decimal,
         stop: Decimal | None,
     ) -> OrderRef:
-        payload = self._private(endpoint, form)
+        payload = self._private(endpoint, form, order_send=True)
         order_id = ""
         if isinstance(payload, dict):
             result = payload.get("result")
@@ -637,6 +735,100 @@ class KrakenVenue:
                 return bucket, found[0], found[1]
         return None
 
+    def _lookup_client_order(self, coid: str) -> tuple[str, str, dict] | None:
+        """Find the order whose own ``cl_ord_id`` is ``coid`` in the open, then closed, orders.
+
+        Queries by the ``cl_ord_id`` filter of Get Open Orders
+        (https://docs.kraken.com/api-reference/account-data/get-open-orders) and
+        Get Closed Orders
+        (https://docs.kraken.com/api-reference/account-data/get-closed-orders).
+        Only a row that carries ``coid`` as its ``cl_ord_id`` counts. Returns
+        ``(bucket, order_id, row)``.
+        """
+        for endpoint, bucket in (("OpenOrders", "open"), ("ClosedOrders", "closed")):
+            book = _result(self._private(endpoint, {"cl_ord_id": coid})).get(bucket)
+            if not isinstance(book, dict):
+                continue
+            for order_id, raw in book.items():
+                if isinstance(raw, dict) and str(raw.get("cl_ord_id") or "") == coid:
+                    return bucket, str(order_id), raw
+        return None
+
+    def _link_sell_fills(self, fills: list[Fill]) -> list[Fill]:
+        """Name the client order behind each sell fill, from documented fields only.
+
+        A TradesHistory trade names the order that executed it, ``ordertxid``
+        (https://docs.kraken.com/api-reference/account-data/get-trades-history).
+        Query Orders Info shows that order's ``cl_ord_id`` and its ``refid``,
+        the "referral order transaction ID that created this order"
+        (https://docs.kraken.com/api-reference/account-data/query-orders-info).
+        An entry's protective stop is its conditional close
+        (``close[ordertype]=stop-loss``, triggered by execution of the primary
+        order: https://docs.kraken.com/api-reference/trading/add-order). It
+        has no ``cl_ord_id`` of its own, so ``refid`` leads to the entry, whose
+        ``cl_ord_id`` is the entry coid: that is the fill's ``order_coid``.
+
+        * An order that carries a ``cl_ord_id`` is named by it.
+        * A sell that is not a stop order (market, limit, ...) and carries no
+          ``cl_ord_id`` is no protective stop: krellbot's Kraken stops are
+          only ever stop-loss orders. Its ``order_coid`` stays None.
+        * Otherwise ``refid`` is followed, at most ``MAX_REFERRAL_HOPS``
+          orders, to the first order with a ``cl_ord_id``.
+        * Anything else is ``order_unknown``: an order Query Orders does not
+          show, a chain that ends without a ``cl_ord_id``, or a stop order
+          with neither field. EditOrder, which ``raise_stop`` uses, replaces a
+          stop with a new order and documents that userref is not retained
+          (https://docs.kraken.com/api-reference/trading/edit-order); it
+          documents no link to the old order, so such a fill is not guessed at.
+
+        Buys are never a protective stop and are not looked up. Each order is
+        read once per adapter instance. A rejected read raises, as any other
+        snapshot read does, and nothing is inferred from it.
+        """
+        if not any(f.side == "sell" for f in fills):
+            return fills
+        self._read_orders({f.coid for f in fills if f.side == "sell" and f.coid})
+        linked: list[Fill] = []
+        for fill in fills:
+            if fill.side != "sell":
+                linked.append(fill)
+                continue
+            order_coid, unknown = self._order_origin(fill.coid) if fill.coid else (None, True)
+            linked.append(replace(fill, order_coid=order_coid, order_unknown=unknown))
+        return linked
+
+    def _read_orders(self, txids: set[str]) -> None:
+        """Read Query Orders Info for ``txids`` and, hop by hop, the orders that created them."""
+        pending = sorted(txid for txid in txids if txid not in self._order_rows)
+        for _hop in range(MAX_REFERRAL_HOPS + 1):  # the sells' own orders, then their creators
+            if not pending:
+                return
+            for start in range(0, len(pending), QUERY_ORDERS_MAX_TXIDS):
+                chunk = pending[start : start + QUERY_ORDERS_MAX_TXIDS]
+                rows = _result(self._private(QUERY_ORDERS, {"txid": ",".join(chunk)}))
+                for txid in chunk:
+                    row = rows.get(txid)
+                    self._order_rows[txid] = row if isinstance(row, dict) else None
+            referrers = {_referrer(self._order_rows.get(txid)) for txid in pending}
+            pending = sorted(ref for ref in referrers if ref and ref not in self._order_rows)
+
+    def _order_origin(self, txid: str) -> tuple[str | None, bool]:
+        """``(order_coid, order_unknown)`` for the order ``txid``; see ``_link_sell_fills``."""
+        row = self._order_rows.get(txid)
+        for hop in range(MAX_REFERRAL_HOPS + 1):
+            if row is None:
+                return None, True
+            client = _text(row.get("cl_ord_id"))
+            if client is not None:
+                return client, False
+            if hop == 0 and _known_non_stop(row):
+                return None, False
+            referrer = _referrer(row)
+            if referrer is None:
+                return None, True
+            row = self._order_rows.get(referrer)
+        return None, True
+
     def _last_price(self, pair: str) -> Decimal:
         payload = self._public("Ticker", {"pair": pair})
         result = _result(payload)
@@ -652,7 +844,11 @@ class KrakenVenue:
         url = f"{BASE_URL}{PUBLIC_PATH}/{endpoint}?{urllib.parse.urlencode(query)}"
         return self._transport.get(url, {})
 
-    def _private(self, endpoint: str, form: dict[str, str]) -> Any:
+    def _private(self, endpoint: str, form: dict[str, str], *, order_send: bool = False) -> Any:
+        """POST one private call; ``order_send`` marks the call that places an order.
+
+        Only an order send turns a documented refusal into ``VenueRejectedError``.
+        """
         for _attempt in range(3):
             payload = self._send_once(endpoint, form)
             err = payload.get("error") if isinstance(payload, dict) else None
@@ -662,6 +858,9 @@ class KrakenVenue:
                     continue
                 if any("Permission" in str(item) or "Invalid key" in str(item) for item in err):
                     raise _PermissionDenied("kraken permission denied")
+                code = _documented_refusal(err) if order_send else None
+                if code is not None:
+                    raise VenueRejectedError("kraken", code)
                 raise RuntimeError(f"kraken {endpoint} rejected the request")
             self._rate_failures = 0
             return payload
@@ -669,23 +868,32 @@ class KrakenVenue:
         raise RateLimitStop("kraken rate limit: stopped after 3 failures")
 
     def _send_once(self, endpoint: str, form: dict[str, str]) -> Any:
-        nonce_str = str(self._nonce.next(int(self._now_ms())))
+        # Wait for the slot before drawing the nonce, so a nonce never sits
+        # through the wait while another process on this home sends a higher
+        # one. One POST per call: throttling never resends.
+        self._wait_for_private_slot()
+        nonce_str = str(self._nonce.next(int(self._now_us())))
         body = dict(form)
         body["nonce"] = nonce_str
         path = f"{PRIVATE_PATH}/{endpoint}"
         postdata = urllib.parse.urlencode(body)
         signature = sign(self._secret, path, nonce_str, postdata)
         headers = {"API-Key": self._api_key, "API-Sign": signature}
-        return self._dispatch(f"{BASE_URL}{path}", body, headers)
+        return self._transport.post(f"{BASE_URL}{path}", body, headers)
 
-    def _dispatch(self, url: str, body: dict[str, str], headers: dict[str, str]) -> Any:
-        now_ms = int(self._now_ms())
-        delta = now_ms - self._last_call_ms
-        if self._last_call_ms and delta < self._min_interval_ms:
-            self._sleep((self._min_interval_ms - delta) / 1000)
-            now_ms = int(self._now_ms())
-        self._last_call_ms = now_ms
-        return self._transport.post(url, body, headers)
+    def _wait_for_private_slot(self) -> None:
+        # Space private calls `min_interval_ms` real milliseconds apart. The
+        # clock is in microseconds, so the interval is converted to it before
+        # comparing, and `sleep` takes seconds. A wall clock that steps back
+        # waits one interval, never longer.
+        interval_us = self._min_interval_ms * US_PER_MS
+        now_us = int(self._now_us())
+        if self._last_call_us is not None:
+            wait_us = min(interval_us - (now_us - self._last_call_us), interval_us)
+            if wait_us > 0:
+                self._sleep(wait_us / US_PER_S)
+                now_us = int(self._now_us())
+        self._last_call_us = now_us
 
     def _note_rate_limit(self) -> None:
         self._rate_failures += 1
@@ -697,7 +905,7 @@ class KrakenVenue:
     def _journal_rate_limit(self) -> None:
         journal.append(
             {
-                "ts": int(self._now_ms()) // 1_000_000,
+                "ts": int(self._now_us()) // US_PER_S,
                 "kind": "rate_limit",
                 "venue": "kraken",
                 "pack": "",
@@ -821,12 +1029,47 @@ def _match_userref(payload: Any, bucket: str, coid: str, userref: int, *, own_on
     return by_userref
 
 
+def _text(raw: Any) -> str | None:
+    return raw if isinstance(raw, str) and raw.strip() else None
+
+
+def _referrer(row: dict | None) -> str | None:
+    """The ``refid`` to follow from an order with no ``cl_ord_id`` of its own."""
+    if row is None or _text(row.get("cl_ord_id")) is not None:
+        return None
+    return _text(row.get("refid"))
+
+
+def _known_non_stop(row: dict) -> bool:
+    """True when the order's documented ``descr.ordertype`` is readable and no stop type."""
+    descr = row.get("descr")
+    ordertype = _text(descr.get("ordertype")) if isinstance(descr, dict) else None
+    return ordertype is not None and "stop" not in ordertype
+
+
 def _executed_qty(raw: dict) -> Decimal | None:
     """The order's executed volume (``vol_exec``), or None when unreadable."""
     executed = _optional_decimal(raw.get("vol_exec"))
     if executed is None or not executed.is_finite() or executed < 0:
         return None
     return executed
+
+
+def _outcome_of(found: tuple[str, str, dict] | None) -> OrderOutcome:
+    """Map a looked-up ``(bucket, order_id, row)`` to its outcome; see ``KrakenVenue.order_outcome``."""
+    if found is None:
+        return UNKNOWN_OUTCOME
+    bucket, _order_id, raw = found
+    executed = _executed_qty(raw)
+    if executed is None:
+        return UNKNOWN_OUTCOME
+    if bucket == "open":
+        if executed > 0:
+            return OrderOutcome(status="partial", filled_qty=executed, authoritative=True)
+        return OrderOutcome(status="open", authoritative=True)
+    if executed > 0:
+        return OrderOutcome(status="filled", filled_qty=executed, authoritative=True)
+    return OrderOutcome(status="absent", authoritative=True)
 
 
 def _parse_recent_trades(payload: Any) -> list[Fill]:

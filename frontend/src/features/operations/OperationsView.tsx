@@ -8,7 +8,7 @@ import {
 } from "react";
 import { DisclosureSection } from "../../components/disclosure/DisclosureSection";
 import "./OperationsView.signal.css";
-import { AlertsFilter } from "./AlertsFilter";
+import { ALERTS_FILTER_STORAGE_KEY, AlertsFilter } from "./AlertsFilter";
 import { DeploymentHistory } from "./DeploymentHistory";
 import { summarizeOperationMode } from "./operationModeLabel";
 import { summarizeDeploymentRefused } from "./deploymentRefusedSummary";
@@ -47,7 +47,7 @@ const NO_GRANTS_BANNER =
 const PROMO_DEFERRED_TEXT = "Changing settings or adding an operator grant cannot enable live orders.";
 const KILL_RELEASED_TEXT = "Kill switch: released";
 const KILL_HELPER =
-  "Engaging stops new entries and all live sends. It does not sell or disarm.";
+  "Engaging stops new entries. Strategy exits and protective stops keep running. Engaging it does not sell or disarm.";
 const NO_ALERTS_TEXT =
   "No alerts. Refresh after a refusal or pause if you expect one.";
 const NO_DEPLOYMENTS_TEXT =
@@ -778,7 +778,7 @@ export function OperationsView({
           data-testid="ops-alerts-panel"
         >
           <h3 className="kbot-ops__panel-title">Alerts</h3>
-          <AlertsFilter alerts={view.alerts}>
+          <AlertsFilter alerts={view.alerts} storageKey={ALERTS_FILTER_STORAGE_KEY}>
             {(visible: OperationsViewModel["alerts"]) => (
               <div className="kbot-ops__alert-groups" data-testid="ops-alert-groups">
                 <ul className="kbot-ops__alerts" data-testid="ops-alerts">

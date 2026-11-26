@@ -5,8 +5,10 @@
        with `another tick running` on stdout.
     2. Loads the license cache + armed packs config.
     3. Snapshots the venue.
-    4. For each armed pack on the venue: ensure a resting stop if owned > 0.
-       If the stop-place fails, market-exit the owned qty in the same tick.
+    4. For each armed pack on the venue: ensure a resting stop if owned > 0
+       (the venue's ``place_stop``). If the venue refuses the stop or has no
+       ``place_stop``, market-exit the owned qty in the same tick, journaling
+       only what the venue shows executed.
     5. Acts on the latest closed bar only. Missed bars are coalesced by
        feeding every candle up to and including the latest into evaluate.run
        so indicator state includes them.
@@ -30,7 +32,8 @@ import errno
 import hashlib
 import json
 from collections.abc import Callable
-from decimal import ROUND_DOWN, Decimal
+from dataclasses import dataclass
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +62,7 @@ from krellbot.storage.outbox import (
     audited_coids,
     dispatched_coids,
 )
-from krellbot.venues.base import OrderOutcome, OrderRef, PairRules, ProtectiveStopRejectedError
+from krellbot.venues.base import OrderOutcome, OrderRef, PairRules, ProtectiveStopRejectedError, VenueRejectedError
 from krellbot.venues.paper import SLIPPAGE_BPS
 
 from .lock import TickLock
@@ -68,7 +71,12 @@ from .lock import TickLock
 OWNERSHIP_AMBIGUOUS = "ownership_ambiguous"
 # Journal ``reason`` for a record that accounts a reconciled intent's outcome.
 RECONCILED_REASON = "reconciled"
-_QTY_FIELD_FOR_INTENT = {"entry": "entry_qty", "exit": "exit_qty", "stop": "stop_qty"}
+# Obligation kind of an exit hold: a sell on an arm's pair whose order the venue
+# could not establish (``Fill.order_unknown``), so it may be that arm's stop.
+# It holds the arm's exits and stop repair. No venue order carries its coid, so
+# only an operator resolve settles it; "executed N" journals ``stop_qty`` N.
+UNLINKED_SELL_KIND = "unlinked_sell"
+_QTY_FIELD_FOR_INTENT = {"entry": "entry_qty", "exit": "exit_qty", "stop": "stop_qty", UNLINKED_SELL_KIND: "stop_qty"}
 
 
 # ---- coid ----------------------------------------------------------------
@@ -412,7 +420,7 @@ def _dispatch_place(
         elif kind == "exit":
             captured[0] = venue_obj.place_exit(c, Decimal(str(payload["qty"])), pair=str(payload["pair"]))
         elif kind == "stop":
-            venue_obj.place_stop(
+            captured[0] = venue_obj.place_stop(
                 c,
                 Decimal(str(payload["qty"])),
                 Decimal(str(payload["stop"])),
@@ -513,16 +521,20 @@ def tick(
             return 0
 
         # A1: live gate comes BEFORE any venue_obj attribute access.
-        # Kill alone still hard-refuses (rc=1). Kill + entries_paused is the
-        # restore fence: nothing sends, tick succeeds (rc=0).
+        # The kill switch alone lets the tick run as paper does: entries are
+        # suppressed below while exits, stop repair, raise_stop and reconcile
+        # run. A kill-switch refusal here is the restore fence: nothing
+        # sends, tick succeeds (rc=0).
         fenced_live = False
         for live_armed in armed_for_venue:
             if live_armed.mode != "live":
                 continue
-            gate_result = live_gate.check_live_send(home, venue=venue, pair=live_armed.pair)
+            gate_result = live_gate.check_live_tick(
+                home, venue=venue, pair=live_armed.pair, entries_paused=live_armed.entries_paused
+            )
             if gate_result.ok:
                 continue
-            if gate_result.code == live_gate.CODE_KILL_SWITCH and live_armed.entries_paused:
+            if gate_result.code == live_gate.CODE_KILL_SWITCH:
                 _record_tick(
                     journal,
                     now=int(now),
@@ -619,6 +631,31 @@ def tick(
             # yet. It is recorded below with its fill ids, exactly once.
             stop_fill_ids, stop_fill_qty = _stop_fills_for(home, identity, snap.recent_fills or [])
             journal_qty = max(ownership.attributable_qty - stop_fill_qty, Decimal(0))
+            # A sell on the pair that the venue could not link to an order may be
+            # this arm's stop. It is never guessed at: while the arm holds
+            # something, the sell holds its exits and stop repair until an
+            # operator resolves it from Operations.
+            hold_refused = False
+            if journal_qty > 0:
+                try:
+                    if _hold_unlinked_sells(home, armed, identity, snap.recent_fills or [], bar_ts=bar_ts):
+                        obligations_view = kb_obligations.read_obligations(home)
+                except StoreError as exc:
+                    pack_intent_refused[armed.pack_id] = exc.code
+                    any_refused = True
+                    hold_refused = True
+                    print(f"intent refused: {exc.code}", flush=True)
+            exits_held_by = _exit_holds(obligations_view, identity)
+            # An earlier exit of this identity whose outcome is not settled may
+            # have sold what the journal still records as owned, so nothing more
+            # is sold or re-protected until order_outcome (or the operator) says
+            # what it executed.
+            exits_pending = _unsettled_exits(obligations_view, identity)
+            exits_held = hold_refused or bool(exits_held_by) or bool(exits_pending)
+            if exits_held_by:
+                print("exits held: a sell on the pair is not linked to an order; resolve it in Operations", flush=True)
+            if exits_pending:
+                print("exits held: an earlier exit's outcome is not settled yet", flush=True)
             if ownership.ambiguous:
                 # History that may belong to this arm cannot be attributed, so
                 # the strategy cannot be shown to be flat: hold new entries.
@@ -640,52 +677,86 @@ def tick(
                 None,
             )
 
+            target = kb_evaluate.run(pack, candles)
+            # Intents the venue's documented response refused, as (coid, code).
+            venue_refusals: list[tuple[str, str]] = []
             ensure_stop_failed = False
             ensure_stop_entry = ""
-            if owned > Decimal(0) and resting is None and latest is not None:
+            exit_qty = Decimal(0)
+            # Set when the repair below falls back to an exit: nothing else is
+            # sent for this pack in this tick.
+            repair_exited = False
+            # On a bar the pack exits, its own exit below sells what it owns. A
+            # stop rested first would only be cancelled again, and one that
+            # triggered at once would be a second sale of the same units.
+            if (
+                owned > Decimal(0)
+                and resting is None
+                and latest is not None
+                and not exits_held
+                and target.reason != "exit"
+            ):
                 repair = _stop_price(pack, Decimal(str(latest.close)))
-                stop_coid = coid_for(
-                    pack_id=armed.pack_id,
-                    pack_version=armed.pack_version,
-                    venue=venue,
-                    pair=armed.pair,
-                    bar_ts=bar_ts,
-                    intent="stop",
-                )
-                stop_body = json.dumps(
-                    {"kind": "stop", "qty": str(owned), "stop": str(repair), "pair": armed.pair},
-                    separators=(",", ":"),
-                    sort_keys=True,
-                )
-                try:
-                    stop_state, _stop_ref = _dispatch_place(
-                        home=home,
-                        mode=armed.mode,
+                stop_refused = False
+                if not callable(getattr(venue_obj, "place_stop", None)):
+                    # This adapter cannot rest a stop on its own. No stop intent
+                    # is committed: it could never be sent, so it would hold
+                    # entries for good. The position is protected by exiting it.
+                    print("ensure_stop failed: the venue cannot place a stop", flush=True)
+                    stop_refused = True
+                else:
+                    stop_coid = coid_for(
+                        pack_id=armed.pack_id,
+                        pack_version=armed.pack_version,
                         venue=venue,
-                        identity=_intent_identity(armed, bar_ts),
-                        coid=stop_coid,
-                        body=stop_body,
-                        venue_obj=venue_obj,
+                        pair=armed.pair,
+                        bar_ts=bar_ts,
+                        intent="stop",
                     )
-                    if stop_state == "sent":
-                        ensure_stop_entry = stop_coid
-                    if ensure_stop_entry:
-                        fill_context[ensure_stop_entry] = {
-                            "pack_id": armed.pack_id,
-                            "pack_version": armed.pack_version,
-                            "bar_ts": bar_ts,
-                            "modeled_px": str(repair),
-                            "fee_bps": _fee_bps_for_venue(venue),
-                            "kind": "stop",
-                        }
-                except StoreError as exc:
-                    pack_intent_refused[armed.pack_id] = exc.code
-                    any_refused = True
-                    print(f"intent refused: {exc.code}", flush=True)
+                    stop_body = json.dumps(
+                        {"kind": "stop", "qty": str(owned), "stop": str(repair), "pair": armed.pair},
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    try:
+                        # The stop coid is committed before the send and never
+                        # sent again: a stop whose reply is lost stays an
+                        # obligation until the venue's record shows it resting.
+                        stop_state, _stop_ref = _dispatch_place(
+                            home=home,
+                            mode=armed.mode,
+                            venue=venue,
+                            identity=_intent_identity(armed, bar_ts),
+                            coid=stop_coid,
+                            body=stop_body,
+                            venue_obj=venue_obj,
+                        )
+                        if stop_state == "sent":
+                            ensure_stop_entry = stop_coid
+                        if ensure_stop_entry:
+                            fill_context[ensure_stop_entry] = {
+                                "pack_id": armed.pack_id,
+                                "pack_version": armed.pack_version,
+                                "bar_ts": bar_ts,
+                                "modeled_px": str(repair),
+                                "fee_bps": _fee_bps_for_venue(venue),
+                                "kind": "stop",
+                            }
+                    except StoreError as exc:
+                        pack_intent_refused[armed.pack_id] = exc.code
+                        any_refused = True
+                        print(f"intent refused: {exc.code}", flush=True)
+                        ensure_stop_failed = True
+                    except (RuntimeError, ValueError) as exc:
+                        if isinstance(exc, VenueRejectedError):
+                            # Journaled with the tick, then the stop intent is
+                            # resolved as not executed: it holds nothing.
+                            pack_intent_refused[armed.pack_id] = _venue_refused(exc, stop_coid, venue_refusals)
+                        print("ensure_stop failed: stop", flush=True)
+                        stop_refused = True
+                if stop_refused:
                     ensure_stop_failed = True
-                except (AttributeError, RuntimeError, ValueError):
-                    ensure_stop_failed = True
-                    print("ensure_stop failed: stop", flush=True)
+                    repair_exited = True
                     exit_coid = coid_for(
                         pack_id=armed.pack_id,
                         pack_version=armed.pack_version,
@@ -700,7 +771,7 @@ def tick(
                         sort_keys=True,
                     )
                     try:
-                        _dispatch_place(
+                        exit_state, exit_ref = _dispatch_place(
                             home=home,
                             mode=armed.mode,
                             venue=venue,
@@ -709,21 +780,36 @@ def tick(
                             body=exit_body,
                             venue_obj=venue_obj,
                         )
-                        fill_context[exit_coid] = {
-                            "pack_id": armed.pack_id,
-                            "pack_version": armed.pack_version,
-                            "bar_ts": bar_ts,
-                            "modeled_px": str(Decimal(str(latest.close))),
-                            "fee_bps": _fee_bps_for_venue(venue),
-                            "kind": "exit",
-                        }
+                        if exit_state == "sent":
+                            fill_context[exit_coid] = {
+                                "pack_id": armed.pack_id,
+                                "pack_version": armed.pack_version,
+                                "bar_ts": bar_ts,
+                                "modeled_px": str(Decimal(str(latest.close))),
+                                "fee_bps": _fee_bps_for_venue(venue),
+                                "kind": "exit",
+                            }
+                        if exit_state in ("sent", "already_sent"):
+                            sold = _executed_exit_qty(armed.mode, exit_ref, requested=owned)
+                            if sold is None:
+                                # Nothing proves what executed. The exit stays an
+                                # obligation that holds this identity's exits and
+                                # repair (and entries on this venue and mode) until
+                                # order_outcome settles it, journaled once by
+                                # resolved_coid. Ownership stays as recorded.
+                                audit_needs_reconcile(OperationalStore(home / "ops.sqlite"), coid=exit_coid)
+                            else:
+                                exit_qty = sold
+                                owned -= sold
                     except StoreError as exc:
                         pack_intent_refused[armed.pack_id] = exc.code
                         any_refused = True
                         print(f"intent refused: {exc.code}", flush=True)
+                    except VenueRejectedError as exc:
+                        pack_intent_refused[armed.pack_id] = _venue_refused(exc, exit_coid, venue_refusals)
                     except (AttributeError, RuntimeError, ValueError):
                         pass
-                    owned = Decimal(0)
+                    obligations_view = kb_obligations.read_obligations(home)
 
             if not candles:
                 _record_tick(
@@ -743,7 +829,6 @@ def tick(
                     on_pack_completed(armed.pack_id, armed.pair)
                 continue
 
-            target = kb_evaluate.run(pack, candles)
             trace_extra: dict = {}
             if armed.mode == "paper":
                 paper_trace = kb_trace.paper_decision_trace(pack, candles)
@@ -753,7 +838,6 @@ def tick(
                     if isinstance(last_reason, str):
                         trace_extra["decision_reason"] = last_reason
             entry_qty = Decimal(0)
-            exit_qty = Decimal(0)
             entry_coid_for_signal = ""
             kill_engaged = live_gate.kill_state(home).engaged
             entries_suppressed = armed.entries_paused or kill_engaged
@@ -772,6 +856,7 @@ def tick(
                 and not entries_suppressed
                 and not reconcile_blocked
                 and not ownership.ambiguous
+                and not repair_exited
                 and target.long
                 and owned == Decimal(0)
                 and target.stop_price is not None
@@ -878,9 +963,13 @@ def tick(
                             except ProtectiveStopRejectedError:
                                 ensure_stop_failed = True
                                 print("entry protective stop rejected; reconciliation required", flush=True)
+                            except VenueRejectedError as exc:
+                                pack_intent_refused[armed.pack_id] = _venue_refused(
+                                    exc, entry_coid_for_signal, venue_refusals
+                                )
                             except (RuntimeError, ValueError):
                                 entry_qty = Decimal(0)
-            elif target.reason == "exit" and owned > Decimal(0):
+            elif target.reason == "exit" and owned > Decimal(0) and not exits_held and not repair_exited:
                 try:
                     venue_obj.cancel_stops(armed.pair)
                 except (RuntimeError, ValueError):
@@ -924,9 +1013,11 @@ def tick(
                     pack_intent_refused[armed.pack_id] = exc.code
                     any_refused = True
                     print(f"intent refused: {exc.code}", flush=True)
+                except VenueRejectedError as exc:
+                    pack_intent_refused[armed.pack_id] = _venue_refused(exc, exit_coid, venue_refusals)
                 except (RuntimeError, ValueError):
                     pass
-            elif target.long and owned > Decimal(0) and target.stop_price is not None:
+            elif target.long and owned > Decimal(0) and target.stop_price is not None and not repair_exited:
                 cur_stop = resting
                 if cur_stop is None or target.stop_price > cur_stop:
                     try:
@@ -949,6 +1040,8 @@ def tick(
                     "exit_qty": str(exit_qty),
                     "stop_qty": str(stop_fill_qty),
                     **({"stop_fill_ids": stop_fill_ids} if stop_fill_ids else {}),
+                    **({"exits_held_by": exits_held_by} if exits_held_by else {}),
+                    **({"exits_pending": exits_pending} if exits_pending else {}),
                     "owned_qty_after": str(owned),
                     "entries_blocked": blocked,
                     "entries_paused": entries_suppressed,
@@ -961,6 +1054,14 @@ def tick(
                     **trace_extra,
                 },
             )
+            # Journal first, then retire: an interruption in between keeps the
+            # hold instead of losing the refusal code. Nothing is resent.
+            for refused_coid, code in venue_refusals:
+                try:
+                    kb_obligations.record_rejection(OperationalStore(home / "ops.sqlite"), coid=refused_coid, code=code)
+                except StoreError as exc:
+                    any_refused = True  # the intent stays unresolved and keeps holding entries
+                    print(f"intent refused: {exc.code}", flush=True)
             if on_pack_completed is not None:
                 on_pack_completed(armed.pack_id, armed.pair)
 
@@ -1077,6 +1178,212 @@ def reconcile_intents(*, venue: str, venue_obj: Any, home: Path | None = None, c
         lock.release()
 
 
+OPERATOR_EXECUTED = "executed"
+OPERATOR_NOT_EXECUTED = "not_executed"
+# Venue observations that are an outcome. ``open`` and ``partial`` are not:
+# the order may still be working, so only a typed assertion settles it.
+_SETTLED_OBSERVATIONS = frozenset({"filled", "absent"})
+# Lock for an intent committed without a venue: no tick accounts those, but two
+# operator resolves of the same one must still not interleave.
+_UNSCOPED_INTENT_LOCK = "unscoped-intents"
+_OPERATOR_RESOLVE_MESSAGES = {
+    "order_resolved": "Order resolved. Nothing was sent to the exchange.",
+    "order_already_resolved": "This order was already resolved. Nothing changed.",
+    "bad_input": "The resolve request is not well formed.",
+    "obligations_unavailable": "Unresolved orders cannot be read right now. Nothing changed.",
+    "order_not_found": "No unresolved order has this client order ID.",
+    "tick_running": "A tick for this venue is running. Try again in a moment.",
+    "no_venue_evidence": "No venue lookup is recorded for this order. Say what happened and type its client order ID.",
+    "order_still_working": (
+        "The last venue lookup shows this order still working. Cancel it at the exchange and wait for the next "
+        "lookup, or say what happened and type its client order ID."
+    ),
+    "confirmation_required": "Type the client order ID to confirm what you assert.",
+    "confirmation_mismatch": "The typed client order ID does not match this order.",
+    "executed_qty_invalid": "Executed quantity must be a non-negative decimal number.",
+    "executed_qty_above_requested": "Executed quantity cannot exceed the quantity the order requested.",
+    "requested_qty_unknown": "The order's requested quantity cannot be read, so an executed quantity cannot be checked.",
+    "executed_below_accounted": "The journal already records more executed quantity for this order than asserted.",
+}
+
+
+@dataclass(frozen=True)
+class OperatorResolveResult:
+    """What one operator resolve did. ``code`` is stable; see ``_OPERATOR_RESOLVE_MESSAGES``."""
+
+    code: str
+    ok: bool = False
+    effect: str = "refused"
+    outcome: str | None = None
+    filled_qty: Decimal | None = None
+    evidence: str | None = None
+    attributed: bool = False
+
+    @property
+    def message(self) -> str:
+        return _OPERATOR_RESOLVE_MESSAGES.get(self.code, self.code)
+
+
+def _operator_qty(raw: object) -> Decimal | None:
+    """An operator-typed executed quantity: a finite, non-negative decimal string."""
+    if not isinstance(raw, str):
+        return None  # a JSON number is not an exact Decimal
+    try:
+        value = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        return None
+    if not value.is_finite() or value < 0:
+        return None
+    return value if value != 0 else Decimal(0)
+
+
+def resolve_order_by_operator(
+    *,
+    coid: str,
+    outcome: str | None = None,
+    executed_qty: object = None,
+    confirmation: object = None,
+    home: Path | None = None,
+    clock=None,
+) -> OperatorResolveResult:
+    """Retire one unresolved intent on the operator's word. Never sends an order.
+
+    Without ``outcome`` the intent's latest recorded venue observation settles
+    it, and no confirmation is needed, but only when that observation is an
+    outcome (``filled`` or ``absent``); an ``open`` or ``partial`` order may
+    still fill and is refused as ``order_still_working``. With ``outcome``
+    (``not_executed``, or ``executed`` with ``executed_qty``) the operator
+    asserts what happened without venue evidence and must type ``coid`` back
+    as ``confirmation``.
+
+    Runs under the intent venue's tick lock (``tick_running`` while a tick
+    holds it). Durable writes follow ``_resolve_obligations``: evidence (the
+    assertion row; a venue observation is already recorded), then the journal
+    record for executed quantity not yet accounted under ``resolved_coid``,
+    then the ``intent_resolved`` row. Quantity is attributed only to the owner
+    recorded in the intent; without one it stays external and is not
+    journaled. A resolved intent is left as it is (``order_already_resolved``).
+    """
+    if not isinstance(coid, str) or not coid:
+        return OperatorResolveResult(code="bad_input")
+    asserted: Decimal | None = None
+    if outcome is None:
+        if executed_qty is not None or confirmation is not None:
+            return OperatorResolveResult(code="bad_input")
+    elif outcome == OPERATOR_EXECUTED:
+        asserted = _operator_qty(executed_qty)
+        if asserted is None:
+            return OperatorResolveResult(code="executed_qty_invalid")
+    elif outcome == OPERATOR_NOT_EXECUTED:
+        if executed_qty is not None:
+            return OperatorResolveResult(code="bad_input")
+        asserted = Decimal(0)
+    else:
+        return OperatorResolveResult(code="bad_input")
+    if outcome is not None:
+        if confirmation is None or confirmation == "":
+            return OperatorResolveResult(code="confirmation_required")
+        if confirmation != coid:
+            return OperatorResolveResult(code="confirmation_mismatch")
+
+    home = Path(home) if home is not None else kb_paths.home()
+    intent = _unresolved_intent(home, coid)
+    if not isinstance(intent, kb_obligations.Obligation):
+        return intent
+    lock = TickLock(home, intent.venue or _UNSCOPED_INTENT_LOCK)
+    if not lock.acquire():
+        return OperatorResolveResult(code="tick_running")
+    try:
+        # Read again under the lock: a tick may have settled the intent meanwhile.
+        intent = _unresolved_intent(home, coid)
+        if not isinstance(intent, kb_obligations.Obligation):
+            return intent
+        now = clock() if clock is not None else _now_seconds()
+        return _settle_by_operator(home, intent, outcome=outcome, asserted=asserted, now=now)
+    finally:
+        lock.release()
+
+
+def _unresolved_intent(home: Path, coid: str) -> kb_obligations.Obligation | OperatorResolveResult:
+    view = kb_obligations.read_obligations(home)
+    if not view.available:
+        return OperatorResolveResult(code="obligations_unavailable")
+    intent = next((o for o in view.unresolved if o.coid == coid), None)
+    if intent is not None:
+        return intent
+    try:
+        resolution = kb_obligations.read_resolution(home, coid)
+    except kb_obligations.ObligationsUnavailable:
+        return OperatorResolveResult(code="obligations_unavailable")
+    if resolution is None:
+        return OperatorResolveResult(code="order_not_found")
+    try:
+        filled: Decimal | None = Decimal(str(resolution.get("filled_qty")))
+    except (InvalidOperation, ValueError):
+        filled = None
+    return OperatorResolveResult(
+        code="order_already_resolved",
+        ok=True,
+        effect="unchanged",
+        outcome=resolution.get("outcome") if isinstance(resolution.get("outcome"), str) else None,
+        filled_qty=filled if filled is not None and filled.is_finite() else None,
+        evidence=resolution.get("evidence") if isinstance(resolution.get("evidence"), str) else None,
+    )
+
+
+def _settle_by_operator(
+    home: Path, intent, *, outcome: str | None, asserted: Decimal | None, now: float
+) -> OperatorResolveResult:
+    """Account and retire ``intent`` while its venue's tick lock is held."""
+    field = _QTY_FIELD_FOR_INTENT.get(intent.kind or "")
+    attributed = field is not None and None not in (intent.venue, intent.pack_id, intent.mode)
+    accounted = _accounted_for(home, intent.coid, field)[0] if attributed else Decimal(0)
+    store = OperationalStore(home / "ops.sqlite")
+    if outcome is None:
+        if intent.last_observation is None or intent.observed_status is None or intent.observed_qty is None:
+            return OperatorResolveResult(code="no_venue_evidence")
+        if intent.observed_status not in _SETTLED_OBSERVATIONS:
+            # An open or partly executed order may still fill: its lookup is not
+            # an outcome, so settling on it would lift the entry hold too early.
+            return OperatorResolveResult(code="order_still_working")
+        status = intent.observed_status
+        # An observation row is written once per change of kind; later partial
+        # lookups may have journaled more than the row shows.
+        filled = max(intent.observed_qty, accounted)
+        evidence = "operator_accepted_venue_observation"
+    else:
+        filled = asserted if asserted is not None else Decimal(0)
+        if outcome == OPERATOR_EXECUTED:
+            if intent.qty is None:
+                return OperatorResolveResult(code="requested_qty_unknown")
+            if filled > intent.qty:
+                return OperatorResolveResult(code="executed_qty_above_requested")
+        if filled < accounted:
+            return OperatorResolveResult(code="executed_below_accounted")
+        status = "filled" if filled > 0 else "absent"
+        evidence = "operator_asserted"
+        kb_obligations.record_assertion(store, coid=intent.coid, outcome=outcome, filled_qty=filled, ts=int(now))
+    if attributed and filled > accounted:
+        _account_intent(
+            home,
+            intent,
+            OrderOutcome(status=status, filled_qty=filled, authoritative=True),
+            venue=intent.venue,
+            journal=kb_journal.append,
+            now=now,
+        )
+    kb_obligations.record_resolution(store, coid=intent.coid, outcome=status, filled_qty=filled, evidence=evidence)
+    return OperatorResolveResult(
+        code="order_resolved",
+        ok=True,
+        effect="changed",
+        outcome=status,
+        filled_qty=filled,
+        evidence=evidence,
+        attributed=attributed,
+    )
+
+
 def _resolve_obligations(home: Path, *, venue: str, venue_obj: Any, snap: Any, journal, now: float) -> None:
     """Record evidence for each unresolved intent on ``venue`` and retire what it settles.
 
@@ -1084,19 +1391,33 @@ def _resolve_obligations(home: Path, *, venue: str, venue_obj: Any, snap: Any, j
     accounting (idempotent by ``resolved_coid``), then the resolution row.
     An interruption anywhere leaves a state the next call converges from
     without double counting. Nothing is resubmitted.
+
+    A repaired stop (kind ``stop``) is looked up through the venue's
+    ``stop_outcome`` when it has one (the reference ``place_stop`` sent it
+    under), else ``order_outcome``. An authoritative ``open`` is that stop's
+    success: it rests, so the obligation is retired. For entries and exits
+    ``open`` is no outcome.
     """
     view = kb_obligations.read_obligations(home)
     if not view.available:
         return
     lookup = getattr(venue_obj, "order_outcome", None)
+    stop_lookup = getattr(venue_obj, "stop_outcome", None) or lookup
     store = OperationalStore(home / "ops.sqlite")
     for intent in view.unresolved:
         if intent.venue != venue or intent.pair is None:
             continue
+        if intent.kind == UNLINKED_SELL_KIND:
+            # No venue order carries an exit hold's coid, so no lookup is made:
+            # only an operator resolve settles it. It stays audited, once.
+            if not intent.marked:
+                audit_needs_reconcile(store, coid=intent.coid)
+            continue
         outcome: OrderOutcome | None = None
-        if lookup is not None:
+        find = stop_lookup if intent.kind == "stop" else lookup
+        if find is not None:
             try:
-                outcome = lookup(intent.coid, pair=intent.pair)
+                outcome = find(intent.coid, pair=intent.pair)
             except (InstrumentMetadataError, RuntimeError, ValueError, OSError):
                 outcome = None
         if not isinstance(outcome, OrderOutcome) or outcome.status == "unknown":
@@ -1112,16 +1433,17 @@ def _resolve_obligations(home: Path, *, venue: str, venue_obj: Any, snap: Any, j
             filled_qty=outcome.filled_qty,
             previous=intent.last_observation,
         )
-        needs_accounting = outcome.status in ("filled", "partial") or (
-            outcome.status == "open" and intent.kind == "stop"
-        )
+        stop_resting = outcome.status == "open" and intent.kind == "stop" and outcome.authoritative
+        needs_accounting = outcome.status in ("filled", "partial") or stop_resting
         if needs_accounting and not _account_intent(home, intent, outcome, venue=venue, journal=journal, now=now):
             continue  # no durable owner context: never assign it to whoever is armed now
         if outcome.status == "absent" and outcome.authoritative:
             kb_obligations.record_resolution(
                 store, coid=intent.coid, outcome="absent", filled_qty=Decimal(0), evidence="venue_record_complete"
             )
-        elif outcome.status == "open" and intent.kind == "stop":
+        elif stop_resting:
+            # Accounted above with the stop coid as entry_coid, so the stop's
+            # later fill is attributed to this identity once (M28.24).
             kb_obligations.record_resolution(
                 store, coid=intent.coid, outcome="open", filled_qty=Decimal(0), evidence="protective_stop_resting"
             )
@@ -1138,19 +1460,7 @@ def _account_intent(home: Path, intent, outcome: OrderOutcome, *, venue: str, jo
     field = _QTY_FIELD_FOR_INTENT.get(intent.kind or "")
     if field is None or intent.pack_id is None or intent.mode is None:
         return False
-    already = Decimal(0)
-    already_ids: set[str] = set()
-    for rec in kb_journal.read_records_lenient(home):
-        detail = rec.get("detail") if isinstance(rec, dict) else None
-        if rec.get("kind") != "tick" or not isinstance(detail, dict) or detail.get("resolved_coid") != intent.coid:
-            continue
-        try:
-            already += Decimal(str(detail.get(field) or "0"))
-        except (ArithmeticError, ValueError):
-            pass
-        ids = detail.get("stop_fill_ids")
-        if isinstance(ids, list):
-            already_ids.update(i for i in ids if isinstance(i, str))
+    already, already_ids = _accounted_for(home, intent.coid, field)
     has_record = already > 0 or bool(already_ids) or _has_resolved_record(home, intent.coid)
     delta = outcome.filled_qty - already
     if delta <= 0 and has_record:
@@ -1186,6 +1496,24 @@ def _account_intent(home: Path, intent, outcome: OrderOutcome, *, venue: str, jo
     return True
 
 
+def _accounted_for(home: Path, coid: str, field: str) -> tuple[Decimal, set[str]]:
+    """``field`` quantity and stop fill ids already journaled under ``resolved_coid``."""
+    already = Decimal(0)
+    already_ids: set[str] = set()
+    for rec in kb_journal.read_records_lenient(home):
+        detail = rec.get("detail") if isinstance(rec, dict) else None
+        if rec.get("kind") != "tick" or not isinstance(detail, dict) or detail.get("resolved_coid") != coid:
+            continue
+        try:
+            already += Decimal(str(detail.get(field) or "0"))
+        except (ArithmeticError, ValueError):
+            pass
+        ids = detail.get("stop_fill_ids")
+        if isinstance(ids, list):
+            already_ids.update(i for i in ids if isinstance(i, str))
+    return already, already_ids
+
+
 def _has_resolved_record(home: Path, coid: str) -> bool:
     return any(
         rec.get("kind") == "tick" and isinstance(rec.get("detail"), dict) and rec["detail"].get("resolved_coid") == coid
@@ -1209,6 +1537,46 @@ def _fill_evidence(filled: Any) -> bool:
     return isinstance(filled, Decimal) and filled.is_finite() and filled > 0
 
 
+def _executed_exit_qty(mode: str, ref: Any, *, requested: Decimal) -> Decimal | None:
+    """What an exit's acknowledgement proves executed; None when it proves nothing.
+
+    Only the paper venue's acknowledgement is its complete record of what
+    executed. A live one is not: Kraken reports no executed volume and
+    Coinbase echoes the requested size, so a live exit is settled from
+    ``order_outcome`` instead.
+    """
+    if mode != "paper":
+        return None
+    filled = getattr(ref, "filled_qty", None)
+    if not isinstance(filled, Decimal) or not filled.is_finite() or not Decimal(0) <= filled <= requested:
+        return None
+    return filled
+
+
+def _unsettled_exits(view: kb_obligations.ObligationsView, identity: OwnershipIdentity) -> list[str]:
+    """Coids of ``identity``'s exits whose outcome is not settled yet."""
+    return [
+        o.coid
+        for o in view.unresolved
+        if o.kind == "exit"
+        and o.venue == identity.venue
+        and o.mode == identity.mode
+        and o.pair == identity.pair
+        and o.pack_id == identity.pack_id
+    ]
+
+
+def _venue_refused(exc: VenueRejectedError, coid: str, refusals: list[tuple[str, str]]) -> str:
+    """Note that the venue's documented response refused ``coid``; return the code to journal.
+
+    The intent is resolved as not executed after the tick record carrying the
+    code is journaled. Only the classified code is kept, never venue text.
+    """
+    refusals.append((coid, exc.code))
+    print(f"venue refused: {exc.code}", flush=True)
+    return exc.code
+
+
 def _intent_identity(armed: kb_config.ArmedPack, bar_ts: int) -> dict:
     """Durable owner context stored with an Outbox intent before it is sent."""
     return {"pack_id": armed.pack_id, "pack_version": armed.pack_version, "bar_ts": int(bar_ts)}
@@ -1223,9 +1591,12 @@ def _stop_fills_for(home: Path, identity: OwnershipIdentity, fills: list) -> tup
 
     A fill counts only when the venue reports which order it executed
     (``order_coid``) and that order is one this identity journaled. Fills
-    without that link are never attributed.
+    without that link are never attributed. A fill once held as unlinkable
+    (``_hold_unlinked_sells``) is accounted only through the operator's
+    resolve of that hold, so a later link never counts it a second time.
     """
     order_coids, accounted = stop_fill_history(home, identity)
+    held: set[str] | None = None
     ids: list[str] = []
     qty = Decimal(0)
     for fill in fills:
@@ -1235,13 +1606,142 @@ def _stop_fills_for(home: Path, identity: OwnershipIdentity, fills: list) -> tup
             continue
         if not order_coid or order_coid not in order_coids or not fill_id or fill_id in accounted or fill_id in ids:
             continue
+        if held is None:
+            held = _committed_coids(home)
+        if _unlinked_sell_coid(identity, fill_id) in held:
+            continue
         ids.append(fill_id)
         qty += Decimal(str(fill.qty))
     return ids, qty
 
 
+class _HoldNotSent(Exception):
+    """Raised by an exit hold's send: the Outbox commits the hold, and nothing is sent."""
+
+
+def _never_send(_coid: str, _body: str) -> None:
+    raise _HoldNotSent
+
+
+def _unlinked_sell_coid(identity: OwnershipIdentity, fill_id: str) -> str:
+    """The exit hold's coid: one per identity and venue fill id, stable across restarts."""
+    raw = f"{identity.pack_id}|{identity.venue}|{identity.pair}|{identity.mode}|{fill_id}|{UNLINKED_SELL_KIND}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:18]
+
+
+def _committed_coids(home: Path) -> set[str]:
+    """Every coid the Outbox holds. Empty when the ledger cannot be read.
+
+    Empty only lets a linked stop fill be credited, which can lower recorded
+    ownership but never raise it, so nothing external is ever sold for it.
+    """
+    path = Path(home) / "ops.sqlite"
+    if not path.exists():
+        return set()
+    try:
+        return dispatched_coids(OperationalStore(path))
+    except StoreError:
+        return set()
+
+
+def _hold_unlinked_sells(
+    home: Path, armed: kb_config.ArmedPack, identity: OwnershipIdentity, fills: list, *, bar_ts: int
+) -> bool:
+    """Commit an exit hold for each unlinkable sell on the pair; True when one is new.
+
+    A sell counts when the venue reported its order as unknown
+    (``Fill.order_unknown``) and it is not already accounted as this
+    identity's stop fill. The hold is an Outbox intent of kind
+    ``UNLINKED_SELL_KIND``, committed and never sent: its venue and mode scope
+    it (so KQ-02's per-venue-and-mode entry hold applies unchanged), and its
+    body names the owner and the sell's quantity, which bounds what an
+    operator may assert executed. A ``needs_reconcile`` marker lists it in
+    Operations and raises the critical alert once. Its coid comes from the
+    identity and the fill id, so repeated snapshots and restarts find the same
+    hold, and a resolved hold is never committed again. ``StoreError``
+    propagates: the caller then acts as held.
+    """
+    unknown = [
+        f
+        for f in fills
+        if getattr(f, "order_unknown", False)
+        and getattr(f, "side", "") == "sell"
+        and getattr(f, "pair", None) == identity.pair
+        and getattr(f, "id", "")
+    ]
+    if not unknown:
+        return False
+    _order_coids, accounted = stop_fill_history(home, identity)
+    store = OperationalStore(home / "ops.sqlite")
+    outbox = Outbox(store)
+    created = False
+    for fill in unknown:
+        if fill.id in accounted:
+            continue
+        coid = _unlinked_sell_coid(identity, fill.id)
+        body = json.dumps(
+            {
+                "kind": UNLINKED_SELL_KIND,
+                "pair": identity.pair,
+                "qty": str(fill.qty),
+                "fill_id": fill.id,
+                **_intent_identity(armed, bar_ts),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        try:
+            # A hold already committed (resolved or not) returns without a send.
+            outbox.dispatch(coid, body, _never_send, mode=identity.mode, venue=identity.venue)
+        except _HoldNotSent:
+            audit_needs_reconcile(store, coid=coid)
+            created = True
+    return created
+
+
+def _exit_holds(view: kb_obligations.ObligationsView, identity: OwnershipIdentity) -> list[str]:
+    """Coids of the unresolved exit holds of ``identity``."""
+    return [
+        o.coid
+        for o in view.unresolved
+        if o.kind == UNLINKED_SELL_KIND
+        and o.venue == identity.venue
+        and o.mode == identity.mode
+        and o.pair == identity.pair
+        and o.pack_id == identity.pack_id
+    ]
+
+
 def _recognized_open_qty(armed: kb_config.ArmedPack, venue: str, candles: list, orders: list) -> Decimal:
-    known = {
+    """What this identity's own resting protective stops show it holds.
+
+    The tick owns ``min(venue_base, max(journal, recognized))``, so a position
+    whose journal write was lost after its send can still be protected and
+    exited. An open order's requested quantity is not executed inventory: an
+    unfilled entry would count units never bought. Only a resting protective
+    stop counts, because the engine places one only for quantity it filled or
+    owns. Entries, exits and orders that cannot be attributed never count.
+
+    A protective stop of this identity is a sell order with a stop price on the
+    armed pair whose client order id is this identity's entry coid (PaperVenue
+    rests an entry's stop under it) or stop coid (a repaired stop) for a bar in
+    ``candles``. Those coids hash the pack, version, venue and pair, so another
+    strategy's, another venue's (KQ-01) and external orders never match. One
+    coid listed twice is one order, counted at its smaller quantity. The
+    identity holds one position at a time (an entry needs ``owned == 0``) and
+    each of its stops covers all of it, so the largest stop counts, never a sum.
+
+    Live arms count nothing. A live venue lists a resting order at its
+    requested quantity (Kraken ``vol``, Coinbase ``base_size``), and
+    ``OpenOrder`` carries no executed quantity, so a live stop that filled in
+    part still shows its full size after its fill was journaled. Kraken's
+    entry-attached stop has no ``cl_ord_id`` either. Live ownership comes from
+    the journal, which venue evidence keeps. PaperVenue fills a stop in full
+    and removes it, so a resting paper stop's quantity is what it still holds.
+    """
+    if armed.mode != "paper":
+        return Decimal(0)
+    stop_coids = {
         coid_for(
             pack_id=armed.pack_id,
             pack_version=armed.pack_version,
@@ -1253,14 +1753,21 @@ def _recognized_open_qty(armed: kb_config.ArmedPack, venue: str, candles: list, 
         for candle in candles
         for intent in ("entry", "stop")
     }
-    total = Decimal(0)
+    resting: dict[str, Decimal] = {}
     for order in orders:
         coid = getattr(order, "coid", None)
-        pair = getattr(order, "pair", None)
-        qty = getattr(order, "qty", None)
-        if coid in known and pair == armed.pair and qty is not None:
-            total += Decimal(str(qty))
-    return total
+        if coid not in stop_coids or getattr(order, "pair", None) != armed.pair:
+            continue
+        if getattr(order, "side", None) != "sell" or getattr(order, "stop_price", None) is None:
+            continue
+        try:
+            qty = Decimal(str(getattr(order, "qty", None)))
+        except (ArithmeticError, ValueError):
+            continue
+        if not qty.is_finite() or qty <= 0:
+            continue
+        resting[coid] = min(qty, resting.get(coid, qty))
+    return max(resting.values(), default=Decimal(0))
 
 
 def _stop_price(pack: dict, last_close: Decimal) -> Decimal:

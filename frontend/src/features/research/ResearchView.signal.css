@@ -328,6 +328,51 @@
   overflow-wrap: anywhere;
 }
 
+/* ============ per calendar year (metrics.per_year) ============ */
+
+.kbot-research__per-year-scroll {
+  overflow-x: auto;
+  min-width: 0;
+}
+
+.kbot-research__per-year-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.kbot-research__per-year-table th,
+.kbot-research__per-year-table td {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.kbot-research__per-year-table th[scope="col"] {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.kbot-research__per-year-table th[scope="col"]:first-child,
+.kbot-research__per-year-table th[scope="row"] {
+  text-align: left;
+}
+
+.kbot-research__per-year-table th[scope="row"],
+.kbot-research__per-year-table td {
+  font-family: var(--font-mono);
+  font-weight: 400;
+  color: var(--text);
+}
+
+.kbot-research__per-year-table td.kbot-research__per-year-value--unavailable {
+  color: var(--muted);
+}
+
 /* ============ equity curve (receipt.equity_curve) ============ */
 
 .kbot-research__equity-curve {
@@ -632,6 +677,75 @@
 .kbot-research__condition-outcome--false,
 .kbot-research__condition-outcome--unknown {
   color: var(--coral);
+}
+
+/* Selected bar: decision, stop, configuration hash, operands and fills. */
+
+.kbot-research__bar-decision {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.kbot-research__bar-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.kbot-research__bar-stop,
+.kbot-research__bar-hash {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.kbot-research__condition-rule {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.kbot-research__condition-operands {
+  font-family: var(--font-mono);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.kbot-research__bar-fills {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.kbot-research__bar-fills-title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.kbot-research__bar-fill-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.kbot-research__bar-fill {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  padding: 6px 10px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--navy) 40%, var(--surface));
+  overflow-wrap: anywhere;
 }
 
 /* ============ raw receipt detail (byte-identical, scroll-constrained) ============ */

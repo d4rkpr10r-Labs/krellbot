@@ -1088,16 +1088,81 @@ def cmd_stop(args):
 class CandleFetchError(RuntimeError):
     """Raised when the public candle fetch fails during tick.
 
-    The wrapped type name is the only thing the engine surfaces to the
-    operator — the original exception's message and any secret it carried
-    are not echoed. Tests inject `fetch` so the real HTTP functions are
-    never called.
+    The wrapped type name and the closed ``failure_code`` (derived from the
+    chained exception's class and HTTP status) are the only things the
+    engine surfaces to the operator — the original exception's message and
+    any secret it carried are not echoed. Tests inject `fetch` so the real
+    HTTP functions are never called.
     """
 
     def __init__(self, exc_type_name: str, *, pair: str | None = None):
         self.exc_type_name = exc_type_name
         self.pair = pair
         super().__init__(exc_type_name)
+
+    @property
+    def failure_code(self) -> str:
+        """The closed feed failure code derived from the chained exception."""
+        return feed_failure_code(self)
+
+
+# Closed set served by `/api/v1/paper/health`. Mirrored in api/app.py.
+FEED_FAILURE_CODES = frozenset(
+    {"timeout", "dns_or_network", "tls", "region_or_permission", "rate_limited", "venue_error"}
+)
+
+
+def _classify_one_fetch_failure(exc: BaseException) -> str | None:
+    """Classify a single exception by its class and HTTP status, or None."""
+    import socket
+    import ssl
+    import urllib.error
+
+    if isinstance(exc, urllib.error.HTTPError):
+        status = exc.code if type(exc.code) is int else None
+        if status == 429:
+            return "rate_limited"
+        if status in (403, 451):
+            return "region_or_permission"
+        return "venue_error"
+    if isinstance(exc, urllib.error.URLError):
+        # urllib wraps the socket failure in `.reason` instead of chaining it.
+        if isinstance(exc.reason, ssl.SSLError):
+            return "tls"
+        if isinstance(exc.reason, TimeoutError):
+            return "timeout"
+        return "dns_or_network"
+    if isinstance(exc, ssl.SSLError):
+        return "tls"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, (socket.gaierror, socket.herror, ConnectionError)):
+        return "dns_or_network"
+    return None
+
+
+def feed_failure_code(exc: BaseException) -> str:
+    """Derive a closed failure code for a failed candle fetch.
+
+    Walks the exception chain the way a traceback does (``__cause__``, else
+    an unsuppressed ``__context__``) and returns the first classification by
+    exception class or HTTP status. Messages are never read. Anything
+    unclassified is ``venue_error``.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(seen) < 16:
+        seen.add(id(current))
+        code = _classify_one_fetch_failure(current)
+        if code is not None:
+            return code
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+    return "venue_error"
 
 
 LIVE_TICK_REFUSED = "live is off; set KRELLBOT_ENABLE_LIVE=1 to tick a live pack"
@@ -1390,7 +1455,11 @@ def venue_for_tick(home, armed_list, *, transport, fetch):
 
     reader = _build_fetch_reader(armed_list, fetch=fetch, transport=transport)
 
-    gate_result = kb_live_gate.check_live_send(home, venue=armed.venue, pair=armed.pair)
+    # The kill switch alone does not refuse here: run.tick suppresses entries
+    # and keeps exits and stops. The restore fence still refuses.
+    gate_result = kb_live_gate.check_live_tick(
+        home, venue=armed.venue, pair=armed.pair, entries_paused=armed.entries_paused
+    )
     if not gate_result.ok:
         if gate_result.code == kb_live_gate.CODE_PAPER_ONLY_RELEASE:
             return PAPER_ONLY_TICK_REFUSED
@@ -1431,7 +1500,9 @@ def _build_live_venue_for_offline(armed, *, transport):
     from krellbot.venues.kraken import KrakenVenue
 
     home = kb_paths.home()
-    gate_result = kb_live_gate.check_live_send(home, venue=armed.venue, pair=armed.pair)
+    gate_result = kb_live_gate.check_live_tick(
+        home, venue=armed.venue, pair=armed.pair, entries_paused=armed.entries_paused
+    )
     if not gate_result.ok:
         if gate_result.code == kb_live_gate.CODE_PAPER_ONLY_RELEASE:
             return PAPER_ONLY_TICK_REFUSED
@@ -1459,10 +1530,29 @@ def _build_live_venue_for_offline(armed, *, transport):
     return venue_obj
 
 
-def _record_fetch_error(*, venue: str, armed, exc_type_name: str, reason: str = "fetch_error") -> None:
-    """Append a `reason: fetch_error` tick record before exit 1."""
+def _record_fetch_error(
+    *,
+    venue: str,
+    armed,
+    exc_type_name: str,
+    reason: str = "fetch_error",
+    failure_code: str | None = None,
+) -> None:
+    """Append a `reason: fetch_error` tick record before exit 1.
+
+    Only the market whose fetch failed carries the closed ``failure_code``;
+    markets left unchecked by the abort (``check_incomplete``) do not.
+    """
     from krellbot import journal as kb_journal
 
+    detail = {
+        "reason": reason,
+        "mode": armed.mode,
+        "exception": exc_type_name,
+        "pair": armed.pair,
+    }
+    if reason == "fetch_error" and failure_code in FEED_FAILURE_CODES:
+        detail["failure_code"] = failure_code
     try:
         kb_journal.append(
             {
@@ -1471,12 +1561,7 @@ def _record_fetch_error(*, venue: str, armed, exc_type_name: str, reason: str = 
                 "venue": venue,
                 "pack": armed.pack_id,
                 "bar_ts": 0,
-                "detail": {
-                    "reason": reason,
-                    "mode": armed.mode,
-                    "exception": exc_type_name,
-                    "pair": armed.pair,
-                },
+                "detail": detail,
             }
         )
     except (OSError, ValueError):
@@ -1501,9 +1586,11 @@ def cmd_tick(args, *, fetch=None, transport=None):
     With no ``--venue``, ticks every venue that has armed records in sorted
     order. The per-venue body is delegated to ``_tick_one_venue`` so the
     multi-venue and single-venue paths share one implementation.
-    """
-    from krellbot.config import load_config
 
+    After the tick returns, opted-in alert notifications are delivered
+    (``_deliver_alerts_after_tick``), so the scheduled tick reaches the
+    operator without a workstation tab open. The exit code is the tick's.
+    """
     if fetch is None:
         fetch = _default_fetch
     if transport is None:
@@ -1524,13 +1611,49 @@ def cmd_tick(args, *, fetch=None, transport=None):
             continue
         print(f"Unknown argument: {a}", file=sys.stderr)
         return 2
+    if venue is None and offline is not None:
+        print("--venue is required with --offline-candles", file=sys.stderr)
+        return 2
 
     home = kb_paths.home()
+    rc = _tick_venues(home, venue=venue, offline=offline, fetch=fetch, transport=transport)
+    _deliver_alerts_after_tick(home)
+    return rc
+
+
+def _deliver_alerts_after_tick(home) -> None:
+    """Send opted-in alert notifications once the tick has finished.
+
+    The workstation sends them only while a tab polls Operations; this lets
+    the scheduled tick send them too. Both go through
+    ``notifications.maybe_notify`` and its shared, locked occurrence store,
+    so each occurrence is sent once whichever process sees it first. With
+    no channel enabled, alerts are not even collected. Collecting is
+    read-only. Nothing here can fail the tick or change its exit code: a
+    notifier is tried at most once per channel per tick and its failure is
+    recorded for ``GET /api/v1/notifications/delivery``; any other failure
+    is dropped and the next tick or Operations read tries again.
+    """
+    from krellbot import notifications as kb_notifications
+
+    try:
+        if not kb_notifications.delivery_enabled(home):
+            return
+        from krellbot.application import alerts as kb_alerts
+        from krellbot.run import _now_seconds as _run_now_seconds
+
+        now = int(_run_now_seconds())
+        kb_notifications.maybe_notify(home, kb_alerts.collect(home, now=now), now=now)
+    except Exception:
+        # Delivery never fails the tick.
+        return
+
+
+def _tick_venues(home, *, venue, offline, fetch, transport) -> int:
+    """Tick ``venue``, or every armed venue when it is None."""
+    from krellbot.config import load_config
 
     if venue is None:
-        if offline is not None:
-            print("--venue is required with --offline-candles", file=sys.stderr)
-            return 2
         config = load_config(home)
         venues = sorted({a.venue for a in config.armed if a.venue})
         if not venues:
@@ -1639,11 +1762,18 @@ def _tick_one_venue(
         )
     except CandleFetchError as exc:
         print(exc.exc_type_name, flush=True)
+        failure_code = exc.failure_code
         for affected in armed_list:
             if (affected.pack_id, affected.pair) in completed:
                 continue
             reason = "fetch_error" if exc.pair is None or affected.pair == exc.pair else "check_incomplete"
-            _record_fetch_error(venue=venue, armed=affected, exc_type_name=exc.exc_type_name, reason=reason)
+            _record_fetch_error(
+                venue=venue,
+                armed=affected,
+                exc_type_name=exc.exc_type_name,
+                reason=reason,
+                failure_code=failure_code,
+            )
         return 1
 
 
@@ -1838,7 +1968,11 @@ def _resolve_executable() -> str:
 
 
 def cmd_service(args):
-    """`krellbot service install|uninstall [--dry-run] [--root PATH]`."""
+    """`krellbot service install|uninstall [--dry-run] [--root PATH]`.
+
+    `krellbot service heartbeat` is the scheduler's 15-minute check
+    (plumbing); see ``cmd_service_heartbeat``.
+    """
     from krellbot import service as kb_service
 
     if not args:
@@ -1848,6 +1982,11 @@ def cmd_service(args):
         )
         return 2
     sub = args[0]
+    if sub == "heartbeat":
+        if len(args) > 1:
+            print("usage: krellbot service heartbeat", file=sys.stderr)
+            return 2
+        return cmd_service_heartbeat(home=kb_paths.home())
     dry_run = False
     write_root: Path | None = None
     executable: str | None = None
@@ -1879,13 +2018,43 @@ def cmd_service(args):
             dry_run=dry_run,
         )
     if sub == "uninstall":
+        from krellbot.service import supervise
+
         if write_root is None:
             write_root = Path.home()
-        return kb_service.uninstall(home=kb_paths.home(), write_root=write_root)
+        rc = kb_service.uninstall(home=kb_paths.home(), write_root=write_root)
+        if rc == 0:
+            # The web scheduler install also wrote the heartbeat units.
+            supervise.uninstall_heartbeat_units(write_root)
+        return rc
     if sub == "status":
         return cmd_service_status(home=kb_paths.home(), write_root=write_root)
     print(f"unknown service subcommand: {sub}", file=sys.stderr)
     return 2
+
+
+def cmd_service_heartbeat(*, home: Path) -> int:
+    """`krellbot service heartbeat`: the scheduler's 15-minute check (plumbing).
+
+    Its own scheduler units fire it, independently of the tick, so a tick
+    that never runs is still reported. ``supervise.check_heartbeat`` reads
+    only scheduler and journal state and sends ``scheduler_stale`` and
+    ``tick_failure`` to the opted-in channels. It never fetches candles,
+    builds venues, reads keys or ticks; ``main`` dispatches it before the
+    legacy key migration for that reason.
+
+    Exits 0 after a check, whatever the notifiers did: a notifier failure is
+    recorded for ``GET /api/v1/notifications/delivery``. Any other failure
+    prints only its exception type and exits 1.
+    """
+    from krellbot.service import supervise
+
+    try:
+        supervise.check_heartbeat(home, now=int(_now_seconds_tick()))
+    except Exception as exc:
+        print(f"heartbeat check failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def cmd_service_status(*, home: Path, write_root: Path | None) -> int:
@@ -2308,6 +2477,10 @@ def main(argv):
         return cmd_uninstall_help()
     if argv[1] == "backup" and len(argv) >= 2:
         return cmd_backup(argv[2:])
+    if argv[1:3] == ["service", "heartbeat"]:
+        # The scheduler's heartbeat check reads no keys, so it runs before
+        # the legacy key migration below.
+        return cmd_service(argv[2:])
     try:
         kb_secrets.migrate_legacy()
     except (ValueError, RuntimeError, FileNotFoundError) as exc:

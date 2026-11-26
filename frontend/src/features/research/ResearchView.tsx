@@ -7,7 +7,14 @@ import {
   type ChangeEvent,
   type JSX,
 } from "react";
-import type { ResearchClient, StoredResult } from "./client";
+import {
+  RESEARCH_DEFAULT_SLIPPAGE_BPS,
+  RESEARCH_FEE_MODEL_LABEL,
+  type FillLeg,
+  type ResearchClient,
+  type ResearchCosts,
+  type StoredResult,
+} from "./client";
 import {
   EquityCurveChart,
   readEquityCurve,
@@ -31,16 +38,39 @@ export type ResearchViewProps = {
   openedJob?: { id: string } | null;
 };
 
+type TraceOperands = {
+  left?: unknown;
+  op?: unknown;
+  right?: unknown;
+  left_value?: unknown;
+  right_value?: unknown;
+};
+
 type TraceCondition = {
   path?: unknown;
   outcome?: unknown;
+  operands?: TraceOperands;
+};
+
+type TraceTarget = {
+  long?: unknown;
+  stop_price?: unknown;
+  reason?: unknown;
 };
 
 type TraceBar = {
   bar_ts?: unknown;
   input?: { close?: unknown };
   conditions?: TraceCondition[];
+  target?: TraceTarget;
 };
+
+/** The run's simulated fills, read from GET /api/v1/jobs/{id}/fills. */
+type FillsState =
+  | { status: "loading" }
+  | { status: "ready"; byBar: Record<string, FillLeg[]> }
+  | { status: "unavailable" }
+  | { status: "error"; message: string };
 
 type MetricCell = {
   label: string;
@@ -48,6 +78,13 @@ type MetricCell = {
   value: string;
   source: string;
 };
+
+/** The costs side-car read for the result on screen, if any. */
+type CostsLoad =
+  | { status: "loading" }
+  | { status: "loaded"; costs: ResearchCosts }
+  | { status: "unavailable" }
+  | { status: "failed"; message: string };
 
 const TRACE_ROW_HEIGHT = 24;
 const TRACE_OVERSCAN_ROWS = 8;
@@ -65,6 +102,7 @@ const RESEARCH_EXPORT_RESULT_BUSY_LABEL = "Exporting result\u2026";
 const RESEARCH_RUN_BUSY_LABEL = "Running\u2026";
 const SUBMIT_FAILED_COPY =
   "Could not submit research run — check the workstation is running.";
+const SLIPPAGE_ERROR = "Slippage basis points must be a nonnegative integer";
 
 /**
  * KRELL-SIGNAL-20261010 research presentation. Every metric cell names the
@@ -97,6 +135,32 @@ function buildMetricCells(receipt: Record<string, unknown>): MetricCell[] {
       testId: "research-result-total-return-pct",
       value: totalReturn,
       source: "metrics.total_return_pct · percent",
+    },
+    {
+      label: "CAGR (%)",
+      testId: "research-result-cagr-pct",
+      value: readPercentageMetric(receipt, "cagr_pct"),
+      source:
+        "metrics.cagr_pct · percent per year, unavailable under a day or with non-positive equity",
+    },
+    {
+      label: "Exposure (%)",
+      testId: "research-result-exposure-pct",
+      value: readPercentageMetric(receipt, "exposure_pct"),
+      source: "metrics.exposure_pct · percent of bars ending with a position",
+    },
+    {
+      label: "Buy and hold return (%)",
+      testId: "research-result-buy-and-hold-return-pct",
+      value: readBuyAndHoldMetric(receipt, "total_return_pct"),
+      source:
+        "metrics.buy_and_hold.total_return_pct · percent, bought at the second bar's open with this run's fee and slippage, held to the last close",
+    },
+    {
+      label: "Buy and hold CAGR (%)",
+      testId: "research-result-buy-and-hold-cagr-pct",
+      value: readBuyAndHoldMetric(receipt, "cagr_pct"),
+      source: "metrics.buy_and_hold.cagr_pct · percent per year",
     },
     {
       label: "Fee basis points",
@@ -216,6 +280,68 @@ function readPercentageMetric(
   return "unavailable";
 }
 
+function readObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function readBuyAndHold(receipt: Record<string, unknown>): Record<string, unknown> | null {
+  return readObject(readMetrics(receipt)?.buy_and_hold);
+}
+
+/** A finite ``metrics.buy_and_hold`` percentage, else unavailable. */
+function readBuyAndHoldMetric(receipt: Record<string, unknown>, key: string): string {
+  const value = readBuyAndHold(receipt)?.[key];
+  return typeof value === "number" && Number.isFinite(value)
+    ? String(value)
+    : "unavailable";
+}
+
+type PerYearRow = { year: string; strategy: string; buyAndHold: string };
+
+function formatYearPct(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value.toFixed(2)
+    : "unavailable";
+}
+
+/**
+ * One row per UTC calendar year either ``per_year`` series names, oldest
+ * first. A year a series lacks, or a value that is not a finite number,
+ * reads unavailable — never zero.
+ */
+function readPerYearRows(receipt: Record<string, unknown>): PerYearRow[] {
+  const strategy = readObject(readMetrics(receipt)?.per_year) ?? {};
+  const buyAndHold = readObject(readBuyAndHold(receipt)?.per_year) ?? {};
+  const years = new Set(
+    [...Object.keys(strategy), ...Object.keys(buyAndHold)].filter((key) =>
+      /^\d{4}$/.test(key),
+    ),
+  );
+  return [...years].sort().map((year) => ({
+    year,
+    strategy: formatYearPct(strategy[year]),
+    buyAndHold: formatYearPct(buyAndHold[year]),
+  }));
+}
+
+/**
+ * The round-trip sample behind the figures. Only the engine's own
+ * ``metrics.trade_count`` (closed round trips) counts; a ``trades`` array
+ * lists fill legs and is never read as round trips.
+ */
+function describeSample(receipt: Record<string, unknown>): string {
+  const count = readMetrics(receipt)?.trade_count;
+  const trips =
+    typeof count === "number" && Number.isSafeInteger(count) && count >= 0
+      ? `${count} round trip${count === 1 ? "" : "s"}`
+      : "Round trips unavailable";
+  const date = (value: unknown) =>
+    typeof value === "string" && value ? value : "unavailable";
+  return `${trips}, ${date(receipt.from)} to ${date(receipt.to)}; no statistical confidence computed`;
+}
+
 function readEquity(receipt: Record<string, unknown>): string {
   // DISC-EQUITY-UNIT: the locked receipt shape has no currency equity.
   // ``metrics.total_return_pct`` and ``equity_curve`` are percentage
@@ -292,6 +418,174 @@ function readPath(condition: TraceCondition): string {
   return "";
 }
 
+function formatOperand(token: unknown, value: unknown): string {
+  if (typeof token === "number" && Number.isFinite(token)) {
+    return String(token);
+  }
+  const shown =
+    typeof value === "number" && Number.isFinite(value) ? String(value) : "unknown";
+  return typeof token === "string" ? `${token} = ${shown}` : shown;
+}
+
+/** "close = 101.5 crosses_above sma2 = 100.25", or null without operands. */
+function readOperands(condition: TraceCondition): string | null {
+  const operands = condition.operands;
+  if (!operands || typeof operands !== "object" || typeof operands.op !== "string") {
+    return null;
+  }
+  return [
+    formatOperand(operands.left, operands.left_value),
+    operands.op,
+    formatOperand(operands.right, operands.right_value),
+  ].join(" ");
+}
+
+function readStopPrice(bar: TraceBar | undefined): string | null {
+  const stop = bar?.target?.stop_price;
+  return typeof stop === "number" && Number.isFinite(stop) ? String(stop) : null;
+}
+
+function readConfigHash(receipt: Record<string, unknown>): string {
+  const sha = receipt.pack_sha256;
+  return typeof sha === "string" && sha !== "" ? sha : "unavailable";
+}
+
+type BarDecision = {
+  decision: "enter" | "exit" | "hold" | "stay flat" | "unavailable" | "loading…";
+  note: string;
+  stop: string;
+  /** The bar's fill legs, or null when they are not known yet. */
+  legs: FillLeg[] | null;
+};
+
+/**
+ * Name what the backtest decided at the close of ``trace[index]``.
+ *
+ * The rule target (``target.reason`` and ``target.long``) says which rule
+ * fired; it is long only on an entry signal, so it cannot tell a held
+ * position from a flat one. The run's own fills supply that: the engine
+ * enters only from flat, exits only while long, acts only when a later
+ * bar exists, and ignores a bar's signal when its stop filled on that bar.
+ *
+ * A fill needs a signal on the bar before it, so up to and including the
+ * first bar that could signal an entry (``firstEntryIndex``) the backtest
+ * is flat with no fills, and the decision needs no fills. Past it, without
+ * the run's fills the decision is unavailable, never guessed.
+ */
+function describeBarDecision(
+  trace: TraceBar[],
+  index: number,
+  fills: FillsState,
+  fillBars: number[],
+  firstEntryIndex: number,
+): BarDecision {
+  const bar = trace[index];
+  const reason = typeof bar.target?.reason === "string" ? bar.target.reason : null;
+  const knownFlat = firstEntryIndex === -1 || index <= firstEntryIndex;
+  if (reason === null) {
+    return {
+      decision: "unavailable",
+      note: "This bar has no recorded rule target.",
+      stop: "Stop price: unavailable",
+      legs: knownFlat
+        ? []
+        : fills.status === "ready" && typeof bar.bar_ts === "number"
+          ? fills.byBar[String(bar.bar_ts)] ?? []
+          : null,
+    };
+  }
+  let long = false;
+  let lastBuyAt: string | null = null;
+  let legs: FillLeg[] = [];
+  if (!knownFlat) {
+    if (fills.status === "loading") {
+      return {
+        decision: "loading…",
+        note: "Reading this run's fills…",
+        stop: "Stop price: loading…",
+        legs: null,
+      };
+    }
+    if (fills.status !== "ready" || typeof bar.bar_ts !== "number") {
+      return {
+        decision: "unavailable",
+        note: "Without this run's fills, the backtest's position at this bar is unknown.",
+        stop: "Stop price: unavailable",
+        legs: null,
+      };
+    }
+    const barTs = bar.bar_ts;
+    for (const filledAt of fillBars) {
+      if (filledAt > barTs) break;
+      for (const leg of fills.byBar[String(filledAt)] ?? []) {
+        if (leg.side === "buy" && Number(leg.qty) > 0) {
+          long = true;
+          lastBuyAt = String(filledAt);
+        } else if (leg.side === "sell") {
+          long = false;
+        }
+      }
+    }
+    legs = fills.byBar[String(barTs)] ?? [];
+  }
+  // The engine sets the stop from the bar before the buy filled.
+  const stopOfBuy = (): string => {
+    if (lastBuyAt === null) return "unavailable";
+    const buyIndex = trace.findIndex((row) => String(row.bar_ts) === lastBuyAt);
+    return (buyIndex > 0 ? readStopPrice(trace[buyIndex - 1]) : null) ?? "unavailable";
+  };
+  const hasNextBar = index + 1 < trace.length;
+  const signalStop = reason === "entry" ? readStopPrice(bar) : null;
+
+  if (legs.some((leg) => leg.side === "sell" && leg.is_stop)) {
+    return {
+      decision: "stay flat",
+      note: "The stop closed the position on this bar, so this bar's signal is not acted on.",
+      stop: `Stop price: ${stopOfBuy()} (hit on this bar)`,
+      legs,
+    };
+  }
+  if (!long) {
+    if (reason === "entry" && bar.target?.long === true && hasNextBar) {
+      return {
+        decision: "enter",
+        note: "The entry rule fired while flat. The buy fills at the next bar's open.",
+        stop: `Stop price: ${signalStop ?? "unavailable"} (set from this bar's close)`,
+        legs,
+      };
+    }
+    const note =
+      reason === "warmup"
+        ? "Indicators are still warming up, so no rule can fire."
+        : reason === "entry" && !hasNextBar
+          ? "No later bar in this window, so this entry signal cannot fill."
+          : reason === "exit"
+            ? "The exit rule fired, but there is no position to sell."
+            : "Flat at this close with no entry signal.";
+    return { decision: "stay flat", note, stop: "Stop price: none (no open position)", legs };
+  }
+  const resting = `Stop price: ${stopOfBuy()} (resting since the buy on bar ${lastBuyAt})`;
+  if (reason === "exit" && hasNextBar) {
+    return {
+      decision: "exit",
+      note: "The exit rule fired while long. The sell fills at the next bar's open.",
+      stop: resting,
+      legs,
+    };
+  }
+  const note =
+    reason === "exit"
+      ? "No later bar in this window, so this exit signal cannot fill."
+      : reason === "entry"
+        ? "The entry rule fired, but the backtest is already long, so it keeps the position."
+        : "Long at this close with no exit signal, so the backtest keeps the position.";
+  return { decision: "hold", note, stop: resting, legs };
+}
+
+function formatFillLeg(leg: FillLeg): string {
+  return `${leg.side} ${leg.qty} @ ${leg.price} · fee ${leg.fee}${leg.is_stop ? " · stop" : ""}`;
+}
+
 export function ResearchView({
   client,
   revisionId,
@@ -300,6 +594,8 @@ export function ResearchView({
   const [datasetPath, setDatasetPath] = useState("");
   const [packPath, setPackPath] = useState("");
   const [feeBps, setFeeBps] = useState("");
+  // Blank keeps the engine default; the request then names no slippage.
+  const [slippageBps, setSlippageBps] = useState("");
   const [fromMs, setFromMs] = useState("");
   const [toMs, setToMs] = useState("");
   const [holdoutFrom, setHoldoutFrom] = useState("");
@@ -346,6 +642,66 @@ export function ResearchView({
   const [exportResultStatus, setExportResultStatus] = useState("");
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // Cost figures belong to the stored result on screen. Any change of that
+  // result (a new run, another job, a reload) drops them; a late read for
+  // a replaced result is ignored by its token.
+  const [costsLoad, setCostsLoad] = useState<
+    { token: object; load: CostsLoad } | null
+  >(null);
+  const [costsResult, setCostsResult] = useState<StoredResult | null>(null);
+  if (costsResult !== storedResult) {
+    setCostsResult(storedResult);
+    setCostsLoad(null);
+  }
+  // A fills read belongs to the exact stored result and job it was made
+  // for; any other pairing reads as loading until its own read settles.
+  const [fillsRead, setFillsRead] = useState<{
+    result: StoredResult;
+    jobId: string;
+    state: FillsState;
+  } | null>(null);
+  const fillsRequested = useRef<{
+    client: ResearchClient;
+    result: StoredResult;
+    jobId: string;
+  } | null>(null);
+
+  // Fills are only shown in the selected-bar detail, so they are read once
+  // per loaded result, when a bar is first selected. A run never selected
+  // costs no extra request.
+  useEffect(() => {
+    const readFills = client.getFills;
+    if (
+      selectedBarTs === null ||
+      storedResult === null ||
+      jobId === null ||
+      readFills === undefined
+    ) {
+      return;
+    }
+    const requested = fillsRequested.current;
+    if (
+      requested !== null &&
+      requested.client === client &&
+      requested.result === storedResult &&
+      requested.jobId === jobId
+    ) {
+      return;
+    }
+    const key = { client, result: storedResult, jobId };
+    fillsRequested.current = key;
+    const settle = (state: FillsState): void => {
+      if (fillsRequested.current === key) {
+        setFillsRead({ result: storedResult, jobId, state });
+      }
+    };
+    readFills.call(client, jobId).then(
+      (body) =>
+        settle(body === null ? { status: "unavailable" } : { status: "ready", byBar: body.fills }),
+      (err: unknown) =>
+        settle({ status: "error", message: err instanceof Error ? err.message : String(err) }),
+    );
+  }, [client, storedResult, jobId, selectedBarTs]);
 
   // Explicit Jobs selection replaces the visible result, not the saved
   // strategy or the form. Never submit a new run to reopen stored evidence.
@@ -427,6 +783,21 @@ export function ResearchView({
       setSubmitError("Fee basis points must be a nonnegative integer");
       return;
     }
+    // Optional: blank keeps the engine default; filled must be a
+    // nonnegative safe integer, never coerced or rounded.
+    let slippageBpsValue: number | null = null;
+    if (slippageBps.trim() !== "") {
+      const slippageField = parseRequiredIntegerField(slippageBps, SLIPPAGE_ERROR);
+      if (!slippageField.ok) {
+        setSubmitError(slippageField.error);
+        return;
+      }
+      if (slippageField.value < 0) {
+        setSubmitError(SLIPPAGE_ERROR);
+        return;
+      }
+      slippageBpsValue = slippageField.value;
+    }
     const fromField = parseRequiredIntegerField(
       fromMs,
       "From must be an integer timestamp",
@@ -505,6 +876,9 @@ export function ResearchView({
         fromMs: fromField.value,
         toMs: toField.value,
       };
+      if (slippageBpsValue !== null) {
+        request.slippageBps = slippageBpsValue;
+      }
       // F4 + W1: when a revision is selected, the request carries the
       // revision and never a non-empty packPath, even if the typed
       // packPath state still holds a stale value.
@@ -668,6 +1042,29 @@ export function ResearchView({
     }
   };
 
+  const handleLoadCosts = async (): Promise<void> => {
+    // Every path that shows a stored result first pins jobIdRef to the job
+    // that produced it, and Cancel keeps it, so it names this result's job.
+    const id = jobIdRef.current;
+    const getCosts = client.getCosts;
+    if (storedResult === null || id === null || getCosts === undefined) {
+      return;
+    }
+    const token = {};
+    setCostsLoad({ token, load: { status: "loading" } });
+    let load: CostsLoad;
+    try {
+      const costs = await getCosts.call(client, id);
+      load = costs === null ? { status: "unavailable" } : { status: "loaded", costs };
+    } catch (err) {
+      load = {
+        status: "failed",
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+    setCostsLoad((prev) => (prev !== null && prev.token === token ? { token, load } : prev));
+  };
+
   const handleExport = async (): Promise<void> => {
     if (!jobId) {
       return;
@@ -700,11 +1097,17 @@ export function ResearchView({
   const trace: TraceBar[] = storedResult
     ? (storedResult.trace as TraceBar[])
     : [];
-  const selectedBar: TraceBar | null =
+  const selectedIndex =
     selectedBarTs === null
-      ? null
-      : trace.find((bar) => readBarTs(bar, trace.indexOf(bar)) === selectedBarTs) ??
-        null;
+      ? -1
+      : trace.findIndex((bar, index) => readBarTs(bar, index) === selectedBarTs);
+  const selectedBar: TraceBar | null = selectedIndex >= 0 ? trace[selectedIndex] : null;
+  const fills: FillsState =
+    storedResult === null || jobId === null || client.getFills === undefined
+      ? { status: "unavailable" }
+      : fillsRead !== null && fillsRead.result === storedResult && fillsRead.jobId === jobId
+        ? fillsRead.state
+        : { status: "loading" };
 
   // In-use strip: a truthful echo of what the NEXT Run submits — the exact
   // current field texts, never a reformatted or inferred configuration.
@@ -715,6 +1118,10 @@ export function ResearchView({
       : packPath;
   const inUseDataset = datasetPath.trim() === "" ? NOT_SET : datasetPath;
   const inUseFee = feeBps.trim() === "" ? NOT_SET : feeBps.trim();
+  const inUseSlippage =
+    slippageBps.trim() === ""
+      ? `default (${RESEARCH_DEFAULT_SLIPPAGE_BPS})`
+      : slippageBps.trim();
   const inUseWindow =
     fromMs.trim() === "" || toMs.trim() === ""
       ? NOT_SET
@@ -934,9 +1341,10 @@ export function ResearchView({
             Costs
           </h2>
           <p className="kbot-research__panel-note">
-            Set the fee on each buy and sell. For example, 40 basis points is
-              0.40% per side. The backtest also models 5 basis points of slippage
-              on each fill.
+            Set the taker fee charged on each buy and sell. For example, 40
+              basis points is 0.40% per side. Slippage moves each simulated fill
+              against the trade; leave it blank to use{" "}
+              {RESEARCH_DEFAULT_SLIPPAGE_BPS} basis points.
           </p>
           <label className="kbot-research__field" htmlFor="kbot-research-fee-bps">
             <span className="kbot-research__field-label">Fee basis points</span>
@@ -947,6 +1355,27 @@ export function ResearchView({
               value={feeBps}
               onChange={(event: ChangeEvent<HTMLInputElement>) =>
                 setFeeBps(event.target.value)
+              }
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </label>
+          <label
+            className="kbot-research__field"
+            htmlFor="kbot-research-slippage-bps"
+          >
+            <span className="kbot-research__field-label">
+              Slippage basis points
+            </span>
+            <input
+              id="kbot-research-slippage-bps"
+              className="kbot-research__input"
+              type="text"
+              inputMode="numeric"
+              value={slippageBps}
+              placeholder={String(RESEARCH_DEFAULT_SLIPPAGE_BPS)}
+              onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                setSlippageBps(event.target.value)
               }
               autoComplete="off"
               spellCheck={false}
@@ -988,6 +1417,15 @@ export function ResearchView({
           <span className="kbot-research__inuse-label">Fee (bps)</span>
           <span className="kbot-research__inuse-value" data-testid="research-inuse-fee">
             {inUseFee}
+          </span>
+        </div>
+        <div className="kbot-research__inuse-item">
+          <span className="kbot-research__inuse-label">Slippage (bps)</span>
+          <span
+            className="kbot-research__inuse-value"
+            data-testid="research-inuse-slippage"
+          >
+            {inUseSlippage}
           </span>
         </div>
       </div>
@@ -1122,6 +1560,13 @@ export function ResearchView({
           selectedBarTs={selectedBarTs}
           onSelectBar={setSelectedBarTs}
           selectedBar={selectedBar}
+          selectedIndex={selectedIndex}
+          fills={fills}
+          costs={costsLoad?.load ?? null}
+          canLoadCosts={client.getCosts !== undefined}
+          onLoadCosts={() => {
+            void handleLoadCosts();
+          }}
         />
       ) : null}
 
@@ -1205,6 +1650,11 @@ type ResultPanelProps = {
   selectedBarTs: string | null;
   onSelectBar: (barTs: string) => void;
   selectedBar: TraceBar | null;
+  selectedIndex: number;
+  fills: FillsState;
+  costs: CostsLoad | null;
+  canLoadCosts: boolean;
+  onLoadCosts: () => void;
 };
 
 function ResultPanel({
@@ -1214,7 +1664,32 @@ function ResultPanel({
   selectedBarTs,
   onSelectBar,
   selectedBar,
+  selectedIndex,
+  fills,
+  costs,
+  canLoadCosts,
+  onLoadCosts,
 }: ResultPanelProps): JSX.Element {
+  const fillBars = useMemo(
+    () =>
+      fills.status === "ready"
+        ? Object.keys(fills.byBar)
+            .map(Number)
+            .filter(Number.isFinite)
+            .sort((a, b) => a - b)
+        : [],
+    [fills],
+  );
+  // The first bar whose target could have opened a position: an entry
+  // signal, or a reason the view cannot read.
+  const firstEntryIndex = useMemo(
+    () =>
+      trace.findIndex((row) => {
+        const reason = row.target?.reason;
+        return reason !== "warmup" && reason !== "flat" && reason !== "exit";
+      }),
+    [trace],
+  );
   const metrics = buildMetricCells(receipt);
   const equitySeries = readEquityCurve(receipt);
   const priceSeries = readPriceSeries(trace as Array<Record<string, unknown>>);
@@ -1301,6 +1776,19 @@ function ResultPanel({
           </div>
         ))}
       </dl>
+      <p
+        className="kbot-research__panel-note"
+        data-testid="research-result-sample"
+      >
+        {describeSample(receipt)}
+      </p>
+      <PerYearPanel rows={readPerYearRows(receipt)} />
+      <CostsPanel
+        receipt={receipt}
+        load={costs}
+        canLoad={canLoadCosts}
+        onLoad={onLoadCosts}
+      />
       <EquityCurveChart series={equitySeries} />
       <PriceWithTradesChart series={priceSeries} markers={tradeMarkers} />
       <div className="kbot-research__trace" data-testid="research-trace">
@@ -1317,43 +1805,350 @@ function ResultPanel({
           onSelectBar={onSelectBar}
         />
         {selectedBar ? (
-          <div
-            className="kbot-research__bar-detail"
-            data-testid="research-bar-detail"
-          >
-            <p className="kbot-research__bar-detail-title">
-              Selected bar detail
-            </p>
-            <p className="kbot-research__bar-close">
-              close: {readBarClose(selectedBar)}
-            </p>
-            <ul className="kbot-research__conditions">
-              {(selectedBar.conditions ?? []).map((condition, index) => {
-                const outcome = readOutcome(condition);
-                return (
-                  <li
-                    key={`cond-${index}`}
-                    className="kbot-research__condition"
-                  >
-                    <span className="kbot-research__condition-path">
-                      {readPath(condition)}
-                    </span>
-                    <span
-                      className={
-                        "kbot-research__condition-outcome" +
-                        ` kbot-research__condition-outcome--${outcome}`
-                      }
-                    >
-                      {outcome}
-                    </span>
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
+          <SelectedBarDetail
+            bar={selectedBar}
+            decision={describeBarDecision(
+              trace,
+              selectedIndex,
+              fills,
+              fillBars,
+              firstEntryIndex,
+            )}
+            configHash={readConfigHash(receipt)}
+            fills={fills}
+          />
         ) : null}
       </div>
     </div>
+  );
+}
+
+type SelectedBarDetailProps = {
+  bar: TraceBar;
+  decision: BarDecision;
+  configHash: string;
+  fills: FillsState;
+};
+
+function SelectedBarDetail({
+  bar,
+  decision,
+  configHash,
+  fills,
+}: SelectedBarDetailProps): JSX.Element {
+  const legs = decision.legs;
+  return (
+    <div className="kbot-research__bar-detail" data-testid="research-bar-detail">
+      <p className="kbot-research__bar-detail-title">Selected bar detail</p>
+      <p className="kbot-research__bar-close">close: {readBarClose(bar)}</p>
+      <p className="kbot-research__bar-decision" data-testid="research-bar-decision">
+        {`Decision: ${decision.decision}`}
+      </p>
+      <p className="kbot-research__bar-note" data-testid="research-bar-decision-note">
+        {decision.note}
+      </p>
+      <p className="kbot-research__bar-stop" data-testid="research-bar-stop">
+        {decision.stop}
+      </p>
+      <p className="kbot-research__bar-hash" data-testid="research-bar-config-hash">
+        {`Configuration hash (pack sha256): ${configHash}`}
+      </p>
+      <ul className="kbot-research__conditions">
+        {(bar.conditions ?? []).map((condition, index) => {
+          const outcome = readOutcome(condition);
+          const operands = readOperands(condition);
+          return (
+            <li key={`cond-${index}`} className="kbot-research__condition">
+              <span className="kbot-research__condition-rule">
+                <span className="kbot-research__condition-path">
+                  {readPath(condition)}
+                </span>
+                {operands !== null ? (
+                  <span className="kbot-research__condition-operands">{operands}</span>
+                ) : null}
+              </span>
+              <span
+                className={
+                  "kbot-research__condition-outcome" +
+                  ` kbot-research__condition-outcome--${outcome}`
+                }
+              >
+                {outcome}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+      <div className="kbot-research__bar-fills" data-testid="research-bar-fills">
+        <p className="kbot-research__bar-fills-title">
+          Simulated fills on this bar (backtest, not venue fills)
+        </p>
+        {legs === null ? (
+          <p className="kbot-research__bar-note">
+            {fills.status === "error"
+              ? `Fills unavailable for this run: reading them failed (${fills.message}).`
+              : fills.status === "loading"
+                ? "Reading this run's fills…"
+                : "Fills unavailable for this run."}
+          </p>
+        ) : legs.length === 0 ? (
+          <p className="kbot-research__bar-note">No fill on this bar.</p>
+        ) : (
+          <ul className="kbot-research__bar-fill-list">
+            {legs.map((leg, index) => (
+              <li
+                key={`fill-${index}`}
+                className="kbot-research__bar-fill"
+                data-testid="research-bar-fill"
+              >
+                {formatFillLeg(leg)}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const PER_YEAR_NOTE =
+  "Each value compares equity at the end of a UTC calendar year with equity " +
+  "where it began: the first bar for the first year, the previous year's " +
+  "last bar after that. A negative Strategy value marks a year this " +
+  "backtest lost. Buy and hold is one buy at the second bar's open with " +
+  "this run's fee and slippage, held to the end.";
+
+/**
+ * Where a strategy lost (KRELL-SIGNAL-20261010): ``metrics.per_year`` beside
+ * ``metrics.buy_and_hold.per_year``, read from the receipt unchanged.
+ */
+function PerYearPanel({ rows }: { rows: PerYearRow[] }): JSX.Element {
+  return (
+    <section
+      className="kbot-research__panel"
+      data-testid="research-per-year"
+      aria-labelledby="kbot-research-per-year-title"
+    >
+      <h2 className="kbot-research__panel-title" id="kbot-research-per-year-title">
+        Per calendar year
+      </h2>
+      <p className="kbot-research__panel-note">{PER_YEAR_NOTE}</p>
+      {rows.length === 0 ? (
+        <p
+          className="kbot-research__status"
+          data-testid="research-per-year-unavailable"
+        >
+          Per-year results unavailable for this run.
+        </p>
+      ) : (
+        <div className="kbot-research__per-year-scroll">
+          <table className="kbot-research__per-year-table">
+            <thead>
+              <tr>
+                <th scope="col">Year (UTC)</th>
+                <th scope="col">Strategy (%)</th>
+                <th scope="col">Buy and hold (%)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.year} data-testid={`research-per-year-${row.year}`}>
+                  <th scope="row">{row.year}</th>
+                  <td
+                    className={
+                      row.strategy === "unavailable"
+                        ? "kbot-research__per-year-value--unavailable"
+                        : undefined
+                    }
+                    data-testid={`research-per-year-${row.year}-strategy`}
+                  >
+                    {row.strategy}
+                  </td>
+                  <td
+                    className={
+                      row.buyAndHold === "unavailable"
+                        ? "kbot-research__per-year-value--unavailable"
+                        : undefined
+                    }
+                    data-testid={`research-per-year-${row.year}-buy-and-hold`}
+                  >
+                    {row.buyAndHold}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+const COSTS_NOTE =
+  "What this backtest charged on its fills, and the same run again with no " +
+  "fees or slippage and with twice both. Backtest reruns over the same data " +
+  "— not live trading costs.";
+const COSTS_LOADING_LABEL = "Loading cost figures…";
+
+/** Two-decimal display of exact Decimal text; never a fabricated zero. */
+function formatDecimalAmount(value: string | null): string {
+  if (value === null) {
+    return "unavailable";
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed.toFixed(2) : "unavailable";
+}
+
+function formatDecimalPercent(value: string | null): string {
+  const amount = formatDecimalAmount(value);
+  return amount === "unavailable" ? amount : `${amount}%`;
+}
+
+function buildCostFigureCells(costs: ResearchCosts): MetricCell[] {
+  const count = costs.fill_count;
+  const fills =
+    count === null
+      ? "fills that did not reconcile with the ledger"
+      : `${count} fill${count === 1 ? "" : "s"}`;
+  const stressed = costs.stressed;
+  return [
+    {
+      label: "Total fees",
+      testId: "research-costs-total-fees",
+      value: formatDecimalAmount(costs.total_fees),
+      source: `costs.total_fees · quote currency, summed over ${fills}`,
+    },
+    {
+      label: "Return with these costs (%)",
+      testId: "research-costs-net-return",
+      value: formatDecimalPercent(costs.net_return_pct),
+      source: `costs.net_return_pct · percent, this run at ${costs.fee_bps} bps fee and ${costs.slippage_bps} bps slippage`,
+    },
+    {
+      label: "Return with no fees or slippage (%)",
+      testId: "research-costs-gross-return",
+      value: formatDecimalPercent(costs.gross_return_pct),
+      source: "costs.gross_return_pct · percent, rerun at 0 bps fee and 0 bps slippage",
+    },
+    {
+      label: `Return at ${stressed.factor}x fees and slippage (%)`,
+      testId: "research-costs-stressed-return",
+      value: formatDecimalPercent(stressed.return_pct),
+      source: `costs.stressed.return_pct · percent, rerun at ${stressed.fee_bps} bps fee and ${stressed.slippage_bps} bps slippage`,
+    },
+  ];
+}
+
+function renderMetricCell(metric: MetricCell): JSX.Element {
+  return (
+    <div
+      className={
+        "kbot-research__metric" +
+        (metric.value === "unavailable"
+          ? " kbot-research__metric--unavailable"
+          : "")
+      }
+      key={metric.testId}
+    >
+      <dt className="kbot-research__metric-label">{metric.label}</dt>
+      <dd className="kbot-research__metric-value" data-testid={metric.testId}>
+        {metric.value}
+      </dd>
+      <dd className="kbot-research__metric-source">{metric.source}</dd>
+    </div>
+  );
+}
+
+type CostsPanelProps = {
+  receipt: Record<string, unknown>;
+  load: CostsLoad | null;
+  canLoad: boolean;
+  onLoad: () => void;
+};
+
+/**
+ * Research cost assumptions (KRELL-SIGNAL-20261010). The fee model, fee and
+ * slippage the engine used are always shown; fee totals and the zero-cost
+ * and stressed reruns come from the job's costs side-car, read on request.
+ */
+function CostsPanel({
+  receipt,
+  load,
+  canLoad,
+  onLoad,
+}: CostsPanelProps): JSX.Element {
+  const assumptions: MetricCell[] = [
+    {
+      label: "Fee model",
+      testId: "research-costs-fee-model",
+      value:
+        load?.status === "loaded" ? load.costs.fee_model : RESEARCH_FEE_MODEL_LABEL,
+      source: "engine · the same fee on every buy and every sell",
+    },
+    {
+      label: "Fee (bps)",
+      testId: "research-costs-fee-bps",
+      value: formatMetric(receipt.fee_bps),
+      source: "receipt.fee_bps · basis points per side",
+    },
+    {
+      label: "Slippage (bps)",
+      testId: "research-costs-slippage-bps",
+      value: formatMetric(receipt.slippage_bps),
+      source: "receipt.slippage_bps · basis points against each fill",
+    },
+  ];
+  const figures =
+    load?.status === "loaded" ? buildCostFigureCells(load.costs) : [];
+  const showButton =
+    canLoad &&
+    (load === null || load.status === "loading" || load.status === "failed");
+  const unavailable = !canLoad || load?.status === "unavailable";
+  return (
+    <section
+      className="kbot-research__panel"
+      data-testid="research-costs"
+      aria-labelledby="kbot-research-costs-title"
+    >
+      <h2 className="kbot-research__panel-title" id="kbot-research-costs-title">
+        Costs
+      </h2>
+      <p className="kbot-research__panel-note">{COSTS_NOTE}</p>
+      <dl className="kbot-research__metrics">
+        {assumptions.map(renderMetricCell)}
+        {figures.map(renderMetricCell)}
+      </dl>
+      {load?.status === "failed" ? (
+        <p
+          className="kbot-research__error"
+          role="alert"
+          data-testid="research-costs-error"
+        >
+          Reading cost figures failed ({load.message}) — use Show cost figures
+          to retry
+        </p>
+      ) : null}
+      {unavailable ? (
+        <p
+          className="kbot-research__status"
+          data-testid="research-costs-unavailable"
+        >
+          Cost figures unavailable for this job.
+        </p>
+      ) : null}
+      {showButton ? (
+        <button
+          type="button"
+          className="kbot-research__action"
+          data-testid="research-costs-load"
+          aria-busy={load?.status === "loading"}
+          disabled={load?.status === "loading"}
+          onClick={onLoad}
+        >
+          {load?.status === "loading" ? COSTS_LOADING_LABEL : "Show cost figures"}
+        </button>
+      ) : null}
+    </section>
   );
 }
 

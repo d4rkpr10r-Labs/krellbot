@@ -10,7 +10,7 @@ Coverage map (RED → GREEN):
   test_live_tick_under_env_unset
   test_live_tick_under_env_one_no_grant
   test_live_tick_under_env_one_mismatched_pair
-  test_live_tick_with_grant_and_kill_engaged
+  test_live_tick_with_grant_env_and_kill_engaged_sends_no_entry
   test_live_tick_with_grant_passes_gate_and_places_one_entry
   test_cmd_tick_live_no_grant_refuses_without_transport_calls
   test_cmd_tick_offline_live_no_grant_refuses_without_transport_calls
@@ -266,8 +266,13 @@ def test_live_tick_refusal_returns_1_zero_venue_calls(home, monkeypatch, case_id
     assert attr_names == [], f"forbidden attrs accessed: {attr_names}"
 
 
-def test_live_tick_with_grant_env_and_kill_engaged_refuses(home, monkeypatch, capsys):
-    """Grant + env + kill switch engaged: refuses with kill_switch_engaged, zero calls."""
+def test_live_tick_with_grant_env_and_kill_engaged_sends_no_entry(home, monkeypatch, capsys):
+    """Grant + env + kill switch engaged: the tick runs as paper does (D6).
+
+    No entry is sent and the tick record carries kill_switch: True. Exits,
+    stop repair, raise_stop and reconcile keep running; they are pinned in
+    test_live_kill_switch_keeps_exits_and_stops.py.
+    """
     from krellbot.run import tick
 
     monkeypatch.setenv("KRELLBOT_ENABLE_LIVE", "1")
@@ -287,10 +292,21 @@ def test_live_tick_with_grant_env_and_kill_engaged_refuses(home, monkeypatch, ca
     )
     out = capsys.readouterr().out
 
-    assert rc == 1
-    assert "live refused: kill_switch_engaged" in out, out
+    assert rc == 0, out
+    assert "live refused" not in out, out
     method_names = [c.name for c in spy.calls if c.kind == "method"]
-    assert method_names == [], method_names
+    assert "place_entry_with_stop" not in method_names, method_names
+    assert [c for c in inner.calls if c.method == "entry"] == []
+    records = [
+        json.loads(line)
+        for jf in sorted((home / "journal").glob("*.jsonl"))
+        for line in jf.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    [detail] = [r["detail"] for r in records if r.get("kind") == "tick" and r.get("pack") == "m3-out-gate"]
+    assert detail["reason"] == "entry", detail
+    assert detail["entry_qty"] == "0", detail
+    assert detail["kill_switch"] is True, detail
 
 
 # ---------------------------------------------------------------------------

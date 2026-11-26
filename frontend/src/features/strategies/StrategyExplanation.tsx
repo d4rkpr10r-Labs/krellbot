@@ -1,9 +1,12 @@
-import { useMemo, type JSX } from "react";
+import { useId, useMemo, type JSX } from "react";
 import {
+  CLOSED_BARS_NOTE,
   explainPack,
+  FORMAT_LIMITS_NOTE,
   NOT_SUPPLIED,
   type ConditionExplanation,
   type ExplainResult,
+  type OperatorFiringNote,
 } from "./explainPack";
 import { StrategyExplanationCsvExport } from "./StrategyExplanationCsvExport";
 import "./StrategyExplanation.signal.css";
@@ -33,6 +36,44 @@ function ConditionList({ condition }: { condition: ConditionExplanation }): JSX.
     );
   }
   return <li>{condition.text}</li>;
+}
+
+/**
+ * When the rules fire and what the format cannot do: a block of its own,
+ * apart from the entry and exit sentences, which stay as they are.
+ */
+function FiringBlock({ notes }: { notes: OperatorFiringNote[] }): JSX.Element {
+  const headingId = useId();
+  return (
+    <div
+      role="group"
+      aria-labelledby={headingId}
+      className="kbot-feature__strategy-explanation-firing"
+      data-testid="strategy-explanation-firing"
+    >
+      <h4 id={headingId} className="kbot-feature__strategy-explanation-section">
+        When the rules fire
+      </h4>
+      {notes.length > 0 ? (
+        <ul
+          className="kbot-feature__strategy-explanation-list kbot-feature__strategy-explanation-list--conditions"
+          data-testid="strategy-explanation-firing-notes"
+        >
+          {notes.map((note) => (
+            <li key={note.key} data-trigger={note.trigger}>
+              {note.text}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      <p
+        className="kbot-feature__strategy-explanation-detail"
+        data-testid="strategy-explanation-format-limits"
+      >
+        {FORMAT_LIMITS_NOTE} {CLOSED_BARS_NOTE}
+      </p>
+    </div>
+  );
 }
 
 function MetadataRow({ label, value }: { label: string; value: string | null }): JSX.Element {
@@ -147,6 +188,8 @@ export function StrategyExplanation({
           >
             <ConditionList condition={explanation.exit} />
           </ul>
+
+          <FiringBlock notes={explanation.firing ?? []} />
 
           <h4 className="kbot-feature__strategy-explanation-section">
             Markets
