@@ -197,9 +197,12 @@ describe("Editor fresh-owned seed after an already-saved draft", () => {
     await waitFor(() => {
       expect(client.create).toHaveBeenCalledTimes(1);
     });
-    expect(screen.getByTestId("editor-revision-id").textContent).toMatch(
-      /rev-owned-created/,
-    );
+    // The id renders only after the mocked create resolves; wait for it.
+    await waitFor(() => {
+      expect(screen.getByTestId("editor-revision-id").textContent).toMatch(
+        /rev-owned-created/,
+      );
+    });
 
     const seeded = startOwnedSeed();
     const firstSent = callsOf(client.create)[0][0] as Record<string, unknown>;
@@ -354,9 +357,12 @@ describe("Editor fresh-owned draft ordinary controls", () => {
     await waitFor(() => {
       expect(client.create).toHaveBeenCalledTimes(1);
     });
-    expect(screen.getByTestId("editor-revision-id").textContent).toMatch(
-      /rev-owned-created/,
-    );
+    // The id renders only after the mocked create resolves; wait for it.
+    await waitFor(() => {
+      expect(screen.getByTestId("editor-revision-id").textContent).toMatch(
+        /rev-owned-created/,
+      );
+    });
 
     // Ordinary same-draft edits keep normal parent semantics.
     fireEvent.change(screen.getByLabelText(/protective stop percent/i), {
