@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef, useState, type JSX } from "react";
 import "./NotificationsPanel.signal.css";
-import type { NotificationsClient, NotificationSettings } from "./notificationsClient";
+import type {
+  NotificationChannelDelivery,
+  NotificationDelivery,
+  NotificationsClient,
+  NotificationSettings,
+} from "./notificationsClient";
 
 const PANEL_TITLE = "Notifications";
 const LOADING_TEXT = "Loading notification settings…";
@@ -16,6 +21,16 @@ const SAVE_LABEL = "Save";
 const SAVING_LABEL = "Saving…";
 const CLIENT_UNAVAILABLE =
   "Notification settings are unavailable in this build.";
+const DELIVERY_TITLE = "Delivery";
+const DELIVERY_HELPER =
+  "An alert counts as sent only when the channel accepted it. Each alert notifies once per occurrence.";
+const DELIVERY_ERROR_PREFIX = "Could not load delivery status";
+const CHANNEL_ORDER = [
+  ["desktop", "Desktop"],
+  ["email", "Email"],
+] as const;
+// Widest ECMAScript Date range in ms; a larger ts would make toISOString throw.
+const MAX_DATE_MS = 8.64e15;
 
 export type NotificationsPanelProps = {
   client: NotificationsClient;
@@ -23,6 +38,109 @@ export type NotificationsPanelProps = {
 
 function emptyEmail(): NotificationSettings["email"] {
   return { to: "", from_addr: "", smtp_host: "", smtp_port: 587 };
+}
+
+function formatDeliveryTs(ts: number): string {
+  const ms = ts * 1000;
+  if (!Number.isFinite(ms) || Math.abs(ms) > MAX_DATE_MS) {
+    return "—";
+  }
+  return `${new Date(ms).toISOString().replace("T", " ").slice(0, 19)} UTC`;
+}
+
+function retryText(retrySeconds: number, pending: number): string {
+  const cadence =
+    retrySeconds === 60
+      ? "Retrying at most once a minute"
+      : `Retrying at most once every ${retrySeconds} seconds`;
+  if (pending <= 0) {
+    return `${cadence}.`;
+  }
+  return `${cadence} (${pending} ${pending === 1 ? "alert" : "alerts"} waiting).`;
+}
+
+function ChannelDelivery({
+  name,
+  label,
+  state,
+  retrySeconds,
+}: {
+  name: string;
+  label: string;
+  state: NotificationChannelDelivery;
+  retrySeconds: number;
+}): JSX.Element {
+  const failure = state.last_failure;
+  const failing =
+    failure !== null &&
+    (state.last_sent_ts === null || failure.ts > state.last_sent_ts);
+  let detail: JSX.Element;
+  if (!state.enabled) {
+    detail = <span className="kbot-ops__notifications-delivery-text">Off.</span>;
+  } else if (failing && failure !== null) {
+    detail = (
+      <>
+        <span
+          className="kbot-ops__notifications-delivery-failure"
+          data-testid={`ops-notifications-delivery-${name}-failure`}
+        >
+          Not delivered. Last failure{" "}
+          <time className="kbot-ops__notifications-delivery-ts">
+            {formatDeliveryTs(failure.ts)}
+          </time>
+          : {failure.message}
+        </span>
+        <span className="kbot-ops__notifications-delivery-text">
+          {retryText(retrySeconds, state.pending)}
+        </span>
+        {state.last_sent_ts !== null ? (
+          <span className="kbot-ops__notifications-delivery-text">
+            Last delivered{" "}
+            <time className="kbot-ops__notifications-delivery-ts">
+              {formatDeliveryTs(state.last_sent_ts)}
+            </time>
+            .
+          </span>
+        ) : null}
+      </>
+    );
+  } else if (state.last_sent_ts !== null) {
+    detail = (
+      <>
+        <span className="kbot-ops__notifications-delivery-text">
+          Last delivered{" "}
+          <time className="kbot-ops__notifications-delivery-ts">
+            {formatDeliveryTs(state.last_sent_ts)}
+          </time>
+          .
+        </span>
+        {failure !== null ? (
+          <span className="kbot-ops__notifications-delivery-text">
+            Earlier failure{" "}
+            <time className="kbot-ops__notifications-delivery-ts">
+              {formatDeliveryTs(failure.ts)}
+            </time>
+            : {failure.message}
+          </span>
+        ) : null}
+      </>
+    );
+  } else {
+    detail = (
+      <span className="kbot-ops__notifications-delivery-text">
+        Nothing sent yet.
+      </span>
+    );
+  }
+  return (
+    <li
+      className="kbot-ops__notifications-delivery-row"
+      data-testid={`ops-notifications-delivery-${name}`}
+    >
+      <span className="kbot-ops__notifications-delivery-channel">{label}</span>
+      {detail}
+    </li>
+  );
 }
 
 export function NotificationsPanel({
@@ -39,10 +157,35 @@ export function NotificationsPanel({
   const [emailFrom, setEmailFrom] = useState("");
   const [smtpHost, setSmtpHost] = useState("");
   const [smtpPort, setSmtpPort] = useState("587");
+  const [delivery, setDelivery] = useState<NotificationDelivery | null>(null);
+  const [deliveryError, setDeliveryError] = useState<string | null>(null);
   const requestRef = useRef(0);
+  const deliveryRequestRef = useRef(0);
   const inFlight = useRef(false);
 
   const hasClient = typeof client.getNotificationSettings === "function";
+  const hasDelivery = typeof client.getNotificationDelivery === "function";
+
+  const loadDelivery = useCallback(async (): Promise<void> => {
+    if (typeof client.getNotificationDelivery !== "function") {
+      return;
+    }
+    const requestId = ++deliveryRequestRef.current;
+    try {
+      const next = await client.getNotificationDelivery();
+      if (requestId !== deliveryRequestRef.current) {
+        return;
+      }
+      setDelivery(next);
+      setDeliveryError(null);
+    } catch (err) {
+      if (requestId !== deliveryRequestRef.current) {
+        return;
+      }
+      setDelivery(null);
+      setDeliveryError(err instanceof Error ? err.message : String(err));
+    }
+  }, [client]);
 
   const applySettings = useCallback((next: NotificationSettings): void => {
     setSettings(next);
@@ -65,6 +208,7 @@ export function NotificationsPanel({
     const requestId = ++requestRef.current;
     setLoading(true);
     setError(null);
+    void loadDelivery();
     try {
       const next = await client.getNotificationSettings();
       if (requestId !== requestRef.current) {
@@ -81,7 +225,7 @@ export function NotificationsPanel({
         setLoading(false);
       }
     }
-  }, [applySettings, client, hasClient]);
+  }, [applySettings, client, hasClient, loadDelivery]);
 
   useEffect(() => {
     void load();
@@ -308,6 +452,44 @@ export function NotificationsPanel({
         >
           {feedback}
         </p>
+      ) : null}
+
+      {hasClient && hasDelivery && (delivery !== null || deliveryError !== null) ? (
+        <section
+          className="kbot-ops__notifications-delivery"
+          data-testid="ops-notifications-delivery"
+          aria-labelledby="ops-notifications-delivery-title"
+        >
+          <h3
+            className="kbot-ops__notifications-delivery-title"
+            id="ops-notifications-delivery-title"
+          >
+            {DELIVERY_TITLE}
+          </h3>
+          <p className="kbot-ops__notifications-helper">{DELIVERY_HELPER}</p>
+          {deliveryError !== null ? (
+            <p
+              className="kbot-ops__notifications-error"
+              role="alert"
+              data-testid="ops-notifications-delivery-error"
+            >
+              {DELIVERY_ERROR_PREFIX} ({deliveryError}).
+            </p>
+          ) : null}
+          {delivery !== null ? (
+            <ul className="kbot-ops__notifications-delivery-list">
+              {CHANNEL_ORDER.map(([name, label]) => (
+                <ChannelDelivery
+                  key={name}
+                  name={name}
+                  label={label}
+                  state={delivery.channels[name]}
+                  retrySeconds={delivery.retry_seconds}
+                />
+              ))}
+            </ul>
+          ) : null}
+        </section>
       ) : null}
     </div>
   );

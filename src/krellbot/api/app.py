@@ -1967,15 +1967,19 @@ def create_app(
         if denied is not None:
             return denied
 
-        body = operations_view_app.operations_view(s.home, now=_now_seconds())
+        now = _now_seconds()
+        body = operations_view_app.operations_view(s.home, now=now)
         # Opt-in alert notifications (desktop/email). Separate from telemetry.
         # FakeNotifier is injected by tests; production builds the default.
+        # Each occurrence notifies once; a notifier failure is recorded for
+        # GET /api/v1/notifications/delivery and never fails this read.
         from krellbot import notifications as kb_notifications
 
         kb_notifications.maybe_notify(
             s.home,
             body.get("alerts") or [],
             notifier=s.alert_notifier,
+            now=now,
         )
         return JSONResponse(body, status_code=200)
 
@@ -1997,6 +2001,26 @@ def create_app(
             return denied
 
         body = kb_notifications.get_settings(s.home)
+        return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/notifications/delivery")
+    async def notifications_delivery_get(request: Request) -> Response:
+        """Return each channel's real delivery record (M28.1).
+
+        Same session gate as ``GET /api/v1/notifications`` (``_gate_get``).
+        Per channel: enabled, last successful send, occurrences still
+        waiting, and the last failure as a fixed code and message. Never
+        carries exception text, an SMTP password or any other secret.
+        """
+
+        from krellbot import notifications as kb_notifications
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+
+        body = kb_notifications.delivery_status(s.home)
         return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
 
     @app.put("/api/v1/notifications")

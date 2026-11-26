@@ -23,12 +23,89 @@ export type NotificationSettingsPatch = {
   email?: Partial<NotificationEmailSettings>;
 };
 
+export type NotificationChannelFailure = {
+  ts: number;
+  code: string;
+  message: string;
+  kind: string | null;
+};
+
+export type NotificationChannelDelivery = {
+  enabled: boolean;
+  last_sent_ts: number | null;
+  pending: number;
+  last_failure: NotificationChannelFailure | null;
+};
+
+export type NotificationDelivery = {
+  schema_version: string;
+  retry_seconds: number;
+  channels: {
+    desktop: NotificationChannelDelivery;
+    email: NotificationChannelDelivery;
+  };
+};
+
 export type NotificationsClient = {
   getNotificationSettings(): Promise<NotificationSettings>;
   updateNotificationSettings(
     patch: NotificationSettingsPatch,
   ): Promise<NotificationSettings>;
+  /** Real per-channel delivery record. Optional so older clients still type. */
+  getNotificationDelivery?(): Promise<NotificationDelivery>;
 };
+
+const DEFAULT_RETRY_SECONDS = 60;
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function adaptFailure(raw: unknown): NotificationChannelFailure | null {
+  if (raw === null || typeof raw !== "object") {
+    return null;
+  }
+  const obj = raw as Record<string, unknown>;
+  const ts = finiteNumber(obj.ts);
+  if (ts === null || typeof obj.code !== "string" || obj.code === "") {
+    return null;
+  }
+  return {
+    ts,
+    code: obj.code,
+    message:
+      typeof obj.message === "string" && obj.message !== ""
+        ? obj.message
+        : "The notification was not delivered.",
+    kind: typeof obj.kind === "string" && obj.kind !== "" ? obj.kind : null,
+  };
+}
+
+function adaptChannelDelivery(raw: unknown): NotificationChannelDelivery {
+  const obj = (raw ?? {}) as Record<string, unknown>;
+  const pending = finiteNumber(obj.pending);
+  return {
+    enabled: obj.enabled === true,
+    last_sent_ts: finiteNumber(obj.last_sent_ts),
+    pending: pending !== null && pending > 0 ? Math.floor(pending) : 0,
+    last_failure: adaptFailure(obj.last_failure),
+  };
+}
+
+export function adaptNotificationDelivery(raw: unknown): NotificationDelivery {
+  const obj = (raw ?? {}) as Record<string, unknown>;
+  const channels = (obj.channels ?? {}) as Record<string, unknown>;
+  const retry = finiteNumber(obj.retry_seconds);
+  return {
+    schema_version:
+      typeof obj.schema_version === "string" ? obj.schema_version : "1",
+    retry_seconds: retry !== null && retry > 0 ? retry : DEFAULT_RETRY_SECONDS,
+    channels: {
+      desktop: adaptChannelDelivery(channels.desktop),
+      email: adaptChannelDelivery(channels.email),
+    },
+  };
+}
 
 function adaptEmail(raw: unknown): NotificationEmailSettings {
   const obj = (raw ?? {}) as Record<string, unknown>;
@@ -106,6 +183,19 @@ export function createNotificationsHttpClient(): NotificationsClient {
         );
       }
       return adaptNotificationSettings(await response.json());
+    },
+    async getNotificationDelivery(): Promise<NotificationDelivery> {
+      const response = await fetch("/api/v1/notifications/delivery", {
+        method: "GET",
+        credentials: "include",
+        headers: {
+          "X-Krellbot-CSRF": getCsrf(),
+        },
+      });
+      if (!response.ok) {
+        throw new Error(`notification delivery status failed: ${response.status}`);
+      }
+      return adaptNotificationDelivery(await response.json());
     },
   };
 }
