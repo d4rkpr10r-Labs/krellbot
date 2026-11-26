@@ -26,6 +26,20 @@ your Tailscale devices, use the Tailscale Serve + `--tailscale-origin` /
 `--tailscale-user` flow documented in [cli.md](cli.md) — never expose the
 backend directly or use Funnel.
 
+A Tailscale session is **read-only by default**. It can see status, receipts,
+alerts and settings, but every change is refused with `remote_read_only`:
+arming and disarming, the kill switch, pausing and resuming entries, live
+grants, key changes, pack installs, research jobs and settings writes. The
+scope is stored in the data folder (`remote_access.json`). A missing or
+unreadable record counts as read-only.
+
+To let Tailscale sessions act, start the workstation **without** the Tailscale
+flags, open Settings → This computer on this computer, and choose
+'Allow full control from Tailscale'. Change it back the same way. A Tailscale
+session can never change the scope, even under full control, and there is no
+command-line flag for it. A running Tailscale workstation picks up the change
+on its next request.
+
 ## The heartbeat check
 
 The tick delivers opted-in alert notifications after it runs, so a tick
