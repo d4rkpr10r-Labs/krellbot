@@ -225,6 +225,19 @@ def get_last_error(home: Path) -> str | None:
     return text or None
 
 
+def last_error_ts(home: Path) -> int | None:
+    """Return when ``last_error`` was last written (unix seconds), or None.
+
+    Every ``set_last_error`` with a message rewrites the file, so its
+    modification time dates the failure. Alerts use it as the occurrence
+    time instead of the time the alert happens to be read.
+    """
+    try:
+        return int(last_error_path(home).stat().st_mtime)
+    except (OSError, ValueError, OverflowError):
+        return None
+
+
 def set_last_error(home: Path, message: str | None) -> None:
     """Persist or clear the scheduler ``last_error`` under ``home/service``.
 

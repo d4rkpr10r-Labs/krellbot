@@ -28,8 +28,12 @@ Sources (all read-only):
 Alerts are deduped, severity-sorted (critical first), and ordered by
 ``last_ts`` descending inside each severity band. Acknowledgements
 persist in ``<home>/run/alerts-ack.json`` keyed by alert id; a new
-occurrence with a greater ``last_ts`` un-acknowledges the alert. A
-corrupt ack file is treated as empty and overwritten on the next ack.
+occurrence with a greater ``last_ts`` un-acknowledges the alert. For the
+ongoing ``scheduler_stale`` and ``unresolved_order_aging`` conditions,
+whose ``last_ts`` is the read time, the occurrence is ``first_ts``, so an
+ack holds until the condition clears and recurs. ``tick_failure`` is dated
+from its ``last_error`` write. A corrupt ack file is treated as empty and
+overwritten on the next ack.
 """
 
 from __future__ import annotations
@@ -60,6 +64,11 @@ KIND_RESTORE_FENCE = "restore_fence"
 
 # Unresolved orders older than this surface as operator-supervision alerts.
 UNRESOLVED_AGING_SECONDS = 3600
+
+# Conditions that stay true between reads. Their ``last_ts`` is the read time
+# (``now``); the occurrence began at ``first_ts`` (the venue's last tick, the
+# order's first stamp) and lasts until the condition clears.
+_ONGOING_KINDS = frozenset({KIND_SCHEDULER_STALE, KIND_UNRESOLVED_ORDER_AGING})
 
 RESTORE_FENCE_REASON_PREFIX = "home restored"
 
@@ -385,12 +394,26 @@ def _collect_journal_refusals(home: Path) -> list[Alert]:
     return out
 
 
-def _apply_acks(alerts: list[Alert], acks: _Mapping[str, int]) -> list[Alert]:
-    """Mark each alert acknowledged when the ack ts is ``>= last_ts``.
+def _occurrence_ts(alert: Alert) -> int:
+    """The time of the latest event an ack must postdate.
 
-    A new occurrence (greater ``last_ts``) un-acknowledges the alert,
-    so the comparison uses ``>=`` so the alert stays acknowledged
-    until a strictly later event arrives.
+    For an ongoing condition ``last_ts`` is the read time, so comparing an
+    ack against it would revert the ack on the next poll. Its occurrence
+    starts at ``first_ts`` and lasts until the condition clears.
+    """
+
+    if alert.kind in _ONGOING_KINDS:
+        return alert.first_ts
+    return alert.last_ts
+
+
+def _apply_acks(alerts: list[Alert], acks: _Mapping[str, int]) -> list[Alert]:
+    """Mark each alert acknowledged when the ack ts is ``>=`` its occurrence.
+
+    A new occurrence (greater ``last_ts``, or a greater ``first_ts`` for an
+    ongoing condition) un-acknowledges the alert, so the comparison uses
+    ``>=`` so the alert stays acknowledged until a strictly later event
+    arrives.
     """
 
     if not acks:
@@ -398,7 +421,7 @@ def _apply_acks(alerts: list[Alert], acks: _Mapping[str, int]) -> list[Alert]:
     out: list[Alert] = []
     for alert in alerts:
         ack_ts = acks.get(alert.id)
-        acknowledged = ack_ts is not None and ack_ts >= alert.last_ts
+        acknowledged = ack_ts is not None and ack_ts >= _occurrence_ts(alert)
         out.append(
             Alert(
                 id=alert.id,
@@ -428,7 +451,12 @@ def _order(alerts: list[Alert]) -> list[Alert]:
 
 
 def _collect_tick_failure(home: Path, *, now: int) -> list[Alert]:
-    """Surface a durable scheduler ``last_error`` as ``tick_failure``."""
+    """Surface a durable scheduler ``last_error`` as ``tick_failure``.
+
+    The alert is dated from the ``last_error`` write, not from the read, so
+    each write is one occurrence however often Operations polls. A write
+    dated after the read (the clock moved back) is clamped to the read.
+    """
 
     from krellbot.service import supervise as kb_supervise
 
@@ -436,6 +464,8 @@ def _collect_tick_failure(home: Path, *, now: int) -> list[Alert]:
     if message is None:
         return []
     code = message if len(message) <= 64 else message[:61] + "..."
+    written_at = kb_supervise.last_error_ts(home)
+    occurred_at = 0 if written_at is None else min(written_at, int(now))
     return [
         Alert(
             id=_alert_id(KIND_TICK_FAILURE, code, None, None),
@@ -445,8 +475,8 @@ def _collect_tick_failure(home: Path, *, now: int) -> list[Alert]:
             venue=None,
             pair=None,
             count=1,
-            first_ts=now,
-            last_ts=now,
+            first_ts=occurred_at,
+            last_ts=occurred_at,
             acknowledged=False,
         )
     ]
