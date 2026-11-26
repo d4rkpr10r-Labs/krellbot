@@ -16,10 +16,10 @@ afterEach(() => {
 });
 
 const DISABLED_TEXT =
-  "Live trading is disabled in this build (KRELLBOT_ENABLE_LIVE is not 1).";
+  "Live trading is disabled in this paper-only release.";
 const NO_GRANTS_TEXT =
-  "Live trading is not authorized: no operator grant on file.";
-const PROMO_DEFERRED_TEXT = "Promotion to live is owner-deferred.";
+  "No operator grant is on file.";
+const PROMO_DEFERRED_TEXT = "Changing settings or adding an operator grant cannot enable live orders.";
 const KILL_HELPER = "Engaging stops new entries and all live sends. It does not sell or disarm.";
 const KILL_RELEASED_TEXT = "Kill switch: released";
 const NO_ALERTS_TEXT = "No alerts.";

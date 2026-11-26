@@ -24,7 +24,7 @@ from fakes.fake_coinbase import FakeCoinbaseTransport
 from fakes.fake_kraken import FakeKrakenTransport
 from fakes.live_grant import write_grant
 
-from krellbot import release_policy
+from krellbot import __version__, release_policy
 from krellbot.application import live_gate
 from krellbot.venues.base import PairRules
 from krellbot.venues.paper import PaperVenue
@@ -106,7 +106,7 @@ def test_gate_refuses_even_with_env_one_and_operator_grant(home, monkeypatch):
 
     assert result.ok is False
     assert result.code == live_gate.CODE_PAPER_ONLY_RELEASE
-    assert "v0.9.6" in result.message
+    assert f"v{__version__}" in result.message
     assert "paper" in result.message.lower()
 
 

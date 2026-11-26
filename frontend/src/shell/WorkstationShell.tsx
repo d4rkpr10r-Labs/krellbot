@@ -841,6 +841,10 @@ export function WorkstationShell({
             ) : null}
             {showStudioControls ? (
               <>
+                <p className="kbot-shell__hint">
+                  Save layout keeps the graph arrangement. Save execution saves
+                  the edited indicator rules as a strategy revision.
+                </p>
                 <StudioNodeInspector
                   nodeId={selectedNodeId}
                   pack={workingPack ?? savedPack ?? {}}

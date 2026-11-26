@@ -106,6 +106,11 @@ export function LivePreflight(): JSX.Element {
         <h2 className="kbot-feature__live-preflight-root__title">
           Live preflight
         </h2>
+        <p>
+          Use sandbox mode with account ID <code>sandbox-default</code> and a
+          revision ID. This checks the local sandbox. It cannot verify exchange
+          credentials or place an order.
+        </p>
       </header>
       <form
         className="kbot-feature__live-preflight-root__form"

@@ -42,6 +42,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+from krellbot import __version__
+
 # ---- ASGI test client (mirrors test_ns27_live_preflight) ------------------
 
 
@@ -375,7 +377,7 @@ def test_promote_refuses_when_live_disabled(home: Path, monkeypatch) -> None:
     assert s == 200, (s, body)
     decoded = json.loads(body)
     assert decoded["code"] == "live_disabled_paper_only_release", decoded
-    assert "v0.9.6" in decoded["message"], decoded
+    assert f"v{__version__}" in decoded["message"], decoded
     assert decoded["ok"] is False, decoded
     assert decoded["effect"] == "refused", decoded
     assert decoded["venue"] == "kraken"

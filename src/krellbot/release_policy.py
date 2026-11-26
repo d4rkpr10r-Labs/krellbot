@@ -16,6 +16,8 @@ turn live orders back on in this release.
 
 from __future__ import annotations
 
+from krellbot import __version__
+
 PAPER_ONLY_RELEASE = True
 CODE_PAPER_ONLY_RELEASE = "live_disabled_paper_only_release"
 
@@ -32,9 +34,8 @@ def paper_only_release_active() -> bool:
 
 def paper_only_message() -> str:
     return (
-        "v0.9.6 is a paper-only release: live order send is disabled regardless of "
-        "environment, stored keys, or authorization. This is temporary; an "
-        "owner-approved code change can re-enable live trading."
+        f"v{__version__} is a paper-only release. Krellbot cannot place, cancel, "
+        "or edit exchange orders, even with stored keys or an operator grant."
     )
 
 

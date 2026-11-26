@@ -9,8 +9,8 @@ const ORDERS_UNAVAILABLE_TEXT = "Live orders unavailable";
 const KILL_ENGAGED_PREFIX = "Kill switch: engaged";
 const KILL_ENGAGED_RULE = "Kill switch engaged";
 const NO_REASON_TEXT = "(no reason)";
-const VENUES_SUFFIX = " live venues authorized";
-const ONE_VENUE_SUFFIX = " live venue authorized";
+const VENUES_SUFFIX = " stored market grants";
+const ONE_VENUE_SUFFIX = " stored market grant";
 const PROMOTION_TEXT = "Promotion available";
 const NO_VENUES_TEXT = "No live venues authorized";
 const ENGAGED_AT_SUFFIX = " UTC";
@@ -79,9 +79,10 @@ function engagedAtText(engagedAt: number | null): string | null {
 }
 
 function modeLabel(live: LiveStatus): string {
-  // Paper is only honest when the kill switch is released AND nothing is
-  // authorized for live; any live authorization or an engaged switch is Live.
-  return live.kill_switch.engaged || live.authorized.length > 0 ? "Live" : "Paper";
+  if (live.release_policy === "paper_only") return "Paper";
+  if (live.release_policy === "live_allowed") return live.live_enabled ? "Live enabled" : "Paper";
+  // Older servers can report saved grants without reporting a release policy.
+  return live.authorized.length > 0 ? "Live" : "Paper";
 }
 
 function ordersText(live: LiveStatus): string {
@@ -128,9 +129,12 @@ function StatusStripBody({ live }: { live: LiveStatus | null }): JSX.Element {
         }
         aria-hidden="true"
       />
-      <span className="kbot-status__mode" aria-label={`Mode ${mode}`}>
+      {mode === "Live" ? <span>Stored authorization</span> : null}
+      <span className="kbot-status__mode" aria-label={mode === "Live" ? "Stored live authorization" : `Mode ${mode}`}>
         {mode}
       </span>
+      {mode === "Paper" && !live?.release_policy ? <span>preview</span> : null}
+      {live && !live.release_policy ? <span>Trading mode unconfirmed</span> : null}
       <span className="kbot-status__divider" aria-hidden="true">·</span>
       {view === null ? (
         <span className="kbot-status__orders" data-testid="live-orders-status">

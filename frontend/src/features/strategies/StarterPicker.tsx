@@ -115,9 +115,8 @@ export function StarterPicker({
     >
       <h3 className="kbot-starter-picker__title">Free Starter Examples</h3>
       <p className="kbot-starter-picker__hint">
-        Free, read-only educational example packs. Picking one seeds the raw JSON
-        below as a fresh editable copy — it is not a reopen of any saved revision.
-        Save, Validate, and Arm behave exactly as before.
+        Choose an example to replace the current draft with an editable copy.
+        Save any changes you want to keep before switching examples.
       </p>
       {state.kind === "error" ? (
         <div className="kbot-starter-picker__error-row">

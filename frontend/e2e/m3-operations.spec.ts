@@ -117,9 +117,9 @@ test("M3-GUI operations surface refuses promotion, drives pause/resume, and enga
 
   const liveStatus = page.getByTestId("ops-live-status");
   await expect(liveStatus).toContainText(
-    "Live trading is disabled in this build (KRELLBOT_ENABLE_LIVE is not 1).",
+    "Live trading is disabled in this paper-only release.",
   );
-  await expect(liveStatus).toContainText("Promotion to live is owner-deferred.");
+  await expect(liveStatus).toContainText("Changing settings or adding an operator grant cannot enable live orders.");
 
   const promoteCodes: string[] = [];
   page.on("response", async (resp) => {

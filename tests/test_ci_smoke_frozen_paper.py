@@ -34,6 +34,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from krellbot import __version__
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 HELPER = SCRIPTS_DIR / "ci_smoke_frozen_paper.py"
@@ -41,9 +43,8 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release-frozen.yml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 
 PAPER_ONLY_MESSAGE = (
-    "v0.9.6 is a paper-only release: live order send is disabled regardless of "
-    "environment, stored keys, or authorization. This is temporary; an "
-    "owner-approved code change can re-enable live trading."
+    f"v{__version__} is a paper-only release. Krellbot cannot place, cancel, "
+    "or edit exchange orders, even with stored keys or an operator grant."
 )
 
 
