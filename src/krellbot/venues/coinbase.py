@@ -485,6 +485,58 @@ class CoinbaseVenue:
             stop_price=None,
         )
 
+    def place_stop(self, coid: str, qty: Decimal, stop: Decimal, *, pair: str) -> OrderRef:
+        """Rest a stop-limit GTC sell for ``qty`` at ``stop`` whose ``client_order_id`` is ``coid``.
+
+        Create Order
+        (https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/orders/create-order)
+        with ``stop_limit_stop_limit_gtc``: the same order the entry's protective
+        stop is, limit ``STOP_BUFFER`` under the stop, ``STOP_DIRECTION_STOP_DOWN``.
+        The coid itself is the ``client_order_id``, so ``order_outcome`` finds it
+        by exact match and ``_link_sell_fills`` names its fills by it. An order the
+        bounded history already shows under the coid is returned and nothing is
+        sent. Only ``base_min_size`` is checked here; a refusal raises.
+        """
+        release_policy.ensure_live_orders_allowed()
+        product = pair or self._product_id
+        if not product:
+            raise ValueError("coinbase stop requires a pair")
+        found = self._find_order(coid, product)
+        if found is not None:
+            return found
+        rules = self.rules(product)
+        lot = _quantize_qty(qty, rules.lot_decimals)
+        price_stop = _quantize_price(stop, rules.price_decimals)
+        _reject_size(lot, rules, None)
+        limit_price = _quantize_price(price_stop * (Decimal(1) - STOP_BUFFER), rules.price_decimals)
+        resp = self._post(
+            "/api/v3/brokerage/orders",
+            {
+                "client_order_id": coid,
+                "product_id": product,
+                "side": "SELL",
+                "order_configuration": {
+                    "stop_limit_stop_limit_gtc": {
+                        "base_size": format(lot, "f"),
+                        "stop_price": format(price_stop, "f"),
+                        "limit_price": format(limit_price, "f"),
+                        "stop_direction": "STOP_DIRECTION_STOP_DOWN",
+                    },
+                },
+            },
+        )
+        if not _order_ok(resp):
+            raise RuntimeError("coinbase stop was not accepted")
+        return OrderRef(
+            id=_extract_order_id(resp),
+            coid=coid,
+            pair=product,
+            side="sell",
+            qty=lot,
+            filled_qty=Decimal(0),
+            stop_price=price_stop,
+        )
+
     def cancel_stops(self, pair: str) -> None:
         release_policy.ensure_live_orders_allowed()
         snapshot = self.snapshot()

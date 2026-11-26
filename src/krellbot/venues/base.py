@@ -298,6 +298,18 @@ class Venue(Protocol):
 
     def place_exit(self, coid: str, qty: Decimal, *, pair: str) -> OrderRef: ...
 
+    def place_stop(self, coid: str, qty: Decimal, stop: Decimal, *, pair: str) -> OrderRef | None:
+        """Rest a sell stop for ``qty`` at ``stop`` under ``coid``, with no entry.
+
+        The run repairs a missing protective stop with it. An order already
+        resting under ``coid`` is not sent again. A refusal raises. The order
+        must be findable again by ``coid`` (the venue's outcome lookup) and
+        its fills must name ``coid`` as ``Fill.order_coid``. An adapter that
+        cannot rest a stop on its own leaves the method out; the run then
+        protects the position by exiting it.
+        """
+        ...
+
     def cancel_stops(self, pair: str) -> None: ...
 
     def raise_stop(self, pair: str, new_stop: Decimal) -> None: ...

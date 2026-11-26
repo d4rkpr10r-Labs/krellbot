@@ -5,8 +5,10 @@
        with `another tick running` on stdout.
     2. Loads the license cache + armed packs config.
     3. Snapshots the venue.
-    4. For each armed pack on the venue: ensure a resting stop if owned > 0.
-       If the stop-place fails, market-exit the owned qty in the same tick.
+    4. For each armed pack on the venue: ensure a resting stop if owned > 0
+       (the venue's ``place_stop``). If the venue refuses the stop or has no
+       ``place_stop``, market-exit the owned qty in the same tick, journaling
+       only what the venue shows executed.
     5. Acts on the latest closed bar only. Missed bars are coalesced by
        feeding every candle up to and including the latest into evaluate.run
        so indicator state includes them.
@@ -418,7 +420,7 @@ def _dispatch_place(
         elif kind == "exit":
             captured[0] = venue_obj.place_exit(c, Decimal(str(payload["qty"])), pair=str(payload["pair"]))
         elif kind == "stop":
-            venue_obj.place_stop(
+            captured[0] = venue_obj.place_stop(
                 c,
                 Decimal(str(payload["qty"])),
                 Decimal(str(payload["stop"])),
@@ -640,9 +642,16 @@ def tick(
                     hold_refused = True
                     print(f"intent refused: {exc.code}", flush=True)
             exits_held_by = _exit_holds(obligations_view, identity)
-            exits_held = hold_refused or bool(exits_held_by)
+            # An earlier exit of this identity whose outcome is not settled may
+            # have sold what the journal still records as owned, so nothing more
+            # is sold or re-protected until order_outcome (or the operator) says
+            # what it executed.
+            exits_pending = _unsettled_exits(obligations_view, identity)
+            exits_held = hold_refused or bool(exits_held_by) or bool(exits_pending)
             if exits_held_by:
                 print("exits held: a sell on the pair is not linked to an order; resolve it in Operations", flush=True)
+            if exits_pending:
+                print("exits held: an earlier exit's outcome is not settled yet", flush=True)
             if ownership.ambiguous:
                 # History that may belong to this arm cannot be attributed, so
                 # the strategy cannot be shown to be flat: hold new entries.
@@ -664,52 +673,80 @@ def tick(
                 None,
             )
 
+            target = kb_evaluate.run(pack, candles)
             ensure_stop_failed = False
             ensure_stop_entry = ""
-            if owned > Decimal(0) and resting is None and latest is not None and not exits_held:
+            exit_qty = Decimal(0)
+            # Set when the repair below falls back to an exit: nothing else is
+            # sent for this pack in this tick.
+            repair_exited = False
+            # On a bar the pack exits, its own exit below sells what it owns. A
+            # stop rested first would only be cancelled again, and one that
+            # triggered at once would be a second sale of the same units.
+            if (
+                owned > Decimal(0)
+                and resting is None
+                and latest is not None
+                and not exits_held
+                and target.reason != "exit"
+            ):
                 repair = _stop_price(pack, Decimal(str(latest.close)))
-                stop_coid = coid_for(
-                    pack_id=armed.pack_id,
-                    pack_version=armed.pack_version,
-                    venue=venue,
-                    pair=armed.pair,
-                    bar_ts=bar_ts,
-                    intent="stop",
-                )
-                stop_body = json.dumps(
-                    {"kind": "stop", "qty": str(owned), "stop": str(repair), "pair": armed.pair},
-                    separators=(",", ":"),
-                    sort_keys=True,
-                )
-                try:
-                    stop_state, _stop_ref = _dispatch_place(
-                        home=home,
-                        mode=armed.mode,
+                stop_refused = False
+                if not callable(getattr(venue_obj, "place_stop", None)):
+                    # This adapter cannot rest a stop on its own. No stop intent
+                    # is committed: it could never be sent, so it would hold
+                    # entries for good. The position is protected by exiting it.
+                    print("ensure_stop failed: the venue cannot place a stop", flush=True)
+                    stop_refused = True
+                else:
+                    stop_coid = coid_for(
+                        pack_id=armed.pack_id,
+                        pack_version=armed.pack_version,
                         venue=venue,
-                        identity=_intent_identity(armed, bar_ts),
-                        coid=stop_coid,
-                        body=stop_body,
-                        venue_obj=venue_obj,
+                        pair=armed.pair,
+                        bar_ts=bar_ts,
+                        intent="stop",
                     )
-                    if stop_state == "sent":
-                        ensure_stop_entry = stop_coid
-                    if ensure_stop_entry:
-                        fill_context[ensure_stop_entry] = {
-                            "pack_id": armed.pack_id,
-                            "pack_version": armed.pack_version,
-                            "bar_ts": bar_ts,
-                            "modeled_px": str(repair),
-                            "fee_bps": _fee_bps_for_venue(venue),
-                            "kind": "stop",
-                        }
-                except StoreError as exc:
-                    pack_intent_refused[armed.pack_id] = exc.code
-                    any_refused = True
-                    print(f"intent refused: {exc.code}", flush=True)
+                    stop_body = json.dumps(
+                        {"kind": "stop", "qty": str(owned), "stop": str(repair), "pair": armed.pair},
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    try:
+                        # The stop coid is committed before the send and never
+                        # sent again: a stop whose reply is lost stays an
+                        # obligation until the venue's record shows it resting.
+                        stop_state, _stop_ref = _dispatch_place(
+                            home=home,
+                            mode=armed.mode,
+                            venue=venue,
+                            identity=_intent_identity(armed, bar_ts),
+                            coid=stop_coid,
+                            body=stop_body,
+                            venue_obj=venue_obj,
+                        )
+                        if stop_state == "sent":
+                            ensure_stop_entry = stop_coid
+                        if ensure_stop_entry:
+                            fill_context[ensure_stop_entry] = {
+                                "pack_id": armed.pack_id,
+                                "pack_version": armed.pack_version,
+                                "bar_ts": bar_ts,
+                                "modeled_px": str(repair),
+                                "fee_bps": _fee_bps_for_venue(venue),
+                                "kind": "stop",
+                            }
+                    except StoreError as exc:
+                        pack_intent_refused[armed.pack_id] = exc.code
+                        any_refused = True
+                        print(f"intent refused: {exc.code}", flush=True)
+                        ensure_stop_failed = True
+                    except (RuntimeError, ValueError):
+                        print("ensure_stop failed: stop", flush=True)
+                        stop_refused = True
+                if stop_refused:
                     ensure_stop_failed = True
-                except (AttributeError, RuntimeError, ValueError):
-                    ensure_stop_failed = True
-                    print("ensure_stop failed: stop", flush=True)
+                    repair_exited = True
                     exit_coid = coid_for(
                         pack_id=armed.pack_id,
                         pack_version=armed.pack_version,
@@ -724,7 +761,7 @@ def tick(
                         sort_keys=True,
                     )
                     try:
-                        _dispatch_place(
+                        exit_state, exit_ref = _dispatch_place(
                             home=home,
                             mode=armed.mode,
                             venue=venue,
@@ -733,21 +770,34 @@ def tick(
                             body=exit_body,
                             venue_obj=venue_obj,
                         )
-                        fill_context[exit_coid] = {
-                            "pack_id": armed.pack_id,
-                            "pack_version": armed.pack_version,
-                            "bar_ts": bar_ts,
-                            "modeled_px": str(Decimal(str(latest.close))),
-                            "fee_bps": _fee_bps_for_venue(venue),
-                            "kind": "exit",
-                        }
+                        if exit_state == "sent":
+                            fill_context[exit_coid] = {
+                                "pack_id": armed.pack_id,
+                                "pack_version": armed.pack_version,
+                                "bar_ts": bar_ts,
+                                "modeled_px": str(Decimal(str(latest.close))),
+                                "fee_bps": _fee_bps_for_venue(venue),
+                                "kind": "exit",
+                            }
+                        if exit_state in ("sent", "already_sent"):
+                            sold = _executed_exit_qty(armed.mode, exit_ref, requested=owned)
+                            if sold is None:
+                                # Nothing proves what executed. The exit stays an
+                                # obligation that holds this identity's exits and
+                                # repair (and entries on this venue and mode) until
+                                # order_outcome settles it, journaled once by
+                                # resolved_coid. Ownership stays as recorded.
+                                audit_needs_reconcile(OperationalStore(home / "ops.sqlite"), coid=exit_coid)
+                            else:
+                                exit_qty = sold
+                                owned -= sold
                     except StoreError as exc:
                         pack_intent_refused[armed.pack_id] = exc.code
                         any_refused = True
                         print(f"intent refused: {exc.code}", flush=True)
                     except (AttributeError, RuntimeError, ValueError):
                         pass
-                    owned = Decimal(0)
+                    obligations_view = kb_obligations.read_obligations(home)
 
             if not candles:
                 _record_tick(
@@ -767,7 +817,6 @@ def tick(
                     on_pack_completed(armed.pack_id, armed.pair)
                 continue
 
-            target = kb_evaluate.run(pack, candles)
             trace_extra: dict = {}
             if armed.mode == "paper":
                 paper_trace = kb_trace.paper_decision_trace(pack, candles)
@@ -777,7 +826,6 @@ def tick(
                     if isinstance(last_reason, str):
                         trace_extra["decision_reason"] = last_reason
             entry_qty = Decimal(0)
-            exit_qty = Decimal(0)
             entry_coid_for_signal = ""
             kill_engaged = live_gate.kill_state(home).engaged
             entries_suppressed = armed.entries_paused or kill_engaged
@@ -796,6 +844,7 @@ def tick(
                 and not entries_suppressed
                 and not reconcile_blocked
                 and not ownership.ambiguous
+                and not repair_exited
                 and target.long
                 and owned == Decimal(0)
                 and target.stop_price is not None
@@ -904,7 +953,7 @@ def tick(
                                 print("entry protective stop rejected; reconciliation required", flush=True)
                             except (RuntimeError, ValueError):
                                 entry_qty = Decimal(0)
-            elif target.reason == "exit" and owned > Decimal(0) and not exits_held:
+            elif target.reason == "exit" and owned > Decimal(0) and not exits_held and not repair_exited:
                 try:
                     venue_obj.cancel_stops(armed.pair)
                 except (RuntimeError, ValueError):
@@ -950,7 +999,7 @@ def tick(
                     print(f"intent refused: {exc.code}", flush=True)
                 except (RuntimeError, ValueError):
                     pass
-            elif target.long and owned > Decimal(0) and target.stop_price is not None:
+            elif target.long and owned > Decimal(0) and target.stop_price is not None and not repair_exited:
                 cur_stop = resting
                 if cur_stop is None or target.stop_price > cur_stop:
                     try:
@@ -974,6 +1023,7 @@ def tick(
                     "stop_qty": str(stop_fill_qty),
                     **({"stop_fill_ids": stop_fill_ids} if stop_fill_ids else {}),
                     **({"exits_held_by": exits_held_by} if exits_held_by else {}),
+                    **({"exits_pending": exits_pending} if exits_pending else {}),
                     "owned_qty_after": str(owned),
                     "entries_blocked": blocked,
                     "entries_paused": entries_suppressed,
@@ -1315,11 +1365,18 @@ def _resolve_obligations(home: Path, *, venue: str, venue_obj: Any, snap: Any, j
     accounting (idempotent by ``resolved_coid``), then the resolution row.
     An interruption anywhere leaves a state the next call converges from
     without double counting. Nothing is resubmitted.
+
+    A repaired stop (kind ``stop``) is looked up through the venue's
+    ``stop_outcome`` when it has one (the reference ``place_stop`` sent it
+    under), else ``order_outcome``. An authoritative ``open`` is that stop's
+    success: it rests, so the obligation is retired. For entries and exits
+    ``open`` is no outcome.
     """
     view = kb_obligations.read_obligations(home)
     if not view.available:
         return
     lookup = getattr(venue_obj, "order_outcome", None)
+    stop_lookup = getattr(venue_obj, "stop_outcome", None) or lookup
     store = OperationalStore(home / "ops.sqlite")
     for intent in view.unresolved:
         if intent.venue != venue or intent.pair is None:
@@ -1331,9 +1388,10 @@ def _resolve_obligations(home: Path, *, venue: str, venue_obj: Any, snap: Any, j
                 audit_needs_reconcile(store, coid=intent.coid)
             continue
         outcome: OrderOutcome | None = None
-        if lookup is not None:
+        find = stop_lookup if intent.kind == "stop" else lookup
+        if find is not None:
             try:
-                outcome = lookup(intent.coid, pair=intent.pair)
+                outcome = find(intent.coid, pair=intent.pair)
             except (InstrumentMetadataError, RuntimeError, ValueError, OSError):
                 outcome = None
         if not isinstance(outcome, OrderOutcome) or outcome.status == "unknown":
@@ -1349,16 +1407,17 @@ def _resolve_obligations(home: Path, *, venue: str, venue_obj: Any, snap: Any, j
             filled_qty=outcome.filled_qty,
             previous=intent.last_observation,
         )
-        needs_accounting = outcome.status in ("filled", "partial") or (
-            outcome.status == "open" and intent.kind == "stop"
-        )
+        stop_resting = outcome.status == "open" and intent.kind == "stop" and outcome.authoritative
+        needs_accounting = outcome.status in ("filled", "partial") or stop_resting
         if needs_accounting and not _account_intent(home, intent, outcome, venue=venue, journal=journal, now=now):
             continue  # no durable owner context: never assign it to whoever is armed now
         if outcome.status == "absent" and outcome.authoritative:
             kb_obligations.record_resolution(
                 store, coid=intent.coid, outcome="absent", filled_qty=Decimal(0), evidence="venue_record_complete"
             )
-        elif outcome.status == "open" and intent.kind == "stop":
+        elif stop_resting:
+            # Accounted above with the stop coid as entry_coid, so the stop's
+            # later fill is attributed to this identity once (M28.24).
             kb_obligations.record_resolution(
                 store, coid=intent.coid, outcome="open", filled_qty=Decimal(0), evidence="protective_stop_resting"
             )
@@ -1450,6 +1509,35 @@ def _protected_or_flat(home: Path, intent, *, venue: str, snap: Any) -> bool:
 def _fill_evidence(filled: Any) -> bool:
     """True when a venue acknowledgement reports a positive, finite Decimal fill."""
     return isinstance(filled, Decimal) and filled.is_finite() and filled > 0
+
+
+def _executed_exit_qty(mode: str, ref: Any, *, requested: Decimal) -> Decimal | None:
+    """What an exit's acknowledgement proves executed; None when it proves nothing.
+
+    Only the paper venue's acknowledgement is its complete record of what
+    executed. A live one is not: Kraken reports no executed volume and
+    Coinbase echoes the requested size, so a live exit is settled from
+    ``order_outcome`` instead.
+    """
+    if mode != "paper":
+        return None
+    filled = getattr(ref, "filled_qty", None)
+    if not isinstance(filled, Decimal) or not filled.is_finite() or not Decimal(0) <= filled <= requested:
+        return None
+    return filled
+
+
+def _unsettled_exits(view: kb_obligations.ObligationsView, identity: OwnershipIdentity) -> list[str]:
+    """Coids of ``identity``'s exits whose outcome is not settled yet."""
+    return [
+        o.coid
+        for o in view.unresolved
+        if o.kind == "exit"
+        and o.venue == identity.venue
+        and o.mode == identity.mode
+        and o.pair == identity.pair
+        and o.pack_id == identity.pack_id
+    ]
 
 
 def _intent_identity(armed: kb_config.ArmedPack, bar_ts: int) -> dict:
