@@ -9,6 +9,10 @@ One line per item. Nothing here is work until the owner moves it into a mileston
 - CI frontend flake: `Editor.ownedSeedIdentity.test.tsx` intermittently misses `[data-testid="editor-revision-id"]` under full suite load (seen on #426; passes alone locally; main tip green).
 - CI macOS flake: `tests/test_int01_workstation_launch.py` under full-suite load (seen on #450); wait/HTTP budgets raised — keep watching macOS matrix if TimeoutError returns.
 - CI Windows 3.13 flake: `tests/test_installer_wrapper_vs_engine.py` live installer fetch can still fail after retries under sustained SSL loss (retries landed; keep watching Windows matrix).
+- `docs/telemetry.md` does not list the `backup_completed` event that `storage/backup.py` sends when telemetry is on.
+- `SECURITY.md` says the bootstrap token comes from `token_hex(32)`; `api/serve.py` uses `token_urlsafe(32)`.
+- `GET /api/v1/catalogue` returns 502 when the transport fails instead of serving the verified cached catalogue.
+- Canonical-JSON + sha256 is reimplemented in six modules (`backtest/receipt.py`, `packs/launch_family.py`, `strategy_ir/canonical.py`, `strategy_ir/identity.py`, `application/packs.py`, `api/jobs.py`).
 - Hosting operator exchange keys (cloud key custody) — explicitly out of P0–P4; never promote without a custody redesign.
 - Paid ads for trading signals — restricted channels; out of P0–P4 growth plan.
 - Personalized / individualized trading advice framing — packs stay tools; out of scope.
