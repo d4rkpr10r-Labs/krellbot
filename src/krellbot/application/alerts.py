@@ -835,6 +835,25 @@ def collect(home: Path, *, now: int) -> list[Alert]:
     return _order(alerts)
 
 
+# The kinds the scheduler heartbeat (``krellbot service heartbeat``) checks.
+SCHEDULER_KINDS = frozenset({KIND_TICK_FAILURE, KIND_SCHEDULER_STALE})
+
+
+def collect_scheduler(home: Path, *, now: int) -> list[Alert]:
+    """The ``tick_failure`` and ``scheduler_stale`` alerts, as ``collect`` builds them.
+
+    Same ids, occurrence times and acknowledgements as ``collect``, so a
+    notification pass over these and one over ``collect`` share each
+    occurrence. Reads only the scheduler's ``last_error``, the armed venues,
+    the journal and the ack file; it opens no store, venue or key and never
+    creates a file.
+    """
+
+    home = Path(home)
+    alerts = [*_collect_tick_failure(home, now=now), *_collect_scheduler_stale(home, now=now)]
+    return _order(_apply_acks(alerts, _load_acks(home)))
+
+
 def acknowledge(home: Path, alert_id: str, *, now: int) -> Alert:
     """Record an ack for ``alert_id`` at ``now`` and return the alert.
 
@@ -874,6 +893,7 @@ __all__ = [
     "KIND_SCHEDULER_STALE",
     "KIND_TICK_FAILURE",
     "KIND_UNRESOLVED_ORDER_AGING",
+    "SCHEDULER_KINDS",
     "SEVERITY_CRITICAL",
     "SEVERITY_WARNING",
     "STALE_CANDLE_TIMEFRAMES",
@@ -885,6 +905,7 @@ __all__ = [
     "acknowledge",
     "candle_is_fresh",
     "collect",
+    "collect_scheduler",
     "current_arm_ticks",
     "feed_freshness",
     "pack_timeframe_seconds",
