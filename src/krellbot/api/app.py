@@ -970,6 +970,41 @@ def _fleet_armed_view(
     }
 
 
+def _fleet_freshness_view(home: Path) -> dict:
+    """Candle evidence for every armed feed, one closed row per record.
+
+    Each row is read from the current arm's latest tick with the stale rule
+    ``/api/v1/paper/health`` uses (``alerts.candle_is_fresh``):
+    ``last_bar_ts_ms`` is the candle that tick read, ``candle_age_s`` its
+    age when read, and ``candle_stale`` whether it was older than two
+    timeframes. Missing evidence is ``null``. The fleet row stays closed;
+    the workstation joins the two on ``(venue, pack_id, pair)``.
+    """
+
+    try:
+        config = kb_config.load_config(Path(home))
+    except (OSError, ValueError):
+        return {"schema_version": SCHEMA_VERSION, "feeds": []}
+    records = _read_journal_records(Path(home)) if config.armed else []
+    feeds: list[dict] = []
+    for record in config.armed:
+        freshness = alerts_app.feed_freshness(
+            alerts_app.current_arm_ticks(records, record),
+            timeframe_seconds=alerts_app.pack_timeframe_seconds(record.pack_path),
+        )
+        feeds.append(
+            {
+                "venue": record.venue,
+                "pack_id": record.pack_id,
+                "pair": record.pair,
+                "last_bar_ts_ms": freshness.last_bar_ts_ms,
+                "candle_age_s": freshness.candle_age_s,
+                "candle_stale": freshness.candle_stale,
+            }
+        )
+    return {"schema_version": SCHEMA_VERSION, "feeds": feeds}
+
+
 def _format_sse(event_id: str, event_name: str, data_payload: dict) -> bytes:
     """Render a single SSE frame. JSON-encode the payload as ``data:``."""
 
@@ -3068,43 +3103,16 @@ def create_app(
             write_root=_scheduler_write_root(s),
             supervisor=_scheduler_supervisor(s),
         )
-        records = []
-        for record in _read_journal_records(s.home):
-            detail = record.get("detail")
-            ts = record.get("ts")
-            if (
-                record.get("kind") == "tick"
-                and record.get("venue") == armed.venue
-                and record.get("pack") == armed.pack_id
-                and isinstance(detail, dict)
-                and detail.get("pair") == armed.pair
-                and isinstance(ts, (int, float))
-                and not isinstance(ts, bool)
-                and 0 < ts < 1_000_000_000_000
-                and armed.armed_at_ts > 0
-                and ts > armed.armed_at_ts
-            ):
-                records.append(record)
-        records.sort(key=lambda rec: rec["ts"])
+        records = alerts_app.current_arm_ticks(_read_journal_records(s.home), armed)
         latest = records[-1] if records else None
         detail = latest.get("detail", {}) if latest else {}
         reason = detail.get("reason")
         refusal = _tick_refusal_code(latest) if latest else None
-        timeframe_seconds = None
-        try:
-            pack = json.loads(Path(armed.pack_path).read_text(encoding="utf-8"))
-            timeframe_seconds = {"1h": 3600, "4h": 14400, "1d": 86400}.get(pack.get("timeframe"))
-        except (OSError, ValueError, AttributeError):
-            pass
+        timeframe_seconds = alerts_app.pack_timeframe_seconds(armed.pack_path)
 
         def has_fresh_candle(rec: dict) -> bool:
-            bar = rec.get("bar_ts")
-            return (
-                timeframe_seconds is not None
-                and isinstance(bar, (int, float))
-                and not isinstance(bar, bool)
-                and 0 <= bar < 1_000_000_000_000_000
-                and 0 <= rec["ts"] * 1000 - bar <= timeframe_seconds * 2000
+            return alerts_app.candle_is_fresh(
+                bar_ts_ms=rec.get("bar_ts"), read_at=rec["ts"], timeframe_seconds=timeframe_seconds
             )
 
         successful = [
@@ -3542,6 +3550,28 @@ def create_app(
 
         return JSONResponse(
             body,
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/v1/paper/fleet/freshness")
+    async def paper_fleet_freshness(request: Request) -> Response:
+        """Return candle age and staleness for every armed feed.
+
+        Same session gate as ``GET /api/v1/paper/fleet`` (``_gate_get``):
+        session cookie + loopback Origin + loopback Host, no CSRF. One row
+        per armed ``(venue, pack_id, pair)`` with ``last_bar_ts_ms``,
+        ``candle_age_s`` and ``candle_stale``; ``null`` where the current
+        arm has no candle evidence. Read-only: nothing is fetched or written.
+        """
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+
+        return JSONResponse(
+            _fleet_freshness_view(s.home),
             status_code=200,
             headers={"Cache-Control": "no-store"},
         )
