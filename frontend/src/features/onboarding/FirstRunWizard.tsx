@@ -8,6 +8,12 @@
  * paper status. Without those clients the shell still walks the steps.
  * The win screen is the celebration: completing it (or skipping from
  * that screen) consumes the shell toast so the workspace stays quiet.
+ *
+ * Recovery (KQ-04): after a lost arm response, Check status advances only
+ * when the chosen venue and pair show this revision's paper arm, and a
+ * Start that follows it checks first. A refused repeat of that revision
+ * reads as already running. Neither path sends a second arm for a run
+ * that exists. A failed loopback session is retried on the next action.
  */
 import {
   useCallback,
@@ -134,6 +140,12 @@ export type FirstRunWizardProps = {
    * for it so a fast Use click is not refused with 403.
    */
   sessionReady?: Promise<boolean>;
+  /**
+   * Starts the loopback session again after `sessionReady` resolved
+   * false. The next action calls it before any request, keeping the
+   * chosen starter and venue. Omit to keep the reopen instruction.
+   */
+  retrySession?: () => Promise<boolean>;
 };
 
 function stepIndexOf(
@@ -254,6 +266,57 @@ function armRefusal(result: PaperCommandResult | null | undefined): string {
   return "Start paper run refused";
 }
 
+type WizardVenue = keyof typeof WIZARD_MARKETS;
+
+const WIZARD_VENUE_LABELS: Record<WizardVenue, string> = {
+  kraken: "Kraken",
+  coinbase: "Coinbase",
+};
+
+function marketLabel(venue: WizardVenue): string {
+  return `${WIZARD_VENUE_LABELS[venue]} · BTC/USD`;
+}
+
+/**
+ * Refusals a repeat Start of an armed revision gets: the reservation check
+ * runs first (`over_reserved`), the engine's duplicate check second.
+ */
+const REPEAT_ARM_CODES: ReadonlySet<string> = new Set([
+  "over_reserved",
+  "already_armed",
+]);
+
+/**
+ * Reads only. True when paper status for the wizard's venue and pair is a
+ * paper arm of this revision's strategy (its draft `strategy_id` is the
+ * armed `pack_id`). Throws when either read fails, so a caller never
+ * mistakes an unknown answer for "not armed".
+ */
+async function wizardArmExists(
+  paperClient: PaperClient,
+  revisionId: string | undefined,
+  venue: WizardVenue,
+): Promise<boolean> {
+  const pair = WIZARD_MARKETS[venue];
+  if (!revisionId || paperClient.listOwnedDrafts === undefined) {
+    throw new Error("paper status unavailable");
+  }
+  const status = await paperClient.getStatus({ venue, pair });
+  if (
+    status.armed !== true ||
+    status.mode !== "paper" ||
+    status.venue !== venue ||
+    status.pair !== pair ||
+    typeof status.pack_id !== "string" ||
+    status.pack_id.length === 0
+  ) {
+    return false;
+  }
+  const drafts = await paperClient.listOwnedDrafts();
+  const draft = drafts.find((row) => row.revision_id === revisionId);
+  return draft !== undefined && draft.strategy_id === status.pack_id;
+}
+
 export function FirstRunWizard({
   storageKey = FIRST_RUN_WIZARD_STORAGE_KEY,
   steps = DEFAULT_FIRST_RUN_WIZARD_STEPS,
@@ -268,6 +331,7 @@ export function FirstRunWizard({
   loadStarters,
   paperClient,
   sessionReady,
+  retrySession,
 }: FirstRunWizardProps): JSX.Element | null {
   const [state, setState] = useState<FirstRunWizardPersisted>(() =>
     readFirstRunWizardState(storageKey),
@@ -277,11 +341,22 @@ export function FirstRunWizard({
   const [chooseError, setChooseError] = useState<string | null>(null);
   const [armBusy, setArmBusy] = useState(false);
   const [armError, setArmError] = useState<string | null>(null);
+  // The last arm's outcome is unknown: offer Check status, and check
+  // before any further arm.
+  const [armUnknown, setArmUnknown] = useState(false);
+  const [checkBusy, setCheckBusy] = useState(false);
+  const [checkResult, setCheckResult] = useState<string | null>(null);
+  const [alreadyRunning, setAlreadyRunning] = useState<string | null>(null);
   const [statusPhase, setStatusPhase] = useState<WizardStatusPhase>({
     kind: "loading",
   });
   const inFlight = useRef(false);
   const stepPrompt = useRef<HTMLParagraphElement>(null);
+  const session = useRef(sessionReady);
+
+  useEffect(() => {
+    session.current = sessionReady;
+  }, [sessionReady]);
 
   useEffect(() => {
     setState(readFirstRunWizardState(storageKey));
@@ -371,15 +446,27 @@ export function FirstRunWizard({
     );
   }
 
-  async function requireSession(kind: "choose" | "arm"): Promise<boolean> {
-    if (sessionReady === undefined) {
+  async function requireSession(kind: "choose" | "arm" | "check"): Promise<boolean> {
+    const current = session.current;
+    if (current === undefined) {
       return true;
     }
-    const ready = await sessionReady;
-    if (ready) {
+    if (await current) {
       return true;
     }
-    const message = "The local workstation session is unavailable. Reopen the workstation and try again.";
+    if (retrySession !== undefined) {
+      const retried = retrySession();
+      session.current = retried;
+      if (await retried) {
+        return true;
+      }
+    }
+    const control =
+      kind === "choose" ? "Use" : kind === "arm" ? "Start paper run" : "Check status";
+    const message =
+      retrySession === undefined
+        ? "The local workstation session is unavailable. Reopen the workstation and try again."
+        : `The local workstation session is unavailable. Press ${control} again to retry.`;
     if (kind === "choose") {
       setChooseError(`Could not save that strategy: ${message}`);
     } else {
@@ -423,12 +510,79 @@ export function FirstRunWizard({
     }
   }
 
+  function advancePastStart(revisionId: string, recovered: boolean): void {
+    const index = stepIndexOf(steps, "start_paper");
+    const nextStep = steps[index + 1];
+    if (!nextStep) {
+      return;
+    }
+    const venue = state.marketVenue ?? "kraken";
+    setArmUnknown(false);
+    setCheckResult(null);
+    setAlreadyRunning(
+      recovered
+        ? `Already running on ${marketLabel(venue)}. Nothing was started twice.`
+        : null,
+    );
+    persist(
+      persisted(
+        "active",
+        nextStep.id,
+        state.selectedStarterId ?? null,
+        revisionId,
+      ),
+    );
+  }
+
+  async function checkStatus(): Promise<void> {
+    if (!paperClient || inFlight.current) {
+      return;
+    }
+    inFlight.current = true;
+    setArmError(null);
+    setCheckResult(null);
+    setCheckBusy(true);
+    try {
+      if (!(await requireSession("check"))) {
+        return;
+      }
+      const venue = state.marketVenue ?? "kraken";
+      let found: boolean;
+      try {
+        found = await wizardArmExists(paperClient, state.revisionId, venue);
+      } catch (reason) {
+        if (!dismissedNow()) {
+          setArmError(
+            `Could not check status: ${errorText(reason)}. Press Check status again.`,
+          );
+        }
+        return;
+      }
+      if (dismissedNow()) {
+        return;
+      }
+      if (found && state.revisionId) {
+        advancePastStart(state.revisionId, true);
+        return;
+      }
+      // Confirmed absent: a new Start is a safe retry, not a duplicate.
+      setArmUnknown(false);
+      setCheckResult(
+        `This strategy is not running on ${marketLabel(venue)} yet. Press Start paper run to try again.`,
+      );
+    } finally {
+      inFlight.current = false;
+      setCheckBusy(false);
+    }
+  }
+
   async function armAndAdvance(): Promise<void> {
     if (!paperClient || inFlight.current) {
       return;
     }
     inFlight.current = true;
     setArmError(null);
+    setCheckResult(null);
     setArmBusy(true);
     try {
       if (!(await requireSession("arm"))) {
@@ -469,18 +623,43 @@ export function FirstRunWizard({
         setArmError("Could not start the simulation. Reopen the workstation and try again.");
         return;
       }
+      const venue = state.marketVenue ?? "kraken";
+      if (armUnknown) {
+        // The last arm may have landed: never send another until a read
+        // says this revision is not armed on the chosen market.
+        let found: boolean;
+        try {
+          found = await wizardArmExists(paperClient, revisionId, venue);
+        } catch (reason) {
+          if (!dismissedNow()) {
+            setArmError(
+              `Could not check status: ${errorText(reason)}. Press Check status again.`,
+            );
+          }
+          return;
+        }
+        if (dismissedNow()) {
+          return;
+        }
+        if (found) {
+          advancePastStart(revisionId, true);
+          return;
+        }
+        setArmUnknown(false);
+      }
       let result: PaperCommandResult;
       try {
         result = await arm.call(paperClient, {
           revision_id: revisionId,
-          venue: state.marketVenue ?? "kraken",
+          venue,
           mode: "paper",
           paper_balance: WIZARD_PAPER_BALANCE,
         });
       } catch (reason) {
         if (!dismissedNow()) {
+          setArmUnknown(true);
           setArmError(
-            `Start paper run outcome unknown: ${errorText(reason)}. Refresh status to see the server state before retrying.`,
+            `Start paper run outcome unknown: ${errorText(reason)}. Check status to see whether it started before trying again.`,
           );
         }
         return;
@@ -489,22 +668,27 @@ export function FirstRunWizard({
         return;
       }
       if (result?.ok !== true) {
+        if (typeof result?.code === "string" && REPEAT_ARM_CODES.has(result.code)) {
+          // A refused repeat of this revision means its earlier Start went
+          // through. Any other arm on the market keeps the refusal.
+          let found = false;
+          try {
+            found = await wizardArmExists(paperClient, revisionId, venue);
+          } catch {
+            found = false;
+          }
+          if (dismissedNow()) {
+            return;
+          }
+          if (found) {
+            advancePastStart(revisionId, true);
+            return;
+          }
+        }
         setArmError(armRefusal(result));
         return;
       }
-      const index = stepIndexOf(steps, "start_paper");
-      const nextStep = steps[index + 1];
-      if (!nextStep) {
-        return;
-      }
-      persist(
-        persisted(
-          "active",
-          nextStep.id,
-          state.selectedStarterId ?? null,
-          revisionId,
-        ),
-      );
+      advancePastStart(revisionId, false);
     } finally {
       inFlight.current = false;
       setArmBusy(false);
@@ -660,6 +844,12 @@ export function FirstRunWizard({
             </p>
           ) : null}
 
+          {activeStep.id === "status" && alreadyRunning !== null ? (
+            <p data-testid="first-run-wizard-already-running" role="status">
+              {alreadyRunning}
+            </p>
+          ) : null}
+
           {activeStep.id === "choose" ? (
             <>
               <label className="kbot-first-run-wizard__market" htmlFor="wizard-market">
@@ -725,17 +915,18 @@ export function FirstRunWizard({
               type="button"
               className="kbot-first-run-wizard__primary"
               data-testid="first-run-wizard-primary"
-              disabled={armBusy || statusLoading}
+              disabled={armBusy || checkBusy || statusLoading}
               onClick={handlePrimary}
             >
               {primaryLabel}
             </button>
           )}
 
-          {activeStep.id === "start_paper" && !armBusy ? (
+          {activeStep.id === "start_paper" && !armBusy && !checkBusy ? (
             <button type="button" className="kbot-first-run-wizard__skip"
               onClick={() => {
                 setArmError(null);
+                setCheckResult(null);
                 persist(persisted("active", "choose", state.selectedStarterId ?? null));
               }}>Back to strategies</button>
           ) : null}
@@ -754,13 +945,29 @@ export function FirstRunWizard({
               {armError}
             </p>
           ) : null}
+          {activeStep.id === "start_paper" && armUnknown && paperClient ? (
+            <button
+              type="button"
+              className="kbot-first-run-wizard__skip"
+              data-testid="first-run-wizard-check-status"
+              disabled={armBusy || checkBusy}
+              onClick={() => void checkStatus()}
+            >
+              {checkBusy ? "Checking…" : "Check status"}
+            </button>
+          ) : null}
+          {activeStep.id === "start_paper" && checkResult !== null ? (
+            <p data-testid="first-run-wizard-check-result" role="status">
+              {checkResult}
+            </p>
+          ) : null}
 
           {showSkip ? (
             <button
               type="button"
               className="kbot-first-run-wizard__skip"
               data-testid="first-run-wizard-skip"
-              disabled={chooseBusyId !== null || armBusy}
+              disabled={chooseBusyId !== null || armBusy || checkBusy}
               onClick={handleSkip}
             >
               Skip setup
