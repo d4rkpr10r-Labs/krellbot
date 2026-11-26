@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type JSX } from "react";
 import { KeysOnboardingPanel } from "../keys/KeysOnboardingPanel";
 import type { KeysClient } from "../keys/client";
+import { DIAGNOSTIC_REPORT_HREF } from "../paper/paperHealth";
 import type { LiveWizardHonesty, TrustClient } from "./client";
 import "./LiveWizardPanel.signal.css";
 
@@ -172,6 +173,14 @@ export function LiveWizardPanel({
                 {trust.posture_ok
                   ? "A persistent keychain is available and the data folder is private to your user."
                   : `${trust.posture_warning ?? "Could not verify local key storage"}. Run krellbot doctor.`}
+                {trust.posture_ok ? null : (
+                  <>
+                    {" "}
+                    <a href={DIAGNOSTIC_REPORT_HREF} data-testid="live-wizard-diagnostic-report">
+                      Diagnostic report
+                    </a>
+                  </>
+                )}
               </p>
               <ul className="kbot-live-wizard__rows">
                 <li className="kbot-live-wizard__row">
