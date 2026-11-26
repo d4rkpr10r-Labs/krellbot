@@ -1455,7 +1455,11 @@ def venue_for_tick(home, armed_list, *, transport, fetch):
 
     reader = _build_fetch_reader(armed_list, fetch=fetch, transport=transport)
 
-    gate_result = kb_live_gate.check_live_send(home, venue=armed.venue, pair=armed.pair)
+    # The kill switch alone does not refuse here: run.tick suppresses entries
+    # and keeps exits and stops. The restore fence still refuses.
+    gate_result = kb_live_gate.check_live_tick(
+        home, venue=armed.venue, pair=armed.pair, entries_paused=armed.entries_paused
+    )
     if not gate_result.ok:
         if gate_result.code == kb_live_gate.CODE_PAPER_ONLY_RELEASE:
             return PAPER_ONLY_TICK_REFUSED
@@ -1496,7 +1500,9 @@ def _build_live_venue_for_offline(armed, *, transport):
     from krellbot.venues.kraken import KrakenVenue
 
     home = kb_paths.home()
-    gate_result = kb_live_gate.check_live_send(home, venue=armed.venue, pair=armed.pair)
+    gate_result = kb_live_gate.check_live_tick(
+        home, venue=armed.venue, pair=armed.pair, entries_paused=armed.entries_paused
+    )
     if not gate_result.ok:
         if gate_result.code == kb_live_gate.CODE_PAPER_ONLY_RELEASE:
             return PAPER_ONLY_TICK_REFUSED
