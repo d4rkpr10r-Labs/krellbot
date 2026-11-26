@@ -92,11 +92,15 @@ This is what the engine does today.
   that bar's close and calls `raise_stop` when the new price is strictly
   above the resting stop. On a flat bar the stop stays where it is.
 - **Missing stop.** If the pack owns base and no stop rests on the pair, the
-  tick re-places one from the latest closed bar's close (`run._stop_price`).
-  A `pct` stop uses `close * (1 - pct/100)`. Every other stop type, `atr`
-  included, uses `close / 2` until
-  [M28.29](milestones/M28.md) repairs it with the pack's own rule. If
-  placing it fails, the tick market-exits the owned qty.
+  tick re-places one with the pack's own stop rule on the latest closed bars
+  (`run._stop_price`). A `pct` stop uses `close * (1 - pct/100)`. An `atr`
+  stop uses the entry rule, `close - mult * ATR(len)`, and is never placed
+  below the stop recorded at entry (the committed entry intent's `stop` in
+  `ops.sqlite`). If the rule gives no price (too few candles, a rule the
+  engine cannot read), the tick re-places the stop recorded at entry, or
+  places no stop when none was recorded. It journals
+  `stop_price_unavailable` and Operations raises a critical alert. If
+  placing the stop fails, the tick market-exits the owned qty.
 - **Pause new buys** sets `entries_paused`. It stops new entries only.
   Exits, stop repair and `raise_stop` keep running.
 - **Stop paper run** (`paper.disarm`) removes the armed record only. The

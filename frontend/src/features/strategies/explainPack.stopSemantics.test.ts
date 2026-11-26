@@ -3,8 +3,9 @@
  * is explained. The sentences mirror `krellbot.pack.evaluate._decide` (stop
  * from the signal bar's close), the raise branch of `krellbot.run.tick`
  * (raise only while the entry condition holds, never lower) and
- * `krellbot.run._stop_price` (a missing stop is re-placed from the latest
- * closed bar's close; every non-percentage stop at half that close).
+ * `krellbot.run._stop_price` (a missing stop is re-placed with the pack's own
+ * stop rule on the latest closed bars, never below the stop recorded at
+ * entry; with no rule price, the recorded stop and a critical alert).
  */
 import { cleanup, render, screen } from "@testing-library/react";
 import { createElement } from "react";
@@ -60,7 +61,7 @@ describe("explainPack stop semantics", () => {
     );
   });
 
-  it("says a missing ATR stop is re-placed at half the close, not with its ATR rule", () => {
+  it("says a missing ATR stop is re-placed with its ATR rule, never below the recorded stop", () => {
     const { stop } = explainPack(atrBytes, "rev-2");
     expect(stop.supported).toBe(true);
     const lines = stop.semantics ?? [];
@@ -69,7 +70,7 @@ describe("explainPack stop semantics", () => {
       "The engine sets this stop from the signal bar's close, 2 × that bar's 14-bar average true range below it. The signal bar is the closed bar on which the entry condition fired; the fill price is not used.",
     );
     expect(lines[2]).toBe(
-      "If the position has no resting stop, the engine re-places one at half the latest closed bar's close (50% below it), not with this ATR rule.",
+      "If the position has no resting stop, the engine re-places one with this same rule on the latest closed bars, never below the stop recorded at entry. If that price cannot be computed, the engine re-places the stop recorded at entry, or places no stop when none was recorded, and raises a critical alert.",
     );
   });
 
@@ -112,7 +113,7 @@ describe("explainPack stop semantics", () => {
     const text = semantics.textContent ?? "";
     expect(text).toContain("from the signal bar's close");
     expect(text).toContain("only raised, never lowered");
-    expect(text).toContain("half the latest closed bar's close");
+    expect(text).toContain("never below the stop recorded at entry");
   });
 
   it("renders no semantics when the stop is unsupported", () => {

@@ -423,8 +423,12 @@ function describeAllocation(value: Json): { text: string; supported: boolean } {
  *   long (entry condition holds, exit does not) and only when the new price
  *   is above the resting stop. Flat bars leave the stop alone.
  * - repair: a position with no resting stop gets `run._stop_price(pack,
- *   latest close)`: `close × (1 − pct/100)` for a percentage stop and
- *   `close / 2` for every other stop type.
+ *   candles)`: `close × (1 − pct/100)` for a percentage stop; for an ATR stop
+ *   the entry rule (`pack/evaluate.stop_price`) on the latest closed bars,
+ *   never below the stop recorded with the entry. When that rule gives no
+ *   price, the recorded stop is re-placed (no stop when none is recorded),
+ *   the tick journals `stop_price_unavailable` and Operations raises a
+ *   critical alert.
  */
 const STOP_RAISE_SENTENCE =
   "After entry it is only raised, never lowered: on each later closed bar where the entry condition still holds, it is recomputed from that bar's close and moves up if the new price is higher. Once the entry condition stops holding, the stop stays where it is.";
@@ -444,7 +448,7 @@ function atrStopSemantics(len: number, mult: number): string[] {
   return [
     `The engine sets this stop from the signal bar's close, ${formatNumber(mult)} × that bar's ${len}-bar average true range below it. ${SIGNAL_BAR_SENTENCE}`,
     STOP_RAISE_SENTENCE,
-    "If the position has no resting stop, the engine re-places one at half the latest closed bar's close (50% below it), not with this ATR rule.",
+    "If the position has no resting stop, the engine re-places one with this same rule on the latest closed bars, never below the stop recorded at entry. If that price cannot be computed, the engine re-places the stop recorded at entry, or places no stop when none was recorded, and raises a critical alert.",
   ];
 }
 
