@@ -17,10 +17,11 @@ day's opening equity in ``<home>/run/daily-loss-<venue>.json``:
 
 Quantities come from the journal records attributed to the identity (pack,
 venue, pair, mode), reconciled records included, never from requested sizes.
-Prices come from the venue fills that name those records' orders; a buy the
-venue's fills cannot name (live adapters link sell fills only) is priced at the
-close of the bar its entry was decided on. External inventory and other
-identities' fills never count.
+Prices come only from the venue fills that name those records' orders.
+External inventory and other identities' fills never count. Live adapters link
+sell fills only, so by the owner's decision live fails closed: once a live
+arm's history holds a buy no fill names, its equity is uncomputable, and with a
+limit it holds entries with ``loss_limit_unavailable``.
 
 When the day's loss (opening equity less the day's lowest equity) reaches the
 limit, the tick refuses entries with ``daily_loss_limit`` until the next UTC
@@ -732,22 +733,29 @@ LIVE_CASH = Decimal(100)
 
 @pytest.fixture(params=["kraken", "coinbase"])
 def live(request, home, monkeypatch, live_capable_release):
+    """A live arm with a 1% limit of its 100 reserved cash, on a fake exchange holding 100 external units."""
     monkeypatch.setenv("KRELLBOT_ENABLE_LIVE", "1")
     cls = LIVE[request.param]
     write_grant(home, venue=cls.venue, pair=cls.pair)
     _arm(home, venue=cls.venue, pair=cls.pair, mode="live", starting_cash=LIVE_CASH, limit="1")
-    world = cls(home)
-    # The strategy's entry on bar 1 (close 12), journaled as the engine journals it.
+    return cls(home)
+
+
+def _seed_live_buy(live) -> None:
+    """The strategy's live entry on bar 1, journaled as the engine journals it.
+
+    No venue fill names it: Kraken trades carry ``ordertxid`` and Coinbase List
+    Fills no client order id, and the adapters link sell fills only.
+    """
     _journal_entry(
-        home,
+        live.home,
         bar=1,
-        qty=world.qty,
-        coid=_coid(1, "entry", venue=cls.venue, pair=cls.pair),
+        qty=live.qty,
+        coid=_coid(1, "entry", venue=live.venue, pair=live.pair),
         mode="live",
-        venue=cls.venue,
-        pair=cls.pair,
+        venue=live.venue,
+        pair=live.pair,
     )
-    return world
 
 
 def _live_tick(live, *closes: str, at: int) -> int:
@@ -757,41 +765,80 @@ def _live_tick(live, *closes: str, at: int) -> int:
     )
 
 
-@pytest.mark.parametrize("executed", ["all", "part"])
-def test_a_live_reconciled_exit_counts_what_executed_at_its_fill_price(live, executed):
-    fee = LIVE_FEE[live.venue]
-    sold = live.qty if executed == "all" else live.qty * 2 / 5
-    live.exchange.exit_executes = sold
-    # The live entry's buy fill does not name its order, so it is priced at its bar's close.
-    cost = live.qty * Decimal(12) * (1 + fee)
-
-    assert _live_tick(live, "10", "12", "8.5", at=T0) == 0  # the exit is sent; its outcome is not known yet
-    assert _bar_record(live.home, 2)["exit_qty"] == "0"
-    state = _arm_state(live.home, venue=live.venue, pair=live.pair, mode="live")
-    day_open = LIVE_CASH - cost + live.qty * Decimal("8.5")
-    assert (Decimal(state["day_open"]), Decimal(state["equity"])) == (day_open, day_open)
-
-    assert _live_tick(live, "10", "12", "8.5", "8", at=T0 + 3_600) == 0  # order_outcome settles it
-
-    [reconciled] = [r["detail"] for r in _records(live.home) if r["detail"].get("reason") == run.RECONCILED_REASON]
-    assert Decimal(reconciled["exit_qty"]) == sold  # what executed, never the requested size
-    proceeds = sold * LIVE_FILL_PRICE[live.venue] * (1 - fee)
-    state = _arm_state(live.home, venue=live.venue, pair=live.pair, mode="live")
-    assert Decimal(state["equity"]) == LIVE_CASH - cost + proceeds + (live.qty - sold) * Decimal(8)
-    assert Decimal(state["day_open"]) == day_open
+def _live_state(live) -> dict:
+    return _arm_state(live.home, venue=live.venue, pair=live.pair, mode="live")
 
 
-def test_the_limit_holds_live_entries_and_lifts_at_the_next_utc_day(live):
-    assert _live_tick(live, "10", "12", "8.5", at=T0) == 0
-    assert _live_tick(live, "10", "12", "8.5", "8", at=T0 + 3_600) == 0  # the exit settles at a loss past 1%
-    assert live.buys() == []
+def test_a_live_arm_computes_equity_and_may_enter_until_it_holds_a_live_buy(live):
+    assert _live_tick(live, "10", "12", at=T0) == 0  # an entry signal on a flat arm with no history
+
+    state = _live_state(live)
+    assert (Decimal(state["equity"]), Decimal(state["day_open"]), state.get("unavailable")) == (
+        LIVE_CASH,
+        LIVE_CASH,
+        None,
+    )
+    assert _bar_record(live.home, 1)["intent_refused"] not in ("loss_limit_unavailable", "daily_loss_limit")
+    assert len(live.buys()) == 1  # the gate let the entry through
+
+
+def test_after_a_live_buy_a_limited_arm_holds_entries_with_loss_limit_unavailable_while_exits_run(live):
+    """Fail closed on live (owner decision): a live buy no fill names leaves equity uncomputable."""
+    _seed_live_buy(live)
+    exit_coid = _coid(2, "exit", venue=live.venue, pair=live.pair)
+
+    assert _live_tick(live, "10", "12", "8.5", at=T0) == 0  # an exit signal: the exit still sells
+    assert live.exits() == [(exit_coid, live.qty)]
+    state = _live_state(live)
+    assert (state["equity"], state["day_open"], state["unavailable"]) == (None, None, "entry_fill_unlinked")
+
+    assert _live_tick(live, "10", "12", "8.5", "8", at=T0 + 3_600) == 0  # order_outcome settles it: flat
+    assert [Decimal(r["detail"]["exit_qty"]) for r in _records(live.home) if r["detail"].get("resolved_coid")] == [
+        live.qty
+    ]
 
     assert _live_tick(live, "10", "12", "8.5", "8", "12", at=T0 + 7_200) == 0  # an entry signal, refused
     record = _bar_record(live.home, 4)
-    assert (record["intent_refused"], record["entry_qty"]) == ("daily_loss_limit", "0")
+    assert (record["intent_refused"], record["entry_qty"]) == ("loss_limit_unavailable", "0")
     assert live.buys() == []  # nothing sent to the exchange
     assert live.base_balance() == 100  # external units untouched
 
+    # Not a daily hold: the next UTC day still cannot price the buy.
     assert _live_tick(live, "10", "12", "8.5", "8", "12", "10", "12", at=NEXT_DAY) == 0
-    assert _bar_record(live.home, 6)["intent_refused"] != "daily_loss_limit"
-    assert len(live.buys()) == 1  # the next UTC day's entry is sent
+    assert _bar_record(live.home, 6)["intent_refused"] == "loss_limit_unavailable"
+    assert live.buys() == []
+    app = _app(live.home, now=NEXT_DAY)
+    session = _session(app)
+    status, body = _read_limit(app, session, venue=live.venue, pair=live.pair)
+    assert status == 200, body
+    assert (body["code"], body["reason"], body["equity"]) == ("loss_limit_unavailable", "entry_fill_unlinked", None)
+
+    # Only an arm with a limit is held: turned off, the same history enters.
+    status, body = _set_limit(app, session, {"venue": live.venue, "pair": live.pair, "pct": None})
+    assert (status, body["ok"]) == (200, True), body
+    assert _live_tick(live, "10", "12", "8.5", "8", "12", "10", "12", "10", "12", at=NEXT_DAY + 3_600) == 0
+    assert _bar_record(live.home, 8)["intent_refused"] is None
+    assert len(live.buys()) == 1
+
+
+@pytest.mark.parametrize("executed", ["all", "part"])
+def test_a_live_reconciled_exit_is_priced_from_what_executed_and_a_residual_is_still_protected(live, executed):
+    _seed_live_buy(live)
+    sold = live.qty if executed == "all" else live.qty * 2 / 5
+    live.exchange.exit_executes = sold
+
+    assert _live_tick(live, "10", "12", "8.5", at=T0) == 0  # the exit is sent; its outcome is not known yet
+    assert _bar_record(live.home, 2)["exit_qty"] == "0"
+    assert _live_tick(live, "10", "12", "8.5", "8", at=T0 + 3_600) == 0  # order_outcome settles it
+
+    [reconciled] = [r["detail"] for r in _records(live.home) if r["detail"].get("resolved_coid")]
+    assert Decimal(reconciled["exit_qty"]) == sold  # what executed, never the requested size
+    state = _live_state(live)
+    # The sell is priced from the fill that names the exit, and kept for when the buy can be priced too.
+    fee = LIVE_FEE[live.venue]
+    assert [Decimal(v) for v in state["cash_flows"].values()] == [sold * LIVE_FILL_PRICE[live.venue] * (1 - fee)]
+    assert (state["equity"], state["unavailable"]) == (None, "entry_fill_unlinked")
+    # Stop repair still runs while equity is unavailable: only the residual is re-protected.
+    residual = live.qty - sold
+    assert live.stops() == ([] if residual == 0 else [(_coid(3, "stop", venue=live.venue, pair=live.pair), residual)])
+    assert live.base_balance() == 100 + residual

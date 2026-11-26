@@ -20,10 +20,13 @@ the tick has seen but not journaled yet counts as a sell of that quantity.
 Prices come from the venue fills that name a record's orders: by fill id
 (``stop_fill_ids``), by client order id (``resolved_coid``, ``entry_coid``,
 or the Outbox exit intent of a tick record's bar), or by ``order_coid``.
-Live adapters name sell fills only (Kraken trades carry ``ordertxid``,
-Coinbase List Fills no client order id), so a buy that no fill names is
-priced at the close of the bar its entry was decided on. A sell that no
-fill names cannot be priced.
+A quantity that no fill names has no price, and equity is then uncomputable
+(``entry_fill_unlinked`` for a buy, ``fill_price_unknown`` for a sell).
+Paper fills always name their orders. Live adapters name sell fills only
+(Kraken trades carry ``ordertxid``, Coinbase List Fills no client order id),
+so a live arm's equity is uncomputable once its history holds a live buy, and
+an arm with a limit then holds entries with ``loss_limit_unavailable``. This
+fails closed on live by the owner's decision; no modelled price stands in.
 
 Each record's net cash is cached by a digest of the record the first time it
 is priced, so a live fill that later leaves the venue's recent window still
@@ -165,16 +168,19 @@ def measure(
         cash = Decimal(0)
         priced: dict[str, str] = {}
         keys: set[str] = set()
-        unpriced = False
+        # Why a quantity had no price; kept as a set so the reason does not
+        # depend on record order.
+        unpriced: set[str] = set()
         for key, record in attributed_records(home, identity):
             keys.add(key)
             value = _decimal(cached.get(key))
             if value is None:
-                value = _record_cash(
-                    identity, record, fills=fills, candles=candles, fee=fee, hold_coid=hold_coid, exit_coids=exit_coids
+                value, reason = _record_cash(
+                    identity, record, fills=fills, fee=fee, hold_coid=hold_coid, exit_coids=exit_coids
                 )
                 if value is None:
-                    unpriced = True  # keep pricing the rest, so their fills are cached while the venue shows them
+                    # Keep pricing the rest, so their fills are cached while the venue shows them.
+                    unpriced.add(reason or "fill_price_unknown")
                     continue
                 priced[key] = str(value)
             cash += value
@@ -182,12 +188,12 @@ def measure(
         if stop_fill_qty > 0:
             pending = _cash(identity.pair, "sell", stop_fill_qty, fills, set(), set(stop_fill_ids), hold_coid, fee)
             if pending is None:
-                unpriced = True
+                unpriced.add("fill_price_unknown")
             else:
                 cash += pending
                 qty = max(qty - stop_fill_qty, Decimal(0))
         if unpriced:
-            return Measure(None, "fill_price_unknown", priced, frozenset(keys))
+            return Measure(None, min(unpriced), priced, frozenset(keys))
         return Measure(starting_cash + cash + qty * last_close, None, priced, frozenset(keys))
 
 
@@ -329,12 +335,15 @@ def _record_cash(
     record: dict,
     *,
     fills: list,
-    candles: list,
     fee: Decimal,
     hold_coid: Callable[[str], str],
     exit_coids: Callable[[object], set[str]],
-) -> Decimal | None:
-    """The net cash of one attributed record, or None when a quantity in it has no price."""
+) -> tuple[Decimal | None, str | None]:
+    """The net cash of one attributed record, or ``(None, reason)`` when a quantity in it has no price.
+
+    Only a fill that names the record's order prices it: a buy no fill names
+    is ``entry_fill_unlinked`` (every live buy today), never a modelled price.
+    """
     detail = record["detail"]
     bar_ts = record.get("bar_ts")
     resolved = _text(detail.get("resolved_coid"))
@@ -344,7 +353,7 @@ def _record_cash(
     for name, side in _FIELDS:
         qty = _qty(detail, name)
         if qty is None:
-            return None
+            return None, "fill_price_unknown"
         if qty == 0:
             continue
         if resolved is not None:
@@ -359,14 +368,10 @@ def _record_cash(
         else:
             coids, fill_ids = set(), ids
         value = _cash(identity.pair, side, qty, fills, coids, fill_ids, hold_coid, fee)
-        if value is None and side == "buy":
-            close = _close_at(candles, bar_ts)
-            if close is not None:
-                value = -(qty * close * (1 + fee))
         if value is None:
-            return None
+            return None, "entry_fill_unlinked" if side == "buy" else "fill_price_unknown"
         total += value
-    return total
+    return total, None
 
 
 def _cash(
@@ -408,16 +413,6 @@ def _cash(
         return None
     notional = qty * sum((q * p for q, p in matched.values()), Decimal(0)) / volume
     return notional * (1 - fee) if side == "sell" else -(notional * (1 + fee))
-
-
-def _close_at(candles: list, bar_ts: object) -> Decimal | None:
-    if not isinstance(bar_ts, int) or isinstance(bar_ts, bool):
-        return None
-    for candle in candles:
-        if int(getattr(candle, "ts_ms", -1)) == bar_ts:
-            close = _decimal(getattr(candle, "close", None))
-            return close if close is not None and close > 0 else None
-    return None
 
 
 def _exit_coids(home: Path, identity: OwnershipIdentity) -> dict[int, set[str]]:
