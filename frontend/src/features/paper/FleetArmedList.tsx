@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState, type JSX, type KeyboardEvent } from "react";
+import { useEffect, useId, useRef, useState, type JSX, type KeyboardEvent } from "react";
 import "./FleetArmedList.signal.css";
 import { UnresolvedOrdersList } from "../operations/UnresolvedOrdersList";
 import type { OperationsClient } from "../operations/client";
+import { PAUSE_NEW_BUYS_DISCLOSURE, STOP_RUN_DISCLOSURE } from "./stopRunDisclosure";
 import type {
   FleetArmedClient,
   FleetArmedDeployment,
@@ -105,6 +106,7 @@ export function FleetArmedList({
   const rowActionKeyRef = useRef<string | null>(null);
   const [selected, setSelected] = useState<FleetArmedDeployment | null>(null);
   const [unresolvedCount, setUnresolvedCount] = useState<number | null>(null);
+  const runControlsDisclosureId = useId();
 
   const canListFleet =
     typeof client === "object" &&
@@ -578,6 +580,7 @@ export function FleetArmedList({
                                   className="kbot-fleet__row-action"
                                   data-testid="fleet-armed-row-pause"
                                   aria-label={`Pause new buys on ${row.venue} ${row.pair}`}
+                                  aria-describedby={runControlsDisclosureId}
                                   disabled={
                                     rowActionInFlight ||
                                     row.entries_paused === true
@@ -616,6 +619,7 @@ export function FleetArmedList({
                                   className="kbot-fleet__row-action"
                                   data-testid="fleet-armed-row-disarm"
                                   aria-label={`Stop paper run ${row.venue} ${row.pair}`}
+                                  aria-describedby={runControlsDisclosureId}
                                   disabled={rowActionInFlight}
                                   onClick={() => {
                                     void runRowAction(row, "disarm");
@@ -646,6 +650,20 @@ export function FleetArmedList({
                 </tbody>
               </table>
             </div>
+            {canPause || canDisarm ? (
+              <p
+                className="kbot-fleet__note"
+                id={runControlsDisclosureId}
+                data-testid="fleet-stop-run-disclosure"
+              >
+                {[
+                  canPause ? PAUSE_NEW_BUYS_DISCLOSURE : null,
+                  canDisarm ? STOP_RUN_DISCLOSURE : null,
+                ]
+                  .filter((sentence): sentence is string => sentence !== null)
+                  .join(" ")}
+              </p>
+            ) : null}
             {selected !== null ? (
               <div
                 className="kbot-fleet__selected"
@@ -690,6 +708,7 @@ export function FleetArmedList({
                         className="kbot-fleet__row-action"
                         data-testid="fleet-armed-selected-pause"
                         aria-label={`Pause new buys on selected ${selected.venue} ${selected.pair}`}
+                        aria-describedby={runControlsDisclosureId}
                         disabled={
                           rowActionInFlight || selected.entries_paused === true
                         }
@@ -722,6 +741,7 @@ export function FleetArmedList({
                         className="kbot-fleet__row-action"
                         data-testid="fleet-armed-selected-disarm"
                         aria-label={`Stop paper run selected ${selected.venue} ${selected.pair}`}
+                        aria-describedby={runControlsDisclosureId}
                         disabled={rowActionInFlight}
                         onClick={() => {
                           void runRowAction(selected, "disarm");

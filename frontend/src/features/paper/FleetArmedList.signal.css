@@ -312,6 +312,16 @@
   outline-offset: 2px;
 }
 
+/* What pause and 'Stop paper run' do: muted contextual copy beside the
+   controls, never a success or caution tone. */
+.kbot-fleet .kbot-fleet__note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted, #abc4d8);
+  overflow-wrap: anywhere;
+}
+
 .kbot-fleet .kbot-fleet__row-action-error {
   flex: 1 1 100%;
   margin: 0;

@@ -79,6 +79,41 @@ The tick engine:
 10. If entries are blocked by the license gate, prints
     `License lapsed or unreachable: entries off, exits on`.
 
+## Stop, pause, Stop paper run and the kill switch
+
+This is what the engine does today.
+
+- **Protective stop.** An entry rests a stop computed from the signal bar's
+  close. The signal bar is the latest closed bar, the one on which the entry
+  condition fired. A `pct` stop is `close * (1 - pct/100)` and an `atr` stop
+  is `close - mult * ATR(len)` on that bar. The fill price is not used. On later
+  bars the stop is only raised, never lowered. While the entry condition
+  still holds and the exit condition does not, the tick recomputes it from
+  that bar's close and calls `raise_stop` when the new price is strictly
+  above the resting stop. On a flat bar the stop stays where it is.
+- **Missing stop.** If the pack owns base and no stop rests on the pair, the
+  tick re-places one from the latest closed bar's close (`run._stop_price`).
+  A `pct` stop uses `close * (1 - pct/100)`. Every other stop type, `atr`
+  included, uses `close / 2` until
+  [M28.29](milestones/M28.md) repairs it with the pack's own rule. If
+  placing it fails, the tick market-exits the owned qty.
+- **Pause new buys** sets `entries_paused`. It stops new entries only.
+  Exits, stop repair and `raise_stop` keep running.
+- **Stop paper run** (`paper.disarm`) removes the armed record only. The
+  paper position and its resting stop stay in the state file, unmanaged.
+  Ticks evaluate armed records only, so nothing raises or re-places that stop
+  or acts on an exit signal for it. There is no close-position control yet
+  ([M28.32](milestones/M28.md)).
+- **Kill switch, paper.** New paper arms are refused with
+  `kill_switch_engaged`. Every paper tick suppresses entries and journals
+  `kill_switch: true`, while exits, stop repair and `raise_stop` run.
+- **Kill switch, live.** The whole live tick halts. `check_live_send`
+  refuses with `kill_switch_engaged` before any venue call, in the
+  scheduler's venue setup and in `run.tick`, so no entry, exit, stop repair
+  or stop raise is sent. This release is paper-only, so the same check
+  refuses a live tick before it reaches the kill switch, with
+  `live_disabled_paper_only_release`.
+
 ## Costs
 
 | Venue    | Taker fee | Slippage |
