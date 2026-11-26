@@ -38,6 +38,7 @@ import json
 import os
 import re
 import smtplib
+import ssl
 import subprocess
 import sys
 import time
@@ -82,6 +83,10 @@ FAILURE_MESSAGES: dict[str, str] = {
     "smtp_tls_unavailable": (
         "The SMTP server did not start TLS (STARTTLS), so Krellbot did not log in or send. "
         "Use a server that supports STARTTLS."
+    ),
+    "smtp_tls_unverified": (
+        "The SMTP server's TLS certificate could not be verified, so Krellbot did not log in or send. "
+        "Use a server with a valid certificate."
     ),
     "smtp_auth_failed": f"The SMTP server refused the login. Check {SMTP_PASSWORD_ENV}.",
     "smtp_rejected": "The SMTP server refused the sender, a recipient or the message.",
@@ -557,7 +562,10 @@ class EmailSmtpNotifier:
     Raises :class:`NotificationFailed` when the message was not accepted.
     Fails closed on TLS: when the server does not offer STARTTLS or STARTTLS
     fails, it raises ``smtp_tls_unavailable`` before ``login``, so neither the
-    password nor the message crosses a plaintext session.
+    password nor the message crosses a plaintext session. STARTTLS verifies
+    the server's certificate against the system trust store and the
+    configured SMTP host; a certificate that fails (self-signed, expired, or
+    for another host) raises ``smtp_tls_unverified``, also before ``login``.
     """
 
     def __init__(self, email: dict[str, object], *, password: str | None = None) -> None:
@@ -593,8 +601,13 @@ class EmailSmtpNotifier:
                 # keeps the server's reply text out of the failure.
                 if not smtp.has_extn("starttls"):
                     raise NotificationFailed("smtp_tls_unavailable")
+                # Verify the chain and that it names ``host``: without a
+                # context, smtplib accepts any certificate.
                 try:
-                    smtp.starttls()
+                    smtp.starttls(context=ssl.create_default_context())
+                except ssl.SSLCertVerificationError:
+                    # An SSLError (so OSError) subclass: catch it first.
+                    raise NotificationFailed("smtp_tls_unverified") from None
                 except (smtplib.SMTPException, OSError):
                     raise NotificationFailed("smtp_tls_unavailable") from None
                 smtp.ehlo()
