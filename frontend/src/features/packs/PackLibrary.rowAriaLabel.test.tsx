@@ -37,7 +37,7 @@ describe("PackLibrary row aria-label summary", () => {
     const row = screen.getByTestId("pack-library-row-alpha-pack");
     expect(row.tagName).toBe("LI");
     expect(row.getAttribute("aria-label")).toBe(
-      "Pack alpha-pack, bucket Download pending, version 2.3.1, " +
+      "Pack alpha-pack, bucket Not downloaded, version 2.3.1, " +
         "permissions read:keys, write:notes, prior revision rev-009",
     );
   });
@@ -66,7 +66,7 @@ describe("PackLibrary row aria-label summary", () => {
 
     const id = "alpha-pack";
     expect(screen.getByTestId(`pack-library-bucket-${id}`).textContent).toBe(
-      "download_pending (Download pending)",
+      "download_pending (Not downloaded)",
     );
     expect(screen.getByTestId(`pack-library-id-${id}`).textContent).toBe(id);
     const copy = screen.getByTestId(`pack-library-copy-${id}`);

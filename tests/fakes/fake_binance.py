@@ -79,6 +79,7 @@ class FakeBinanceTransport:
         post_responses: list[dict] | None = None,
         delete_responses: list[dict] | None = None,
         raise_on: set[str] | None = None,
+        all_orders: list | None = None,
     ) -> None:
         self._exchange_info = exchange_info if exchange_info is not None else dict(_DEFAULT_EXCHANGE_INFO)
         self._account = account if account is not None else dict(_DEFAULT_ACCOUNT)
@@ -88,6 +89,9 @@ class FakeBinanceTransport:
         self._post_responses = list(post_responses or [])
         self._delete_responses = list(delete_responses or [])
         self._raise_on = set(raise_on or ())
+        # Orders the venue knows about, newest last, as ``allOrders`` rows.
+        # Accepted POSTs are appended so a later lookup finds them.
+        self.all_orders: list[dict] = list(all_orders or [])
         self.calls: list[RecordedCall] = []
 
     def get(self, url: str, headers: dict[str, str]) -> dict | list:
@@ -104,14 +108,38 @@ class FakeBinanceTransport:
             return list(self._fills)
         if path.endswith("/sapi/v1/account/apiRestrictions"):
             return dict(self._api_restrictions)
+        if path.endswith("/api/v3/allOrders"):
+            symbol = parse_qs(urlparse(url).query).get("symbol", [""])[0]
+            return [dict(o) for o in self.all_orders if o.get("symbol") == symbol]
         return {}
 
     def post(self, url: str, body: dict | None, headers: dict[str, str]) -> dict:
         self.calls.append(RecordedCall(method="POST", url=url, headers=dict(headers), body=dict(body or {})))
         self._maybe_raise(url)
+        body = dict(body or {})
         if self._post_responses:
-            return self._post_responses.pop(0)
-        return {"orderId": 1, "status": "FILLED", "executedQty": body.get("quantity") if body else "0"}
+            resp = self._post_responses.pop(0)
+        else:
+            # Market orders fill at once; stop-limit orders rest as NEW.
+            if body.get("type") == "MARKET":
+                resp = {"orderId": 1, "status": "FILLED", "executedQty": body.get("quantity", "0")}
+            else:
+                resp = {"orderId": 2, "status": "NEW", "executedQty": "0"}
+        if isinstance(resp, dict) and resp.get("orderId") not in (None, "") and body.get("newClientOrderId"):
+            self.all_orders.append(
+                {
+                    "symbol": body.get("symbol", ""),
+                    "orderId": resp["orderId"],
+                    "clientOrderId": body["newClientOrderId"],
+                    "side": body.get("side", ""),
+                    "type": body.get("type", ""),
+                    "origQty": body.get("quantity", "0"),
+                    "executedQty": resp.get("executedQty", "0"),
+                    "stopPrice": body.get("stopPrice", "0"),
+                    "status": resp.get("status", "NEW"),
+                }
+            )
+        return resp
 
     def delete(self, url: str, headers: dict[str, str]) -> dict:
         self.calls.append(RecordedCall(method="DELETE", url=url, headers=dict(headers)))

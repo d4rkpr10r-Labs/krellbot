@@ -172,7 +172,7 @@ describe("PackCatalogue browse and one-click install", () => {
     await waitFor(() => {
       expect(
         screen.getByTestId("pack-catalogue-install-status-free-dual-ma").textContent,
-      ).toMatch(/Installed · download_pending · 1\.0\.0/);
+      ).toMatch(/Not installed · 1\.0\.0 · pack file not downloaded/);
     });
     expect(install).toHaveBeenCalledWith("free-dual-ma");
     expect(onInstalled).toHaveBeenCalledOnce();

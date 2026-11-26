@@ -41,7 +41,8 @@ const BUCKET_LABELS: Record<PackRow["bucket"], string> = {
   deployed: "Deployed",
   configured: "Configured",
   installed: "Installed",
-  download_pending: "Download pending",
+  // No worker fetches these files; the label must not imply a download is running.
+  download_pending: "Not downloaded",
   purchased: "Purchased",
 };
 

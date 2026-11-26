@@ -29,6 +29,20 @@ export type PackCatalogueProps = {
   onCheckoutPaid?: (result: CheckoutResult) => void;
 };
 
+/**
+ * Buckets whose rows have a pack file on this computer. A catalogue install
+ * that only recorded a pending marker has no file and must not say Installed.
+ */
+const BUCKETS_WITH_PACK_FILE = new Set(["installed", "configured", "deployed"]);
+
+export function installFeedback(bucket: string | undefined, version: string): string {
+  if (bucket !== undefined && BUCKETS_WITH_PACK_FILE.has(bucket)) {
+    return `Installed · ${bucket} · ${version}`;
+  }
+  // Nothing will fetch the file later; say so instead of implying a download.
+  return `Not installed · ${version} · pack file not downloaded. This build can't download catalogue packs.`;
+}
+
 function failureMessage(err: unknown): string {
   if (err instanceof PackLibraryHttpError) {
     return `Catalogue failed (HTTP ${err.status})`;
@@ -96,11 +110,11 @@ export function PackCatalogue({
         .then((result) => {
           if (seq !== actionSeq.current) return;
           if (result.ok) {
-            const bucket = result.pack?.bucket ?? "download_pending";
+            const bucket = result.pack?.bucket;
             const version = result.pack?.version ?? pack.version ?? "—";
             setRowFeedback((prev) => ({
               ...prev,
-              [pack.id]: `Installed · ${bucket} · ${version}`,
+              [pack.id]: installFeedback(bucket, version),
             }));
             onInstalled?.(result);
             return;

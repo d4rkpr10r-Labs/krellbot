@@ -31,6 +31,20 @@ gates and paper-only rail:
 `binance` is paper-only breadth (M14). The same applies to `gate`, `pionex`,
 `okx`, `bybit`, `kucoin`, `ourbit`, `toobit`, `xt`, `mexc`, `deepcoin`, `lbank`, `bitget`, `htx`, `btcc`, and `cryptocom`.
 Live preflight and Ops live authorization offer only the two qualified ids.
+
+`binance` is the third-venue candidate (M27.4). Its adapter has fake-only
+qualification coverage in `tests/test_binance_live_qualification_fakes.py`:
+- **Keys:** a key must grant exactly read and spot trading. Withdrawal,
+  internal-transfer and universal-transfer rights are refused as
+  withdraw-capable, and any other enabled permission fails closed.
+- **Partial fills:** an entry protects only the quantity that filled.
+- **Protective stops:** a stop rejected, or with an unknown outcome, after
+  a fill is audited for reconcile.
+- **Restarts:** an entry sent by an earlier process is found by client
+  order id and never resent.
+
+It stays out of the qualified registry until the owner reviews the evidence
+(M27.5).
 Store a trade-only key with `krellbot keys add <venue> --file <key-file>`
 (or the workstation Keys panel) for the venue you grant.
 

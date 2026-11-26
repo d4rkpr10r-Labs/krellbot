@@ -231,7 +231,7 @@ class WithdrawCapableError(RuntimeError):
     """Raised when `check_key` finds the key can withdraw. Engine refuses it.
 
     Subclasses (`KeyUnverifiableError`, `KeyTradeOffError`,
-    `KeyMalformedError`, `KrakenKeyUnknownPermissionError`) refine the
+    `KeyMalformedError`, `KeyUnknownPermissionError`) refine the
     refusal reason so the CLI can tell invalid keys, shape errors,
     read-only keys, and actually-withdraw-capable keys apart. They all
     remain `isinstance(WithdrawCapableError)` for the engine.
@@ -261,7 +261,16 @@ class KeyMalformedError(WithdrawCapableError):
     """
 
 
-class KrakenKeyUnknownPermissionError(WithdrawCapableError):
+class KeyUnknownPermissionError(WithdrawCapableError):
+    """The key grants a permission outside the venue's accepted trade-only set.
+
+    Covers permission tokens the adapter does not recognize and known
+    permissions beyond spot trading. Fails closed so a venue-added
+    permission cannot silently make a trade-only key partially trusted.
+    """
+
+
+class KrakenKeyUnknownPermissionError(KeyUnknownPermissionError):
     """A future Kraken-added permission token was present and unrecognized.
 
     Fails closed so a new (e.g.) `transfer-funds` token cannot silently
