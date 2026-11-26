@@ -1,7 +1,7 @@
 # Platform expansion assessment
 
-Status: **proposal for owner review** (pairs with [M28](milestones/M28.md)).
-Nothing here is work until the owner merges M28. Pricing, tiers, hosted
+Status: **proposal for owner review** (pairs with [M29](milestones/M29.md)).
+Nothing here is work until the owner merges M29. Pricing, tiers, hosted
 services and third-party spend are owner decisions; this document does not
 make them.
 
@@ -33,13 +33,14 @@ brief. The code is the source of truth. File references are repo-relative.
 5. **The brief's tier model conflicts with the current positioning.**
    [market-position.md](market-position.md) argues activity fees beat flat
    subscriptions; the brief proposes $19 / $39 monthly tiers. That is a
-   business decision for the owner (M28.11), not an engineering default.
+   business decision for the owner (M29.14), not an engineering default.
 
-Recommended first tranche (M28): make every reported result reproducible and
+Recommended first tranche (M29): make every reported result reproducible and
 honest (run identity, dataset manifests, risk metrics with reference
 fixtures, complete trial ledgers, walk-forward), attach verifiable evidence to
-packs, unify entitlements, and deliver alerts without the UI open. All of it
-is local, free, V1-compatible, and is the foundation every paid service needs.
+packs, and unify entitlements. Delivering alerts without the UI open is
+M28.19 (F17), after M28.1's per-occurrence dedupe. All of it is local,
+free, V1-compatible, and is the foundation every paid service needs.
 
 ## 2. Capability gap matrix
 
@@ -47,27 +48,27 @@ Legend: **E** exists, **P** partial, **A** absent.
 
 | Capability | Existing implementation | State | Architectural gap | Required change | Deps | Workstream |
 | --- | --- | --- | --- | --- | --- | --- |
-| Deterministic backtest | `backtest/engine.py` `Backtester.run`, `backtest/ledger.py`; `tests/test_backtest_engine.py`, `tests/test_m2_export_determinism.py` | E | Single position, long only, flat fee/slippage; doc drift on stop fill (`docs/backtest.md` says `min(stop, open[t+1])`, engine fills on the triggering bar) | Fix doc; keep engine | — | M28.3 |
-| Run identity / receipt digest | `backtest/receipt.py` `build_receipt`; `api/jobs.py` computes `receipt_canonical_sha256` | P | Digest computed but `_extract_result` drops it; no single run id over pack + data + engine + params | Persist digest and a composed run id | — | M28.1 |
-| Dataset versioning | `data/cache.py` content-addressed `datasets/imported/<stem>/<sha256>.csv`; `research/datasets.py` `DatasetManifest` (unwired) | P | Research receipts carry only a data hash, no coverage/gap manifest | Wire manifests and pinned windows into research | M28.1 | M28.2 |
-| Data quality | `data/gaps.py` `check_gaps`, `dedupe`; candle readers refuse inconsistent OHLC | P | `cache._parse_csv` silently drops malformed rows | Count and report dropped rows in the manifest | M28.2 | M28.2 |
-| Holdout / leakage | `research/holdout.py` `assert_disjoint`; `application/research.py` `prepare_v1` / `FutureData` | E | Holdout is only enforced per single run | Enforce across sweeps (selection never sees holdout) | M28.5 | M28.5 |
-| Parameter sweep / optimization | none (`grep sweep|optimi|grid` empty) | A | No multi-trial job | Bounded sweep job, every trial recorded | M28.1, M28.4 | M28.5 |
-| Walk-forward / OOS | none | A | — | Rolling train/test windows over the sweep | M28.5 | M28.6 |
-| Multiple-testing awareness | `research/experiments.py` `record_trial` (unwired) | P | Trials not persisted, so trial count cannot be reported | Persist trial ledger; report trial count with every best result | M28.5 | M28.5 |
-| Risk-adjusted metrics | `backtest/metrics.py` (total return, CAGR, max DD, exposure, per-year, buy-and-hold) | P | No Sharpe, Sortino, volatility, DD duration, profit factor, expectancy, fee impact; no hand-computed reference tests | Add with reference fixtures and `docs/metrics.md` | — | M28.3 |
-| Portfolio analytics | `application/paper.py` `project_portfolio_history`, `GET /api/v1/portfolio/history`; `features/portfolio/PortfolioHistoryPanel.tsx` | P | Equity replay duplicates fee/equity maths outside `Ledger`; no risk statistics | Reuse M28.3 metric functions on paper equity | M28.3 | Tranche 2 |
-| Research job lifecycle | `api/jobs.py` `JobManager` (1 running, 4 queued, persisted, `interrupted` on restart) | P | Runner ignores `cancel_event`; `progress` never set; no resume | Cooperative cancel + progress | — | M28.4 |
-| Pack evidence | `docs/evidence.md` (install digest only); `features/paper/ForwardPaperLedgerPanel.tsx` | A | Catalogue rows carry no evidence; nothing binds evidence to pack bytes | Evidence record v1 bound to `pack_sha256` | M28.1, M28.2 | M28.7, M28.8 |
-| Entitlements | `license.py` `entries_allowed` (tick gate, entries off / exits on); `application/checkout.py` SKU entitlements; legacy CLI `gate()` | P | Three models; refund revokes SKU but the tick gate reads the license cache | One read facade; documented lapse semantics | owner decision on lapse | M28.9 |
-| Tiers (Plus / Pro), metering | `free` / `paid` only | A | No hosted-service entitlement type, no usage ledger | After M28.11 decisions | M28.9, M28.11 | Tranche 3 |
+| Deterministic backtest | `backtest/engine.py` `Backtester.run`, `backtest/ledger.py`; `tests/test_backtest_engine.py`, `tests/test_m2_export_determinism.py` | E | Single position, long only, flat fee/slippage; doc drift on stop fill (`docs/backtest.md` says `min(stop, open[t+1])`, engine fills on the triggering bar) | Fix doc; keep engine | — | M29.3 |
+| Run identity / receipt digest | `backtest/receipt.py` `build_receipt`; `api/jobs.py` computes `receipt_canonical_sha256` | P | Digest computed but `_extract_result` drops it; no single run id over pack + data + engine + params | Persist digest and a composed run id | — | M29.1 |
+| Dataset versioning | `data/cache.py` content-addressed `datasets/imported/<stem>/<sha256>.csv`; `research/datasets.py` `DatasetManifest` (unwired) | P | Research receipts carry only a data hash, no coverage/gap manifest | Wire manifests and pinned windows into research | M29.1 | M29.2 |
+| Data quality | `data/gaps.py` `check_gaps`, `dedupe`; candle readers refuse inconsistent OHLC | P | `cache._parse_csv` silently drops malformed rows | Count and report dropped rows in the manifest | M29.2 | M29.2 |
+| Holdout / leakage | `research/holdout.py` `assert_disjoint`; `application/research.py` `prepare_v1` / `FutureData` | E | Holdout is only enforced per single run | Enforce across sweeps (selection never sees holdout) | M29.9 | M29.6, M29.9 |
+| Parameter sweep / optimization | none (`grep sweep|optimi|grid` empty) | A | No multi-trial job | Bounded sweep job, every trial recorded | M29.1, M29.4, M29.8 | M29.9 |
+| Walk-forward / OOS | none | A | — | Rolling train/test windows over the sweep | M29.9 | M29.10 |
+| Multiple-testing awareness | `research/experiments.py` `record_trial` (unwired) | P | Trials not persisted, so trial count cannot be reported | Persist trial ledger; report trial count with every best result | M29.9 | M29.9 |
+| Risk-adjusted metrics | `backtest/metrics.py` (total return, CAGR, max DD, exposure, per-year, buy-and-hold) | P | No Sharpe, Sortino, volatility, DD duration, profit factor, expectancy, fee impact; no hand-computed reference tests | Add with reference fixtures and `docs/metrics.md` | — | M29.3 (fee impact: M28.9, F01) |
+| Portfolio analytics | `application/paper.py` `project_portfolio_history`, `GET /api/v1/portfolio/history`; `features/portfolio/PortfolioHistoryPanel.tsx` | P | Equity replay duplicates fee/equity maths outside `Ledger`; no risk statistics | Reuse M29.3 metric functions on paper equity | M29.3 | Tranche 2 |
+| Research job lifecycle | `api/jobs.py` `JobManager` (1 running, 4 queued, persisted, `interrupted` on restart) | P | Runner ignores `cancel_event`; `progress` never set; no resume | Cooperative cancel + progress | — | M29.4 |
+| Pack evidence | `docs/evidence.md` (install digest only); `features/paper/ForwardPaperLedgerPanel.tsx` | A | Catalogue rows carry no evidence; nothing binds evidence to pack bytes | Evidence record v1 bound to `pack_sha256` | M29.1, M29.2 | M29.11, M29.12 |
+| Entitlements | `license.py` `entries_allowed` (tick gate, entries off / exits on); `application/checkout.py` SKU entitlements; legacy CLI `gate()` | P | Three models; refund revokes SKU but the tick gate reads the license cache | One read facade; documented lapse semantics | owner decision on lapse | M29.13 |
+| Tiers (Plus / Pro), metering | `free` / `paid` only | A | No hosted-service entitlement type, no usage ledger | After M29.14 decisions | M29.13, M29.14 | Tranche 3 |
 | Pack signing and provenance | ed25519 `license.verify_signed`; `packs/creator_signed.py`; both shipped keys are `# DEV` | P | No key ids, rotation, signer scoping, revocation; creator id dropped on install; `packs/creator/` not discovered | Key ids + revocation list + provenance kept on install | owner signing keys | Tranche 3 |
 | Pack permissions | catalogue `permissions` shown in `PackLibrary.tsx` | P | Not enforced | Enforce declared permissions at install / arm | Tranche 3 | Tranche 3 |
-| AI integration | `mcp/tools.py` `McpTools` (read, draft, validate, backtest, paper_arm), `application/user_policy.py` | P | Not a real MCP transport; no LLM client; no BYOK, metering or budgets | Local MCP stdio wrapper, then BYOK adapter with budgets | M28.4, M28.5 | Tranche 2 |
-| Alerts / notifications | `notifications.py` desktop + SMTP; `application/alerts.py` | P | `maybe_notify` runs only from `GET /api/v1/operations` (UI must be open) | Notify from the scheduled tick | — | M28.10 |
-| Remote access | `api/tailnet.py` `TailnetAccess` (full workstation over Tailscale) | P | No read-only scope, no device enrollment, no relay | Key-blind outbound relay after M28.10 | M28.10, M28.11 | Tranche 3 |
+| AI integration | `mcp/tools.py` `McpTools` (read, draft, validate, backtest, paper_arm), `application/user_policy.py` | P | Not a real MCP transport; no LLM client; no BYOK, metering or budgets | Local MCP stdio wrapper, then BYOK adapter with budgets; `JobManager` assumes a single owning process, so MCP job creation goes through the loopback API or a cross-process lock | M29.4, M29.9 | Tranche 2 |
+| Alerts / notifications | `notifications.py` desktop + SMTP; `application/alerts.py` | P | `maybe_notify` runs only from `GET /api/v1/operations` (UI must be open) | Notify from the scheduled tick | — | M28.1, M28.19 (F17) |
+| Remote access | `api/tailnet.py` `TailnetAccess` (full workstation over Tailscale) | P | No read-only scope, no device enrollment, no relay | Key-blind outbound relay after M28.19's scheduled-tick alerts | M28.19, M29.14 | Tranche 3 |
 | Headless runner | `service/` renderers + supervisors, hourly one-shot `krellbot tick` | E | — | Reuse for alerts and research workers | — | — |
-| Remote / cloud compute | none | A | No portable job contract | Portable job spec first (local workers), remote later | M28.5 | Tranche 2–3 |
+| Remote / cloud compute | none | A | No portable job contract | Portable job spec first (local workers), remote later | M29.9 | Tranche 2–3 |
 | Marketplace | `community.py` allow-listed index; `packs/rev_share_ledger.py` (fake settlements, unwired) | P | No submission validation, no seller identity | Validation infra before commerce | Tranche 3 | Tranche 4 |
 | Managed hosting | explicit non-goal (`docs/threat-model.md`, `PARKING.md`) | A | Custody redesign required | Parked | — | Not scheduled |
 | Telemetry | `telemetry.py` opt-in; `FUNNEL_EVENTS` | E | `backup_completed` event is undocumented in `docs/telemetry.md` | Parked (one line) | — | PARKING |
@@ -112,17 +113,24 @@ Risks the scores do not capture:
 
 ```mermaid
 graph TD
-  R1[M28.1 run identity] --> R2[M28.2 dataset manifests]
-  R1 --> R5[M28.5 sweep + trial ledger]
-  R4[M28.4 cancel + progress] --> R5
-  R5 --> R6[M28.6 walk-forward]
-  R3[M28.3 risk metrics] --> R6
-  R1 --> E7[M28.7 evidence record]
+  R1[M29.1 run identity] --> R2[M29.2 dataset manifests]
+  R1 --> R5[M29.9 sweep + trial ledger]
+  R4[M29.4 cancel + progress] --> B5[M29.5 batch]
+  R2 --> B5
+  B5 --> R5
+  R1 --> H6[M29.6 holdout lock]
+  H6 --> R5
+  P8[M29.8 declared parameters] --> R5
+  R3[M29.3 trades + risk metrics] --> U7[M29.7 uncertainty + label]
+  H6 --> U7
+  R5 --> R6[M29.10 walk-forward]
+  R3 --> R6
+  R1 --> E7[M29.11 evidence record]
   R2 --> E7
   R3 --> E7
-  E7 --> E8[M28.8 evidence view]
-  O11[M28.11 owner decisions] --> T9[M28.9 entitlement facade]
-  N10[M28.10 headless alerts]
+  E7 --> E8[M29.12 evidence view]
+  O11[M29.14 owner decisions] --> T9[M29.13 entitlement facade]
+  N10[M28.19 headless alerts]
   R6 --> T2A[Tranche 2: BYOK AI research coordinator]
   R5 --> T2B[Tranche 2: portable job contract]
   R3 --> T2C[Tranche 2: portfolio risk analytics]
@@ -145,19 +153,19 @@ Proposed ADRs (status **Proposed** until the owner merges):
 ## 6. Revised backlog
 
 The brief's PR-01…PR-15 workstreams map onto tranches. Only tranche 1 is
-written as tasks (M28). Later tranches become milestone proposals after
-tranche 1 lands and the owner decides M28.11.
+written as tasks (M29; its alert item moved to M28.1 and M28.19). Later tranches become
+milestone proposals after tranche 1 lands and the owner decides M29.14.
 
 | Brief PR | Tranche | Where | Classification |
 | --- | --- | --- | --- |
-| PR-01 audit + roadmap | 1 | this file + M28 | Foundation |
-| PR-03 evidence + provenance | 1 | M28.1, M28.2, M28.7 | V1-compatible foundation |
-| PR-04 evidence presentation | 1 | M28.8 | V1 (Advanced surface only) |
-| PR-05 research job lifecycle | 1 | M28.4 | V1-compatible foundation |
-| PR-06 (integrity half) | 1 | M28.5, M28.6 | Post-V1 local, no services |
-| PR-08 (metric half) | 1 | M28.3 | V1-compatible foundation |
-| PR-02 entitlements | 1 | M28.9 (after M28.11) | V1-critical correctness |
-| PR-09 (local half) | 1 | M28.10 | V1-compatible foundation |
+| PR-01 audit + roadmap | 1 | this file + M29 | Foundation |
+| PR-03 evidence + provenance | 1 | M29.1, M29.2, M29.11 | V1-compatible foundation |
+| PR-04 evidence presentation | 1 | M29.12 | V1 (Advanced surface only) |
+| PR-05 research job lifecycle | 1 | M29.4 | V1-compatible foundation |
+| PR-06 (integrity half) | 1 | M29.5–M29.10 | Post-V1 local, no services |
+| PR-08 (metric half) | 1 | M29.3 | V1-compatible foundation |
+| PR-02 entitlements | 1 | M29.13 (after M29.14) | V1-critical correctness |
+| PR-09 (local half) | 1 | M28.1, M28.19 (F17) | V1-compatible foundation |
 | PR-06 (AI half), PR-07 | 2 | BYOK coordinator, budgets | Post-V1 revenue accelerator |
 | PR-08 (portfolio half) | 2 | portfolio risk analytics | Post-V1 |
 | PR-10 | 2 | portable job contract, local process pool | Post-V1 |
@@ -170,16 +178,16 @@ tranche 1 lands and the owner decides M28.11.
 
 ## 7. V1 protection
 
-- M28 does not touch the first-run wizard, the paper-arm path, live
+- M29 does not touch the first-run wizard, the paper-arm path, live
   qualification (M27), or `PAPER_ONLY_RELEASE`.
 - New metrics and evidence appear only behind **More / Advanced** surfaces.
   Strategy explanations keep their rule of no `% return`, `% profit` or
   `win rate` copy (`StrategyExplanation.test.tsx`).
 - No new service is reachable from a default install. No new egress is
   added in tranche 1.
-- M27 stays ahead of M28. Agents finish M27.3–M27.4 first unless the owner
-  reorders.
-- Risk-path tasks (M28.9) carry the `risk-path` label and owner review.
+- M27 and M28 stay ahead of M29. Agents finish their agent tasks first
+  unless the owner reorders.
+- Risk-path tasks (M29.11, M29.13) carry the `risk-path` label and owner review.
 
 ## 8. Commercial and operational risk
 
@@ -201,11 +209,11 @@ margin is positive **at the cap**, not at average use.
 **Risks.**
 
 - *Positioning.* Flat tiers contradict [market-position.md](market-position.md).
-  Owner decides (M28.11).
+  Owner decides (M29.14).
 - *Trust.* Any hosted surface that sees trading data weakens the "krellbot.dev
   never receives keys" pitch. ADR 0004 keeps keys and order authority local.
 - *Integrity.* Optimization without a complete trial ledger produces
-  cherry-picked results. M28.5 records every trial, including failures.
+  cherry-picked results. M29.9 records every trial, including failures.
 - *Regulatory.* Marketplace payouts, data resale and managed hosting need
   legal review. None are scheduled in tranche 1.
 - *Operational.* Hosted services need on-call, incident response and backups
@@ -213,6 +221,7 @@ margin is positive **at the cap**, not at average use.
 
 ## 9. Immediately executable
 
-Once the owner merges M28, the dependency-ready agent tasks are **M28.1**,
-**M28.3**, **M28.4** and **M28.10**. They can run in parallel. M28.9 waits
-for the owner's lapse decision in M28.11.
+Once the owner merges M29 and M28's agent tasks have landed, the
+dependency-ready agent tasks are **M29.1**, **M29.4** and **M29.8** (owner
+review). They can run in parallel. M29.13 waits for the owner's lapse
+decision in M29.14.

@@ -17,10 +17,9 @@ One line per item. Nothing here is work until the owner moves it into a mileston
 - Exchange-native free AI agent tooling parity race — spike only in M22.5; no cloud-key me-too product.
 - Multi-pack reservation / breaking one-pack-per-(venue,pair) before independent qualification (still true post-M16).
 - Learn top-nav / Learn view (Signal artboard) — still do not invent in cockpit.
+- `run.tick(home=X)` appends the journal under `$KRELLBOT_HOME` but reads ownership from `X/journal`; harmless while both are the same directory.
+- Paper taker-fee tables exist in four copies (`venues/paper._fee_bps_for` and `run._fee_bps_for_venue`, both on risk paths, plus `application/paper._PAPER_TAKER_BPS` and `application/research._default_fee`). They agree on every listed venue but fall back differently for an unlisted one: `run` gives 0, `venues/paper` 120 (Coinbase's), `_PAPER_TAKER_BPS.get(venue, 40)` 40, and `_default_fee` 120 for any venue but Kraken.
 - `docs/telemetry.md` does not list the `backup_completed` event that `storage/backup.py` sends when telemetry is on.
 - `SECURITY.md` says the bootstrap token comes from `token_hex(32)`; `api/serve.py` uses `token_urlsafe(32)`.
 - `GET /api/v1/catalogue` returns 502 when the transport fails instead of serving the verified cached catalogue.
 - Canonical-JSON + sha256 is reimplemented in six modules (`backtest/receipt.py`, `packs/launch_family.py`, `strategy_ir/canonical.py`, `strategy_ir/identity.py`, `application/packs.py`, `api/jobs.py`).
-- Paper fee tables are duplicated (`application/paper.py` `_PAPER_TAKER_BPS`, `venues/paper.py` constants, `application/research.py` `_default_fee`).
-- `run._recognized_open_qty` counts an open order's requested qty as owned and sums every matching entry/stop order; it is not proof of executed inventory.
-- `run.tick(home=X)` appends the journal under `$KRELLBOT_HOME` but reads ownership from `X/journal`; harmless while both are the same directory.

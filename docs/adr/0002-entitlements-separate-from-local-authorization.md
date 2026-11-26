@@ -1,6 +1,6 @@
 # 0002 — Commercial entitlements never gate local engine capability
 
-- Status: Proposed 2026-11-25 (accepted when the owner merges M28).
+- Status: Proposed 2026-11-25 (accepted when the owner merges M29).
 - Owners: license, checkout, run, packs.
 - Replaces: nothing. Constrains future tiers (Plus / Pro, hosted services).
 
@@ -45,7 +45,7 @@ engine is never artificially limited.
 
 Lapse (expiry, refund, failed renewal, unreachable billing) stops **new
 entries** of the affected paid pack only. Exits and protective stops keep
-running. Nothing is force-closed. The exact policy is the owner's M28.11
+running. Nothing is force-closed. The exact policy is the owner's M29.14
 decision; this ADR fixes the floor.
 
 ### One read facade
@@ -61,4 +61,4 @@ and UI do not read cache files directly.
 
 ## Test names that enforce it
 
-- `tests/test_entitlement_lapse_keeps_exits.py` (M28.9)
+- `tests/test_entitlement_lapse_keeps_exits.py` (M29.13)

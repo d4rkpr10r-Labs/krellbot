@@ -98,10 +98,11 @@ release policy continue to apply.
 
 ## Platform expansion proposal
 
-[M28](milestones/M28.md) proposes reproducible research (run identity,
+[M29](milestones/M29.md) proposes reproducible research (run identity,
 dataset manifests, risk metrics, complete sweep trial ledgers,
-walk-forward), verifiable pack evidence, one entitlement read path and
-headless alerts. All of it is local and free. Hosted services, tiers and
+walk-forward), verifiable pack evidence and one entitlement read path;
+headless alerts are M28.1 and M28.19 in [M28](milestones/M28.md). All of
+it is local and free. Hosted services, tiers and
 pricing stay owner decisions; see
 [platform-initiative.md](platform-initiative.md) and ADRs 0002–0004.
 

@@ -1,6 +1,6 @@
 # 0004 — Hosted services are key-blind and outbound-only
 
-- Status: Proposed 2026-11-25 (accepted when the owner merges M28).
+- Status: Proposed 2026-11-25 (accepted when the owner merges M29).
 - Owners: notifications, api, telemetry, threat model.
 - Replaces: nothing. Constrains Connect, hosted AI and remote compute.
 
@@ -44,7 +44,8 @@ running under its local configuration (ADR 0002).
 
 ## Consequences
 
-- Connect starts as an alert and status mirror, built on M28.10.
+- Connect starts as an alert and status mirror, built on M28.19's
+  scheduled-tick alerts (F17).
 - `docs/threat-model.md` gets a hosted-services section before any hosted
   service ships.
 

@@ -1,6 +1,6 @@
 # 0003 — Research is a deterministic engine coordinated, not computed, by AI
 
-- Status: Proposed 2026-11-25 (accepted when the owner merges M28).
+- Status: Proposed 2026-11-25 (accepted when the owner merges M29).
 - Owners: backtest, research, api/jobs, mcp.
 - Replaces: nothing. Constrains tranche 2 agentic research.
 
@@ -17,14 +17,14 @@ lets a local agent read, draft, validate, backtest and paper-arm under
 ### Numbers come only from the engine
 
 Every metric, equity curve and trial result is produced by the deterministic
-engine and stored with a run id (M28.1). An AI component may propose packs,
+engine and stored with a run id (M29.1). An AI component may propose packs,
 parameters and hypotheses, and may summarize stored results. It never writes
 a metric, and summaries cite run ids.
 
 ### All trials are recorded
 
 Sweeps and AI-driven searches record every trial, including failures and
-cancellations (M28.5). A reported best result always carries the trial
+cancellations (M29.9). A reported best result always carries the trial
 count. Holdout data is never used to select a candidate.
 
 ### Generated packs are untrusted input
@@ -38,7 +38,7 @@ stays a typed human action in the workstation.
 
 Research jobs have hard caps on trials, wall time, concurrency and (for AI)
 tokens or spend, checked before the job starts. Cancel is cooperative and
-prompt (M28.4). An AI loop cannot enqueue more work than its budget.
+prompt (M29.4). An AI loop cannot enqueue more work than its budget.
 
 ### Providers
 
@@ -52,6 +52,6 @@ model, if the owner approves one, is metered and capped per ADR 0002.
 
 ## Test names that enforce it
 
-- `tests/test_research_run_identity.py` (M28.1)
-- `tests/test_research_sweep_trial_ledger.py` (M28.5)
+- `tests/test_research_run_identity.py` (M29.1)
+- `tests/test_research_sweep_trial_ledger.py` (M29.9)
 - `tests/test_mcp_paper_tools_refuse_live_and_keys.py` (existing)
