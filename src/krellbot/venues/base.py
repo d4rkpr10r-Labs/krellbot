@@ -55,8 +55,13 @@ class Fill:
     price: Decimal
     ts_ms: int
     # Client order id of the resting order this fill executed, when the venue
-    # reports it (paper stop fills do). ``coid`` stays the fill's own id.
+    # reports it (paper stop fills do). A live protective stop's fill names the
+    # entry coid that placed the stop. ``coid`` stays the fill's own id.
     order_coid: str | None = None
+    # True when the venue looked up which order executed this sell and could
+    # not establish it from documented fields, so the fill cannot be shown not
+    # to be a strategy's protective stop. ``order_coid`` is then None.
+    order_unknown: bool = False
 
 
 @dataclass(frozen=True)

@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import base64
 import json
+import urllib.parse
 from collections.abc import Callable
+from dataclasses import replace
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Protocol
 
@@ -47,6 +49,10 @@ BASE_URL = f"https://{API_HOST}"
 DEFAULT_LOT_DECIMALS = 8
 DEFAULT_PRICE_DECIMALS = 5
 STOP_BUFFER = Decimal("0.005")  # limit = stop * (1 - 0.5%)
+# A protective stop's client_order_id is its entry's coid plus this suffix.
+STOP_COID_SUFFIX = "_stop"
+# Order-history pages read for one lookup: a bound, never full pagination.
+ORDER_HISTORY_PAGES = 5
 # Documented order statuses. A working order can still execute; a final one
 # cannot. Any other status (UNKNOWN_ORDER_STATUS, a new one) proves nothing.
 _WORKING_ORDER_STATUSES = frozenset({"PENDING", "QUEUED", "OPEN", "CANCEL_QUEUED"})
@@ -357,6 +363,8 @@ class CoinbaseVenue:
         self._nonce_fn = nonce_fn or _default_nonce
         self._recent: dict[str, OrderRef] = {}
         self._prices: dict[str, Decimal] = {}
+        # Order records read for sell fills, by order_id (None: not shown).
+        self._fill_orders: dict[str, dict | None] = {}
 
     # ---- public protocol surface ----------------------------------------
 
@@ -381,7 +389,7 @@ class CoinbaseVenue:
         return Truth(
             balances=_parse_coinbase_balances(accounts),
             open_orders=_parse_coinbase_orders(orders),
-            recent_fills=_parse_coinbase_fills(fills),
+            recent_fills=self._link_sell_fills(_parse_coinbase_fills(fills)),
         )
 
     def place_entry_with_stop(self, coid: str, qty: Decimal, stop: Decimal, *, pair: str) -> OrderRef:
@@ -613,25 +621,76 @@ class CoinbaseVenue:
 
     def _find_order_record(self, coid: str, pair: str) -> dict | None:
         """The order row whose ``client_order_id`` is ``coid``, from at most five pages."""
+        rows = self._order_history_rows(f"product_ids={pair}")
+        return next((raw for raw in rows if str(raw.get("client_order_id") or "") == coid), None)
+
+    def _order_history_rows(self, query: str):
+        """Yield List Orders rows for ``query`` from at most ``ORDER_HISTORY_PAGES`` pages, lazily."""
         cursor = ""
-        for _page in range(5):
-            path = f"/api/v3/brokerage/orders/historical/batch?product_ids={pair}"
+        for _page in range(ORDER_HISTORY_PAGES):
+            path = f"/api/v3/brokerage/orders/historical/batch?{query}"
             if cursor:
                 path = f"{path}&cursor={cursor}"
             payload = self._get(path)
             if not isinstance(payload, dict):
-                return None
+                return
             orders = payload.get("orders")
             if isinstance(orders, list):
-                for raw in orders:
-                    if isinstance(raw, dict) and str(raw.get("client_order_id") or "") == coid:
-                        return raw
+                yield from (raw for raw in orders if isinstance(raw, dict))
             if payload.get("has_next") is not True:
-                return None
+                return
             cursor = str(payload.get("cursor") or "")
             if not cursor:
-                return None
-        return None
+                return
+
+    def _link_sell_fills(self, fills: list[tuple[Fill, str]]) -> list[Fill]:
+        """Name the client order behind each sell fill, from documented fields only.
+
+        A List Fills row names the order it executed by ``order_id`` and
+        carries no client order id
+        (https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/orders/list-fills).
+        The order record, read through the documented ``order_ids`` filter of
+        List Orders within the same five-page bound as ``_find_order``
+        (https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/orders/list-orders),
+        carries ``client_order_id``. ``place_entry_with_stop`` gives the
+        protective stop ``<entry coid>_stop``, and Edit Order keeps the order
+        and its ids, so the fill's ``order_coid`` is the entry coid. Any other
+        order is named by its own ``client_order_id``. An order the bounded
+        lookup does not show, or a record without a ``client_order_id``, is
+        ``order_unknown``. Buys are never a protective stop and are not looked
+        up. Each order is read once per adapter instance; a failed read raises,
+        as any other snapshot read does.
+        """
+        wanted = {oid for fill, oid in fills if fill.side == "sell" and oid and oid not in self._fill_orders}
+        if wanted:
+            found = self._order_records_by_id(wanted)
+            self._fill_orders.update({oid: found.get(oid) for oid in wanted})
+        linked: list[Fill] = []
+        for fill, order_id in fills:
+            if fill.side != "sell":
+                linked.append(fill)
+                continue
+            raw = self._fill_orders.get(order_id) if order_id else None
+            client = str(raw.get("client_order_id") or "") if raw is not None else ""
+            if not client:
+                linked.append(replace(fill, order_unknown=True))
+                continue
+            if client.endswith(STOP_COID_SUFFIX) and len(client) > len(STOP_COID_SUFFIX):
+                client = client[: -len(STOP_COID_SUFFIX)]
+            linked.append(replace(fill, order_coid=client))
+        return linked
+
+    def _order_records_by_id(self, order_ids: set[str]) -> dict[str, dict]:
+        """The order row for each of ``order_ids`` that the bounded lookup shows."""
+        query = "&".join(f"order_ids={urllib.parse.quote(oid, safe='')}" for oid in sorted(order_ids))
+        found: dict[str, dict] = {}
+        for raw in self._order_history_rows(query):
+            order_id = str(raw.get("order_id") or "")
+            if order_id in order_ids:
+                found.setdefault(order_id, raw)
+                if len(found) == len(order_ids):
+                    break
+        return found
 
 
 def _decimals(increment: str) -> int:
@@ -807,11 +866,12 @@ def _parse_coinbase_balances(payload: Any) -> list[Balance]:
     return out
 
 
-def _parse_coinbase_fills(payload: Any) -> list[Fill]:
+def _parse_coinbase_fills(payload: Any) -> list[tuple[Fill, str]]:
+    """Each List Fills row as a ``Fill`` and the ``order_id`` of the order it executed."""
     fills = payload.get("fills") if isinstance(payload, dict) else None
     if not isinstance(fills, list):
         return []
-    out: list[Fill] = []
+    out: list[tuple[Fill, str]] = []
     for raw in fills:
         if not isinstance(raw, dict):
             continue
@@ -819,17 +879,17 @@ def _parse_coinbase_fills(payload: Any) -> list[Fill]:
         price = _optional_decimal(raw.get("price"))
         if qty is None or price is None:
             continue
-        out.append(
-            Fill(
-                id=str(raw.get("entry_id", "")),
-                coid=str(raw.get("client_order_id", "")),
-                pair=str(raw.get("product_id", "")),
-                side=str(raw.get("side", "")),
-                qty=qty,
-                price=price,
-                ts_ms=_fill_ts(raw.get("trade_time")),
-            )
+        fill = Fill(
+            id=str(raw.get("entry_id", "")),
+            coid=str(raw.get("client_order_id", "")),
+            pair=str(raw.get("product_id", "")),
+            # Documented as BUY / SELL; the engine compares lowercase sides.
+            side=str(raw.get("side", "")).lower(),
+            qty=qty,
+            price=price,
+            ts_ms=_fill_ts(raw.get("trade_time")),
         )
+        out.append((fill, str(raw.get("order_id") or "")))
     return out
 
 

@@ -69,7 +69,12 @@ from .lock import TickLock
 OWNERSHIP_AMBIGUOUS = "ownership_ambiguous"
 # Journal ``reason`` for a record that accounts a reconciled intent's outcome.
 RECONCILED_REASON = "reconciled"
-_QTY_FIELD_FOR_INTENT = {"entry": "entry_qty", "exit": "exit_qty", "stop": "stop_qty"}
+# Obligation kind of an exit hold: a sell on an arm's pair whose order the venue
+# could not establish (``Fill.order_unknown``), so it may be that arm's stop.
+# It holds the arm's exits and stop repair. No venue order carries its coid, so
+# only an operator resolve settles it; "executed N" journals ``stop_qty`` N.
+UNLINKED_SELL_KIND = "unlinked_sell"
+_QTY_FIELD_FOR_INTENT = {"entry": "entry_qty", "exit": "exit_qty", "stop": "stop_qty", UNLINKED_SELL_KIND: "stop_qty"}
 
 
 # ---- coid ----------------------------------------------------------------
@@ -620,6 +625,24 @@ def tick(
             # yet. It is recorded below with its fill ids, exactly once.
             stop_fill_ids, stop_fill_qty = _stop_fills_for(home, identity, snap.recent_fills or [])
             journal_qty = max(ownership.attributable_qty - stop_fill_qty, Decimal(0))
+            # A sell on the pair that the venue could not link to an order may be
+            # this arm's stop. It is never guessed at: while the arm holds
+            # something, the sell holds its exits and stop repair until an
+            # operator resolves it from Operations.
+            hold_refused = False
+            if journal_qty > 0:
+                try:
+                    if _hold_unlinked_sells(home, armed, identity, snap.recent_fills or [], bar_ts=bar_ts):
+                        obligations_view = kb_obligations.read_obligations(home)
+                except StoreError as exc:
+                    pack_intent_refused[armed.pack_id] = exc.code
+                    any_refused = True
+                    hold_refused = True
+                    print(f"intent refused: {exc.code}", flush=True)
+            exits_held_by = _exit_holds(obligations_view, identity)
+            exits_held = hold_refused or bool(exits_held_by)
+            if exits_held_by:
+                print("exits held: a sell on the pair is not linked to an order; resolve it in Operations", flush=True)
             if ownership.ambiguous:
                 # History that may belong to this arm cannot be attributed, so
                 # the strategy cannot be shown to be flat: hold new entries.
@@ -645,7 +668,7 @@ def tick(
             venue_refusals: list[tuple[str, str]] = []
             ensure_stop_failed = False
             ensure_stop_entry = ""
-            if owned > Decimal(0) and resting is None and latest is not None:
+            if owned > Decimal(0) and resting is None and latest is not None and not exits_held:
                 repair = _stop_price(pack, Decimal(str(latest.close)))
                 stop_coid = coid_for(
                     pack_id=armed.pack_id,
@@ -891,7 +914,7 @@ def tick(
                                 )
                             except (RuntimeError, ValueError):
                                 entry_qty = Decimal(0)
-            elif target.reason == "exit" and owned > Decimal(0):
+            elif target.reason == "exit" and owned > Decimal(0) and not exits_held:
                 try:
                     venue_obj.cancel_stops(armed.pair)
                 except (RuntimeError, ValueError):
@@ -962,6 +985,7 @@ def tick(
                     "exit_qty": str(exit_qty),
                     "stop_qty": str(stop_fill_qty),
                     **({"stop_fill_ids": stop_fill_ids} if stop_fill_ids else {}),
+                    **({"exits_held_by": exits_held_by} if exits_held_by else {}),
                     "owned_qty_after": str(owned),
                     "entries_blocked": blocked,
                     "entries_paused": entries_suppressed,
@@ -1320,6 +1344,12 @@ def _resolve_obligations(home: Path, *, venue: str, venue_obj: Any, snap: Any, j
     for intent in view.unresolved:
         if intent.venue != venue or intent.pair is None:
             continue
+        if intent.kind == UNLINKED_SELL_KIND:
+            # No venue order carries an exit hold's coid, so no lookup is made:
+            # only an operator resolve settles it. It stays audited, once.
+            if not intent.marked:
+                audit_needs_reconcile(store, coid=intent.coid)
+            continue
         outcome: OrderOutcome | None = None
         if lookup is not None:
             try:
@@ -1467,9 +1497,12 @@ def _stop_fills_for(home: Path, identity: OwnershipIdentity, fills: list) -> tup
 
     A fill counts only when the venue reports which order it executed
     (``order_coid``) and that order is one this identity journaled. Fills
-    without that link are never attributed.
+    without that link are never attributed. A fill once held as unlinkable
+    (``_hold_unlinked_sells``) is accounted only through the operator's
+    resolve of that hold, so a later link never counts it a second time.
     """
     order_coids, accounted = stop_fill_history(home, identity)
+    held: set[str] | None = None
     ids: list[str] = []
     qty = Decimal(0)
     for fill in fills:
@@ -1479,9 +1512,110 @@ def _stop_fills_for(home: Path, identity: OwnershipIdentity, fills: list) -> tup
             continue
         if not order_coid or order_coid not in order_coids or not fill_id or fill_id in accounted or fill_id in ids:
             continue
+        if held is None:
+            held = _committed_coids(home)
+        if _unlinked_sell_coid(identity, fill_id) in held:
+            continue
         ids.append(fill_id)
         qty += Decimal(str(fill.qty))
     return ids, qty
+
+
+class _HoldNotSent(Exception):
+    """Raised by an exit hold's send: the Outbox commits the hold, and nothing is sent."""
+
+
+def _never_send(_coid: str, _body: str) -> None:
+    raise _HoldNotSent
+
+
+def _unlinked_sell_coid(identity: OwnershipIdentity, fill_id: str) -> str:
+    """The exit hold's coid: one per identity and venue fill id, stable across restarts."""
+    raw = f"{identity.pack_id}|{identity.venue}|{identity.pair}|{identity.mode}|{fill_id}|{UNLINKED_SELL_KIND}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:18]
+
+
+def _committed_coids(home: Path) -> set[str]:
+    """Every coid the Outbox holds. Empty when the ledger cannot be read.
+
+    Empty only lets a linked stop fill be credited, which can lower recorded
+    ownership but never raise it, so nothing external is ever sold for it.
+    """
+    path = Path(home) / "ops.sqlite"
+    if not path.exists():
+        return set()
+    try:
+        return dispatched_coids(OperationalStore(path))
+    except StoreError:
+        return set()
+
+
+def _hold_unlinked_sells(
+    home: Path, armed: kb_config.ArmedPack, identity: OwnershipIdentity, fills: list, *, bar_ts: int
+) -> bool:
+    """Commit an exit hold for each unlinkable sell on the pair; True when one is new.
+
+    A sell counts when the venue reported its order as unknown
+    (``Fill.order_unknown``) and it is not already accounted as this
+    identity's stop fill. The hold is an Outbox intent of kind
+    ``UNLINKED_SELL_KIND``, committed and never sent: its venue and mode scope
+    it (so KQ-02's per-venue-and-mode entry hold applies unchanged), and its
+    body names the owner and the sell's quantity, which bounds what an
+    operator may assert executed. A ``needs_reconcile`` marker lists it in
+    Operations and raises the critical alert once. Its coid comes from the
+    identity and the fill id, so repeated snapshots and restarts find the same
+    hold, and a resolved hold is never committed again. ``StoreError``
+    propagates: the caller then acts as held.
+    """
+    unknown = [
+        f
+        for f in fills
+        if getattr(f, "order_unknown", False)
+        and getattr(f, "side", "") == "sell"
+        and getattr(f, "pair", None) == identity.pair
+        and getattr(f, "id", "")
+    ]
+    if not unknown:
+        return False
+    _order_coids, accounted = stop_fill_history(home, identity)
+    store = OperationalStore(home / "ops.sqlite")
+    outbox = Outbox(store)
+    created = False
+    for fill in unknown:
+        if fill.id in accounted:
+            continue
+        coid = _unlinked_sell_coid(identity, fill.id)
+        body = json.dumps(
+            {
+                "kind": UNLINKED_SELL_KIND,
+                "pair": identity.pair,
+                "qty": str(fill.qty),
+                "fill_id": fill.id,
+                **_intent_identity(armed, bar_ts),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        try:
+            # A hold already committed (resolved or not) returns without a send.
+            outbox.dispatch(coid, body, _never_send, mode=identity.mode, venue=identity.venue)
+        except _HoldNotSent:
+            audit_needs_reconcile(store, coid=coid)
+            created = True
+    return created
+
+
+def _exit_holds(view: kb_obligations.ObligationsView, identity: OwnershipIdentity) -> list[str]:
+    """Coids of the unresolved exit holds of ``identity``."""
+    return [
+        o.coid
+        for o in view.unresolved
+        if o.kind == UNLINKED_SELL_KIND
+        and o.venue == identity.venue
+        and o.mode == identity.mode
+        and o.pair == identity.pair
+        and o.pack_id == identity.pack_id
+    ]
 
 
 def _recognized_open_qty(armed: kb_config.ArmedPack, venue: str, candles: list, orders: list) -> Decimal:

@@ -22,7 +22,7 @@ import json
 import time
 import urllib.parse
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Any, Protocol
@@ -51,6 +51,12 @@ PUBLIC_PATH = "/0/public"
 PRIVATE_PATH = "/0/private"
 GET_API_KEY_INFO = "GetApiKeyInfo"
 ADD_ORDER = "AddOrder"
+QUERY_ORDERS = "QueryOrders"
+# Query Orders Info takes a comma-delimited list of at most 50 txids.
+QUERY_ORDERS_MAX_TXIDS = 50
+# Orders followed through ``refid`` from a sell's own order towards the order
+# that created it. An entry's conditional close is one hop from the entry.
+MAX_REFERRAL_HOPS = 3
 NS_PER_US = 1_000
 US_PER_MS = 1_000
 US_PER_S = 1_000_000
@@ -411,6 +417,8 @@ class KrakenVenue:
         self._last_call_us: int | None = None
         self._rate_failures: int = 0
         self._sleep = sleep or time.sleep
+        # Query Orders Info rows read for sell fills, by txid (None: not shown).
+        self._order_rows: dict[str, dict | None] = {}
 
     # ---- public protocol surface ----------------------------------------
 
@@ -438,7 +446,7 @@ class KrakenVenue:
         return Truth(
             balances=_parse_balances(balances_data),
             open_orders=_parse_open_orders(open_orders_data),
-            recent_fills=_parse_recent_trades(recent_trades_data),
+            recent_fills=self._link_sell_fills(_parse_recent_trades(recent_trades_data)),
         )
 
     def place_entry_with_stop(self, coid: str, qty: Decimal, stop: Decimal, *, pair: str) -> OrderRef:
@@ -675,6 +683,81 @@ class KrakenVenue:
                 return bucket, found[0], found[1]
         return None
 
+    def _link_sell_fills(self, fills: list[Fill]) -> list[Fill]:
+        """Name the client order behind each sell fill, from documented fields only.
+
+        A TradesHistory trade names the order that executed it, ``ordertxid``
+        (https://docs.kraken.com/api-reference/account-data/get-trades-history).
+        Query Orders Info shows that order's ``cl_ord_id`` and its ``refid``,
+        the "referral order transaction ID that created this order"
+        (https://docs.kraken.com/api-reference/account-data/query-orders-info).
+        An entry's protective stop is its conditional close
+        (``close[ordertype]=stop-loss``, triggered by execution of the primary
+        order: https://docs.kraken.com/api-reference/trading/add-order). It
+        has no ``cl_ord_id`` of its own, so ``refid`` leads to the entry, whose
+        ``cl_ord_id`` is the entry coid: that is the fill's ``order_coid``.
+
+        * An order that carries a ``cl_ord_id`` is named by it.
+        * A sell that is not a stop order (market, limit, ...) and carries no
+          ``cl_ord_id`` is no protective stop: krellbot's Kraken stops are
+          only ever stop-loss orders. Its ``order_coid`` stays None.
+        * Otherwise ``refid`` is followed, at most ``MAX_REFERRAL_HOPS``
+          orders, to the first order with a ``cl_ord_id``.
+        * Anything else is ``order_unknown``: an order Query Orders does not
+          show, a chain that ends without a ``cl_ord_id``, or a stop order
+          with neither field. EditOrder, which ``raise_stop`` uses, replaces a
+          stop with a new order and documents that userref is not retained
+          (https://docs.kraken.com/api-reference/trading/edit-order); it
+          documents no link to the old order, so such a fill is not guessed at.
+
+        Buys are never a protective stop and are not looked up. Each order is
+        read once per adapter instance. A rejected read raises, as any other
+        snapshot read does, and nothing is inferred from it.
+        """
+        if not any(f.side == "sell" for f in fills):
+            return fills
+        self._read_orders({f.coid for f in fills if f.side == "sell" and f.coid})
+        linked: list[Fill] = []
+        for fill in fills:
+            if fill.side != "sell":
+                linked.append(fill)
+                continue
+            order_coid, unknown = self._order_origin(fill.coid) if fill.coid else (None, True)
+            linked.append(replace(fill, order_coid=order_coid, order_unknown=unknown))
+        return linked
+
+    def _read_orders(self, txids: set[str]) -> None:
+        """Read Query Orders Info for ``txids`` and, hop by hop, the orders that created them."""
+        pending = sorted(txid for txid in txids if txid not in self._order_rows)
+        for _hop in range(MAX_REFERRAL_HOPS + 1):  # the sells' own orders, then their creators
+            if not pending:
+                return
+            for start in range(0, len(pending), QUERY_ORDERS_MAX_TXIDS):
+                chunk = pending[start : start + QUERY_ORDERS_MAX_TXIDS]
+                rows = _result(self._private(QUERY_ORDERS, {"txid": ",".join(chunk)}))
+                for txid in chunk:
+                    row = rows.get(txid)
+                    self._order_rows[txid] = row if isinstance(row, dict) else None
+            referrers = {_referrer(self._order_rows.get(txid)) for txid in pending}
+            pending = sorted(ref for ref in referrers if ref and ref not in self._order_rows)
+
+    def _order_origin(self, txid: str) -> tuple[str | None, bool]:
+        """``(order_coid, order_unknown)`` for the order ``txid``; see ``_link_sell_fills``."""
+        row = self._order_rows.get(txid)
+        for hop in range(MAX_REFERRAL_HOPS + 1):
+            if row is None:
+                return None, True
+            client = _text(row.get("cl_ord_id"))
+            if client is not None:
+                return client, False
+            if hop == 0 and _known_non_stop(row):
+                return None, False
+            referrer = _referrer(row)
+            if referrer is None:
+                return None, True
+            row = self._order_rows.get(referrer)
+        return None, True
+
     def _last_price(self, pair: str) -> Decimal:
         payload = self._public("Ticker", {"pair": pair})
         result = _result(payload)
@@ -873,6 +956,24 @@ def _match_userref(payload: Any, bucket: str, coid: str, userref: int, *, own_on
             continue
         by_userref = (str(order_id), raw)
     return by_userref
+
+
+def _text(raw: Any) -> str | None:
+    return raw if isinstance(raw, str) and raw.strip() else None
+
+
+def _referrer(row: dict | None) -> str | None:
+    """The ``refid`` to follow from an order with no ``cl_ord_id`` of its own."""
+    if row is None or _text(row.get("cl_ord_id")) is not None:
+        return None
+    return _text(row.get("refid"))
+
+
+def _known_non_stop(row: dict) -> bool:
+    """True when the order's documented ``descr.ordertype`` is readable and no stop type."""
+    descr = row.get("descr")
+    ordertype = _text(descr.get("ordertype")) if isinstance(descr, dict) else None
+    return ordertype is not None and "stop" not in ordertype
 
 
 def _executed_qty(raw: dict) -> Decimal | None:
