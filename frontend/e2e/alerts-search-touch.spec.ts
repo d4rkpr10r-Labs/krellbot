@@ -257,7 +257,7 @@ test("Operations Alerts Search keeps >=44px touch targets <=640px and compact de
   expect(focusedQuery?.focusVisible).toBe(true);
   expect(focusedQuery?.outlineStyle).toBe("solid");
   expect(focusedQuery?.outlineWidth).toBe("2px");
-  expect(focusedQuery?.outlineColor).toBe("rgb(168, 216, 209)");
+  expect(focusedQuery?.outlineColor).toBe("rgb(94, 234, 212)");
 
   // Desktop density is preserved while typing at 1440px too.
   await page.setViewportSize({ width: 1440, height: 900 });

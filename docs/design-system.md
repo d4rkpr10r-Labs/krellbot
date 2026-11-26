@@ -34,6 +34,15 @@ from those nine tokens. Prefer semantic roles in component CSS.
   alert rows). It maps to `--caution-text`, deliberately **not** to
   `--sage`. Never recolor a caution/error consumer green.
 
+## Website and workstation theme
+
+The HTML entry point selects `signal-night` for the workstation and its
+first-run wizard. The palette in `frontend/src/styles/signal-night.css` maps the
+website's near-black surfaces, teal actions and aqua selection onto Signal's
+existing roles. Violet marks depth in the page heading. Caution and danger
+keep their existing semantic colors. The shared glass header, grid and short
+entrance transitions run locally using CSS, including on the paper-only path.
+
 ## Typography
 
 - **Manrope** (SIL OFL 1.1) is the primary UI/body/heading font.
