@@ -242,6 +242,19 @@
   color: var(--text, #e9f0f5);
 }
 
+/* --- when the rules fire: operator notes and format limits ---
+ *
+ * One block of its own between the exit rules and the markets: the
+ * section heading, the operator notes as a disc list and the format
+ * limits as a detail line, spaced like the card's other sections. */
+
+.kbot-feature__strategy-explanation-firing {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+}
+
 /* --- details and notices --- */
 
 .kbot-feature__strategy-explanation-detail {

@@ -43,6 +43,21 @@ export type StopExplanation = {
   semantics?: string[];
 };
 
+/**
+ * How a condition operator fires on closed bars: an "event" is true only on
+ * the bar where something changes (`crosses_*`); a "state" is true on every
+ * bar while it holds (`>`, `<`, `>=`, `<=`).
+ */
+export type OperatorTrigger = "state" | "event";
+
+/** One fixed note on when an operator the pack uses is true. */
+export type OperatorFiringNote = {
+  /** Stable identity: "comparison" covers all four comparison operators. */
+  key: "comparison" | "crosses_above" | "crosses_below";
+  trigger: OperatorTrigger;
+  text: string;
+};
+
 export type ExplainResult = {
   /** Revision the explanation was built from, as supplied. */
   revisionId: string | null;
@@ -65,6 +80,11 @@ export type ExplainResult = {
   markets: MarketExplanation[];
   allocation: { text: string; supported: boolean };
   stop: StopExplanation;
+  /**
+   * Notes on when the operators used by the entry and exit rules are true
+   * (see `operatorFiringNotes`). Optional so hand-built results stay valid.
+   */
+  firing?: OperatorFiringNote[];
   /** True when at least one construct was unsupported or malformed. */
   hasUnknowns: boolean;
   /** Number of characters of the stored bytes. */
@@ -477,6 +497,108 @@ function describeStop(value: Json): StopExplanation {
   };
 }
 
+/*
+ * When rules fire, true of the engine today:
+ * - `pack/evaluate._eval_leaf`: `crosses_above` is `l1 <= r1 and l0 > r0`
+ *   and `crosses_below` is `l1 >= r1 and l0 < r0`, comparing the previous
+ *   bar with the bar being evaluated; it is False on bar 0 or when either
+ *   side has no value on either bar. `>`, `<`, `>=`, `<=` compare the two
+ *   sides on the bar being evaluated only, so they hold on every bar where
+ *   the comparison is true.
+ * - `pack/evaluate.Target` is long or flat. `backtest/engine.Backtester` and
+ *   `run.tick` enter only when the owned quantity is zero and exit or stop
+ *   the whole owned quantity; the schema has no short, partial-exit or
+ *   scale-in field.
+ * - Rules see closed bars only (`cli._closed_signal_reader`; the backtest
+ *   fills a signal at the next bar's open). The protective stop is the one
+ *   price-triggered order: `Backtester.run` and
+ *   `PaperVenue._apply_triggered_stops` fill it on a bar whose low reaches
+ *   it, and a live stop rests at the venue.
+ */
+export const FORMAT_LIMITS_NOTE =
+  "This strategy format cannot go short, take partial exits, add to a position, or act inside a bar.";
+
+export const CLOSED_BARS_NOTE =
+  "Entry and exit rules are checked only after a bar closes, and any entry or exit order is sent after that check. Only the protective stop can be triggered by price during a bar.";
+
+const COMPARISON_OPERATORS = [">", "<", ">=", "<="] as const;
+
+const FIRING_NOTES: readonly OperatorFiringNote[] = [
+  {
+    key: "comparison",
+    trigger: "state",
+    text: 'Comparisons ("is greater than", "is less than", "is at least", "is at most") are true on every closed bar while they hold, not only on the first bar they hold.',
+  },
+  {
+    key: "crosses_above",
+    trigger: "event",
+    text: '"X crosses above Y" is true only on the closed bar where X moves from at or below Y on the bar before to above Y. It is not true again until X has first gone back to at or below Y.',
+  },
+  {
+    key: "crosses_below",
+    trigger: "event",
+    text: '"X crosses below Y" is true only on the closed bar where X moves from at or above Y on the bar before to below Y. It is not true again until X has first gone back to at or above Y.',
+  },
+];
+
+/** "event" for `crosses_*`, "state" for a comparison, null otherwise. */
+export function operatorTrigger(op: unknown): OperatorTrigger | null {
+  if (op === "crosses_above" || op === "crosses_below") {
+    return "event";
+  }
+  if (typeof op === "string" && (COMPARISON_OPERATORS as readonly string[]).includes(op)) {
+    return "state";
+  }
+  return null;
+}
+
+/*
+ * Collect the operators of the leaves `describeCondition` explains as
+ * leaves. A construct it reports as unknown (bad grouping, empty list,
+ * deeper than the DSL allows, unsupported operator) contributes nothing.
+ */
+function collectOperators(value: Json, depth: number, into: Set<string>): void {
+  if (Array.isArray(value)) {
+    const op = value.length === 3 ? value[1] : undefined;
+    if (operatorTrigger(op) !== null) {
+      into.add(op as string);
+    }
+    return;
+  }
+  if (!isRecord(value)) {
+    return;
+  }
+  const keys = Object.keys(value);
+  if (keys.length !== 1 || (keys[0] !== "all" && keys[0] !== "any")) {
+    return;
+  }
+  const list = value[keys[0]];
+  if (!Array.isArray(list) || list.length === 0 || depth >= 4) {
+    return;
+  }
+  for (const child of list) {
+    collectOperators(child, depth + 1, into);
+  }
+}
+
+/**
+ * Fixed notes on when the operators used by a pack's entry and exit rules
+ * are true: one note for the comparisons, one for each `crosses_*` used, in
+ * that order. Operators the explanation cannot read get no note.
+ */
+export function operatorFiringNotes(pack: unknown): OperatorFiringNote[] {
+  if (!isRecord(pack)) {
+    return [];
+  }
+  const used = new Set<string>();
+  collectOperators(pack.entry, 1, used);
+  collectOperators(pack.exit, 1, used);
+  const usesComparison = COMPARISON_OPERATORS.some((op) => used.has(op));
+  return FIRING_NOTES.filter((note) =>
+    note.key === "comparison" ? usesComparison : used.has(note.key),
+  ).map((note) => ({ ...note }));
+}
+
 function readMetadataString(pack: Record<string, Json>, key: string): string | null {
   const value = pack[key];
   return typeof value === "string" && value.length > 0 ? value : null;
@@ -560,6 +682,7 @@ export function explainPack(bytes: string, revisionId: string | null): ExplainRe
     markets,
     allocation,
     stop,
+    firing: operatorFiringNotes(pack),
     hasUnknowns,
     byteLength: bytes.length,
   };
