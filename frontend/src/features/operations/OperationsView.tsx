@@ -8,7 +8,7 @@ import {
 } from "react";
 import { DisclosureSection } from "../../components/disclosure/DisclosureSection";
 import "./OperationsView.signal.css";
-import { AlertsFilter } from "./AlertsFilter";
+import { ALERTS_FILTER_STORAGE_KEY, AlertsFilter } from "./AlertsFilter";
 import { DeploymentHistory } from "./DeploymentHistory";
 import { summarizeOperationMode } from "./operationModeLabel";
 import { summarizeDeploymentRefused } from "./deploymentRefusedSummary";
@@ -778,7 +778,7 @@ export function OperationsView({
           data-testid="ops-alerts-panel"
         >
           <h3 className="kbot-ops__panel-title">Alerts</h3>
-          <AlertsFilter alerts={view.alerts}>
+          <AlertsFilter alerts={view.alerts} storageKey={ALERTS_FILTER_STORAGE_KEY}>
             {(visible: OperationsViewModel["alerts"]) => (
               <div className="kbot-ops__alert-groups" data-testid="ops-alert-groups">
                 <ul className="kbot-ops__alerts" data-testid="ops-alerts">
