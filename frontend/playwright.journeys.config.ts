@@ -32,6 +32,9 @@ export default defineConfig({
           "test-results/journeys.json",
       },
     ],
+    // Counts expected failures (test.fail) apart from passes; Playwright's
+    // own footer counts them as passed.
+    ["./journeys/helpers/journeyOutcomes.ts"],
   ],
   timeout: 180_000,
   expect: { timeout: 20_000 },
