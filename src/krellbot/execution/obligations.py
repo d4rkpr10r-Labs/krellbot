@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from krellbot.venues.base import VENUE_REFUSAL_CODES
+
 OPS_DB_FILENAME = "ops.sqlite"
 RESOLVED_KIND = "intent_resolved"
 OPERATOR_ASSERTION_KIND = "operator_asserted"
@@ -254,6 +256,26 @@ def record_resolution(store, *, coid: str, outcome: str, filled_qty: Decimal, ev
     """Retire one obligation. Callers write it only after its accounting is durable."""
     payload = json.dumps(
         {"coid": coid, "outcome": outcome, "filled_qty": str(filled_qty), "evidence": evidence},
+        sort_keys=True,
+    )
+    with store.transaction() as conn:
+        conn.execute("INSERT INTO ledger (kind, payload) VALUES (?, ?)", (RESOLVED_KIND, payload))
+
+
+VENUE_REJECTED = "venue_rejected"
+
+
+def record_rejection(store, *, coid: str, code: str) -> None:
+    """Retire an intent the venue refused by its documented response: nothing executed.
+
+    ``code`` is the classified refusal code, never the venue's own text. The
+    outcome is ``absent`` with no executed quantity, so there is nothing to
+    account before it; callers still journal the refusal first.
+    """
+    if code not in VENUE_REFUSAL_CODES:
+        raise ValueError("not a documented venue refusal code")
+    payload = json.dumps(
+        {"coid": coid, "outcome": "absent", "filled_qty": "0", "evidence": VENUE_REJECTED, "code": code},
         sort_keys=True,
     )
     with store.transaction() as conn:
