@@ -22,7 +22,7 @@ function setup(kill_switch: OperationsViewModel["live"]["kill_switch"]) {
   return client;
 }
 
-const legacyEngagedPanel = "Kill switchKill switch: engaged — (no reason)ReasonEngage kill switchRelease kill switchEngaging stops new entries and all live sends. It does not sell or disarm.";
+const legacyEngagedPanel = "Kill switchKill switch: engaged — (no reason)ReasonEngage kill switchRelease kill switchEngaging stops new entries. Strategy exits and protective stops keep running. Engaging it does not sell or disarm.";
 
 describe("kill switch engaged age", () => {
   it("adds a seconds-epoch age directly after the unchanged state paragraph", async () => {
