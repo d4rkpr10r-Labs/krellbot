@@ -21,8 +21,11 @@ journaled only from evidence: a live acknowledgement is not an executed
 quantity, so the exit stays an obligation until ``order_outcome`` reports
 what executed. While it is unsettled the identity's exits and stop repair are
 held, so the sale is not repeated every bar and external units are never
-sold. An adapter without ``place_stop`` commits no stop intent and keeps the
-exit fallback. Paper repair is unchanged.
+sold. A documented refusal of the stop (M28.28) is journaled as its code and
+resolves the stop intent as not executed before the same fallback. An adapter
+without ``place_stop`` commits no stop intent and keeps the exit fallback. On
+a bar the pack exits, no stop is rested just to be cancelled. Paper repair is
+unchanged.
 
 Runs on fake transports with the release gate patched in-process
 (``live_capable_release``); ``PAPER_ONLY_RELEASE`` stays True in source.
@@ -49,11 +52,12 @@ from krellbot.execution.obligations import read_obligations
 from krellbot.pack.model import Candle
 from krellbot.run.reconcile import OwnershipIdentity, project_ownership
 from krellbot.storage.database import OperationalStore
-from krellbot.venues.base import Balance, KeyPerms, OrderOutcome, OrderRef, PairRules, Truth
+from krellbot.venues.base import Balance, KeyPerms, OrderOutcome, OrderRef, PairRules, Truth, VenueRejectedError
 from krellbot.venues.coinbase import CoinbaseVenue
 from krellbot.venues.kraken import KrakenVenue, coid_userref
 from krellbot.venues.paper import PaperVenue
 
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "venues"
 PACK = "missing-stop"
 H = 3_600_000
 ENTRY_BAR = 2 * H
@@ -63,6 +67,13 @@ KRAKEN_KEY = "FAKE_KEY_FOR_KRAKEN_TESTS"
 KRAKEN_SECRET = "kQH5HW/8p1uGOVjbgWA7FunAmGO8lsSUXNsu3eow76sz84Q18fWxnyRzBHCd3pd5nE9qa99HAZtuZuj6F1huXg=="
 COINBASE_KEY = "organizations/fake-org/apiKeys/fake-coinbase-key-001"
 COINBASE_SECRET = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQGKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXA=="
+
+
+def _documented(venue: str, name: str) -> dict:
+    """A documented response body from the venue fixtures; the first line is its provenance."""
+    lines = (FIXTURES / venue / f"{name}.json").read_text(encoding="utf-8").splitlines()
+    assert lines[0].startswith("#")
+    return json.loads("\n".join(lines[1:]))
 
 
 def _candle(ts_ms: int, close: str) -> Candle:
@@ -169,9 +180,11 @@ class _KrakenExchange(FakeKrakenTransport):
     order is only found by the reference it was placed with. AddOrder rests a
     ``stop-loss`` sell and executes a market sell at once (moving the balance
     and adding a TradesHistory trade). ``stop_reply`` makes Kraken reject a
-    stop (``reject``) or accept it and lose the reply (``lose_ack``).
-    ``exit_listed=False`` keeps an executed market sell out of the open and
-    closed lists, so its outcome cannot be established until ``reveal``.
+    stop with an error the classifier does not recognize (``reject``), refuse
+    it with a documented order refusal (``refuse``), or accept it and lose the
+    reply (``lose_ack``). ``exit_listed=False`` keeps an executed market sell
+    out of the open and closed lists, so its outcome cannot be established
+    until ``reveal``.
     ``exit_executes`` is the part of a market sell that executes.
     """
 
@@ -222,6 +235,8 @@ class _KrakenExchange(FakeKrakenTransport):
         if form.get("ordertype") == "stop-loss":
             if self.stop_reply == "reject":
                 return {"error": ["EOrder:Invalid price"]}
+            if self.stop_reply == "refuse":
+                return _documented("kraken", "order_minimum_not_met")
             self.open_rows[txid] = order_info(
                 vol=form["volume"],
                 vol_exec="0.00000000",
@@ -409,6 +424,8 @@ class _CoinbaseExchange(FakeCoinbaseTransport):
                         "preview_failure_reason": "PREVIEW_INVALID_LIMIT_PRICE",
                     },
                 }
+            if self.stop_reply == "refuse":
+                return _documented("coinbase", "order_minimum_not_met")
             box = config["stop_limit_stop_limit_gtc"]
             row = order_record(
                 client_order_id=coid,
@@ -687,7 +704,7 @@ def test_a_replaced_stop_that_fills_is_credited_once(live, reply):
 @pytest.mark.parametrize(
     "outcome", ["executed", "partly-executed", "unknown-then-executed"], ids=lambda outcome: outcome
 )
-def test_a_rejected_stop_falls_back_to_one_exit_journaled_from_venue_evidence(live, outcome):
+def test_a_stop_rejected_without_a_documented_code_falls_back_to_one_exit_journaled_from_evidence(live, outcome):
     stop_coid = _coid(live.venue, live.pair, intent="stop", bar_ts=3 * H)
     exit_coid = _coid(live.venue, live.pair, intent="exit", bar_ts=3 * H)
     executed = live.qty if outcome != "partly-executed" else live.qty * 2 / 5
@@ -735,6 +752,43 @@ def test_a_rejected_stop_falls_back_to_one_exit_journaled_from_venue_evidence(li
         live.assert_stop_request(residual_stop, live.qty - executed, Decimal(7))  # half of the 14 close
     else:
         assert live.stop_coids() == [stop_coid]
+
+
+def test_a_documented_stop_refusal_is_recorded_resolved_and_falls_back_to_an_exit_from_evidence(live):
+    stop_coid = _coid(live.venue, live.pair, intent="stop", bar_ts=3 * H)
+    exit_coid = _coid(live.venue, live.pair, intent="exit", bar_ts=3 * H)
+    live.exchange.stop_reply = "refuse"  # the documented "order minimum not met" body
+
+    assert _tick(live, _bars("13")) == 0
+
+    record = _bar_record(live.home, 3 * H)
+    assert (record["ensure_stop_failed"], record["intent_refused"]) == (True, "order_minimum_not_met")
+    assert (record["exit_qty"], Decimal(record["owned_qty_after"])) == ("0", live.qty)
+    assert live.stop_coids() == [stop_coid]
+    assert live.sells() == [live.qty]
+    # The refused stop executed nothing and holds nothing; the exit waits for evidence.
+    assert _resolutions(live.home) == [
+        {
+            "coid": stop_coid,
+            "outcome": "absent",
+            "filled_qty": "0",
+            "evidence": "venue_rejected",
+            "code": "order_minimum_not_met",
+        }
+    ]
+    assert _unresolved(live.home) == {exit_coid: "exit"}
+
+    assert _tick(live, _bars("13", "14")) == 0
+    assert _tick(live, _bars("13", "14", "15")) == 0
+
+    reconciled = [r for r in _records(live.home) if r.get("resolved_coid") == exit_coid]
+    assert sum(Decimal(r["exit_qty"]) for r in reconciled) == live.qty
+    assert _unresolved(live.home) == {}
+    assert not read_obligations(live.home).blocks_entries(venue=live.venue, mode="live")
+    assert live.stop_coids() == [stop_coid]  # never sent again
+    assert live.sells() == [live.qty]
+    assert _owned(live) == 0
+    assert live.base_balance() == EXTERNAL
 
 
 # ---- an adapter without place_stop -----------------------------------------------------
@@ -1016,10 +1070,27 @@ def test_coinbase_place_stop_sends_a_stop_limit_under_the_coid_and_never_twice(l
     assert (outcome.status, outcome.authoritative) == ("open", True)
 
 
-def test_coinbase_rejected_stop_raises(live_capable_release):
-    exchange = _CoinbaseExchange(base=Decimal(1))
-    exchange.stop_reply = "reject"
-    venue = CoinbaseVenue(COINBASE_KEY, COINBASE_SECRET, exchange, now_fn=lambda: 1, nonce_fn=lambda: "aa" * 16)
+@pytest.mark.parametrize("venue_name", ["kraken", "coinbase"])
+@pytest.mark.parametrize("reply", ["refuse", "reject"], ids=["documented-refusal", "unrecognized-error"])
+def test_a_refused_place_stop_raises_a_typed_rejection_only_for_a_documented_refusal(
+    home, live_capable_release, venue_name, reply
+):
+    if venue_name == "kraken":
+        exchange = _KrakenExchange(base=Decimal(5))
+        clock = _Clock()
+        venue = KrakenVenue(KRAKEN_KEY, KRAKEN_SECRET, exchange, now_ms=clock.now, home=home, sleep=clock.sleep)
+        pair, qty = KRAKEN_PAIR, Decimal(5)
+    else:
+        exchange = _CoinbaseExchange(base=Decimal(1))
+        venue = CoinbaseVenue(COINBASE_KEY, COINBASE_SECRET, exchange, now_fn=lambda: 1, nonce_fn=lambda: "aa" * 16)
+        pair, qty = COINBASE_PAIR, Decimal("0.5")
+    exchange.stop_reply = reply
 
-    with pytest.raises(RuntimeError):
-        venue.place_stop("c0ffee00c0ffee00ab", Decimal("0.5"), Decimal("6.5"), pair=COINBASE_PAIR)
+    with pytest.raises(RuntimeError) as refused:
+        venue.place_stop("c0ffee00c0ffee00ab", qty, Decimal("6.5"), pair=pair)
+
+    if reply == "refuse":
+        assert isinstance(refused.value, VenueRejectedError)
+        assert refused.value.code == "order_minimum_not_met"
+    else:  # proves nothing about execution: no typed rejection, the stop stays unknown
+        assert not isinstance(refused.value, VenueRejectedError)

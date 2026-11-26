@@ -502,7 +502,8 @@ class CoinbaseVenue:
         The coid itself is the ``client_order_id``, so ``order_outcome`` finds it
         by exact match and ``_link_sell_fills`` names its fills by it. An order the
         bounded history already shows under the coid is returned and nothing is
-        sent. Only ``base_min_size`` is checked here; a refusal raises.
+        sent. Only ``base_min_size`` is checked here. A documented create-order
+        refusal raises ``VenueRejectedError``; any other failure ``RuntimeError``.
         """
         release_policy.ensure_live_orders_allowed()
         product = pair or self._product_id
@@ -533,6 +534,9 @@ class CoinbaseVenue:
             },
         )
         if not _order_ok(resp):
+            code = _documented_refusal(resp)
+            if code is not None:
+                raise VenueRejectedError("coinbase", code)
             raise RuntimeError("coinbase stop was not accepted")
         return OrderRef(
             id=_extract_order_id(resp),

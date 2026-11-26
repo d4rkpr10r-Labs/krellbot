@@ -542,7 +542,8 @@ class KrakenVenue:
         fills name the coid through ``_link_sell_fills`` (the order carries
         ``cl_ord_id``), and ``stop_outcome`` finds it again. Only ``ordermin``
         is checked here: whether the stop's cost is acceptable is Kraken's to
-        say, and a refusal raises ``RuntimeError`` from ``_private``.
+        say. The send goes through ``_place``, so a documented refusal raises
+        ``VenueRejectedError`` and any other error ``RuntimeError``.
         """
         release_policy.ensure_live_orders_allowed()
         if not pair:
