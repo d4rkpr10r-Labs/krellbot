@@ -29,7 +29,8 @@ from tests.test_community_pack_paper_arm import _auth, _bootstrap, _get, _pack_d
 from tests.test_ns06_api import TEST_PORT, _build_app, asgi_call
 
 ROUTE = "/api/v1/diagnostics/operations"
-SECRET = "sk-live-hunter2-SECRET"
+# Canary values planted in source records; none may reach the response.
+CANARY = "sk-live-hunter2-CANARY"
 HOST = "api.private-venue.example"
 PRIVATE_PATH = "/home/alice-private/.krellbot"
 STARTING_CASH = "1234.5678"
@@ -58,7 +59,7 @@ def _add_records(home: Path) -> None:
 
     def armed(*, venue: str, pair: str, pack_id: str, pack_version: str, mode: str) -> ArmedPack:
         return ArmedPack(
-            pack_path=f"{PRIVATE_PATH}/{SECRET}.json",
+            pack_path=f"{PRIVATE_PATH}/{CANARY}.json",
             pack_sha256="f" * 64,
             pack_id=pack_id,
             pack_version=pack_version,
@@ -77,14 +78,14 @@ def _add_records(home: Path) -> None:
         armed(venue="coinbase", pair="BTC-USD", pack_id="live-only-pack", pack_version="2.0.0", mode="live")
     )
     cfg.armed.append(
-        armed(venue="binance", pair="BTCUSDT", pack_id=f"Alice {SECRET}", pack_version=f"v1 {HOST}", mode="paper")
+        armed(venue="binance", pair="BTCUSDT", pack_id=f"Alice {CANARY}", pack_version=f"v1 {HOST}", mode="paper")
     )
     cfg.armed.append(armed(venue=HOST, pair="BTCUSDT", pack_id="host-pack", pack_version="1.0.0", mode="paper"))
     save_config(home, cfg)
 
 
 def _write_journal(home: Path, *, start: int) -> None:
-    private = {"balance": STARTING_CASH, "secret": SECRET, "headers": HOST, "exception": PRIVATE_PATH}
+    private = {"balance": STARTING_CASH, "secret": CANARY, "headers": HOST, "exception": PRIVATE_PATH}
     paper = {"pair": "SUIUSD", "mode": "paper", **private}
     live = {"pair": "BTC-USD", "mode": "live", **private}
     records = [
@@ -100,7 +101,7 @@ def _write_journal(home: Path, *, start: int) -> None:
             "ts": start + 2,
             "venue": "kraken",
             "pack": "ops-report",
-            "detail": {**paper, "intent_refused": f"{SECRET} at {HOST}"},
+            "detail": {**paper, "intent_refused": f"{CANARY} at {HOST}"},
         },
         {
             "kind": "tick",
@@ -135,7 +136,7 @@ def _seed_unresolved(home: Path, *, now: int) -> None:
     store = OperationalStore(home / "ops.sqlite")
     store.connect()
     with store.transaction() as conn:
-        for coid, age in ((f"{SECRET}-old", 7200), (f"{HOST}-new", 30)):
+        for coid, age in ((f"{CANARY}-old", 7200), (f"{HOST}-new", 30)):
             stamp = now - age
             outbox = {
                 "coid": coid,
@@ -196,13 +197,13 @@ def test_operations_section_allowlists_alerts_orders_and_paper_runs(home, monkey
     now = armed_at + int(TICK_STALE_SECONDS) + 100
     _fix_now(monkeypatch, now)
     _seed_unresolved(home, now=now)
-    supervise.set_last_error(home, f"tick failed at {PRIVATE_PATH} via {HOST} key={SECRET}")
-    live_gate.engage_kill(home, reason=f"home restored from {PRIVATE_PATH} {SECRET}", now=now - 5)
+    supervise.set_last_error(home, f"tick failed at {PRIVATE_PATH} via {HOST} key={CANARY}")
+    live_gate.engage_kill(home, reason=f"home restored from {PRIVATE_PATH} {CANARY}", now=now - 5)
 
     status, body = _read(_build_app(home))
     assert status == 200
     text = body.decode()
-    for leaked in (SECRET, HOST, PRIVATE_PATH, str(home), STARTING_CASH, OWNED_QTY, "f" * 64):
+    for leaked in (CANARY, HOST, PRIVATE_PATH, str(home), STARTING_CASH, OWNED_QTY, "f" * 64):
         assert leaked not in text, leaked
     for field in (
         "pack_path",
@@ -286,13 +287,13 @@ def test_store_failure_reads_unavailable_without_error_text(home, monkeypatch):
     from krellbot.application import alerts as alerts_app
 
     def broken(*args, **kwargs):
-        raise OSError(f"cannot read {PRIVATE_PATH} {SECRET}")
+        raise OSError(f"cannot read {PRIVATE_PATH} {CANARY}")
 
     monkeypatch.setattr(alerts_app, "collect", broken)
     monkeypatch.setattr(kb_config, "load_config", broken)
     status, body = _get(app, ROUTE, headers=headers)
     assert status == 200
-    assert SECRET.encode() not in body
+    assert CANARY.encode() not in body
     assert PRIVATE_PATH.encode() not in body
     section = json.loads(body)
     assert section["alerts"] == "unavailable"
