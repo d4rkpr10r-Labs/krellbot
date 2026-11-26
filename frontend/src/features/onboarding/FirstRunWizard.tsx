@@ -379,7 +379,7 @@ export function FirstRunWizard({
     if (ready) {
       return true;
     }
-    const message = "Local session unavailable";
+    const message = "The local workstation session is unavailable. Reopen the workstation and try again.";
     if (kind === "choose") {
       setChooseError(`Could not save that strategy: ${message}`);
     } else {
@@ -466,7 +466,7 @@ export function FirstRunWizard({
       }
       const arm = paperClient.arm;
       if (arm === undefined) {
-        setArmError("Start paper run controls unavailable");
+        setArmError("Could not start the simulation. Reopen the workstation and try again.");
         return;
       }
       let result: PaperCommandResult;
@@ -663,7 +663,7 @@ export function FirstRunWizard({
           {activeStep.id === "choose" ? (
             <>
               <label className="kbot-first-run-wizard__market" htmlFor="wizard-market">
-                Exchange for BTC/USD
+                Exchange for simulated BTC/USD trades
                 <select id="wizard-market" data-testid="first-run-wizard-market"
                   value={state.marketVenue ?? "kraken"} disabled={chooseBusyId !== null}
                   onChange={(event) => {

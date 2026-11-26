@@ -630,7 +630,7 @@ function ArmForm({
         </p>
       ) : drafts.length === 0 ? (
         <p className="kbot-paper-status__empty" data-testid="paper-arm-empty">
-          No runnable saved revisions
+          No runnable saved revisions. Open Strategies, save a draft, then validate it.
         </p>
       ) : (
         <>
@@ -1250,6 +1250,11 @@ export function StatusPanel({
               armed={true}
               refreshKey={armEpoch}
             />
+            <p className="kbot-paper-status__empty">
+              Pause new buys leaves exit rules active. Stop paper run removes
+              this market from future evaluations and leaves any open simulated
+              position in place.
+            </p>
             <div className="kbot-paper-status__actions">
               <button
                 type="button"

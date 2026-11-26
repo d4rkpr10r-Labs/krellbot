@@ -1,14 +1,6 @@
 # Krellbot
 
-Open Crypto Automation, Simplified.
-
-Local-first crypto automation with security boundaries and open source code.
-
-We provide the intelligence. You keep 100% of your trades.
-
-This repository is the engine. It is free. It runs on your computer. It does not hold your money, and it does not send your exchange key to krellbot.dev.
-
-Strategy packs are a separate download. The pack format is open, so you can write your own.
+Krellbot is a free, open-source workstation for testing crypto trading rules on your computer. Load a strategy pack, replay candles to inspect its decisions, or arm the strategy with a simulated balance. The public release is paper-only. You can start with an included strategy and no exchange account.
 
 Site: https://krellbot.dev
 Docs: https://krellbot.dev/docs/
@@ -16,19 +8,20 @@ Security: [SECURITY.md](SECURITY.md)
 
 ## Install
 
-The site installer is the way to run Krellbot. No exchange account, API keys,
-or paid pack is needed for paper. Minimal Linux images need CA certificates,
+The [installation guide](https://krellbot.dev/docs/install) lists the supported processors for each operating system. Minimal Linux images need CA certificates,
 curl and unzip first.
 
 ```sh
 # Linux
-curl -fsSL https://krellbot.dev/api/install?os=linux | sh
+curl -fsSL 'https://krellbot.dev/api/install?os=linux' | sh
 
 # macOS
-curl -fsSL https://krellbot.dev/api/install?os=mac | sh
+curl -fsSL 'https://krellbot.dev/api/install?os=mac' | sh
+```
 
-# Windows (PowerShell)
-irm https://krellbot.dev/api/install?os=win | iex
+```powershell
+# Windows
+irm 'https://krellbot.dev/api/install?os=win' | iex
 ```
 
 The site installer downloads a per-user, one-directory frozen release
@@ -76,23 +69,14 @@ retained by default.
 | Data home (`$KRELLBOT_HOME`, default) | `~/.krellbot/` | `%USERPROFILE%\.krellbot\` |
 | Frozen binary | `~/.local/share/krellbot/versions/<ver>/krellbot` | `%LOCALAPPDATA%\Krellbot\versions\<ver>\krellbot.exe` |
 | Launcher | `~/.local/bin/krellbot` | `%LOCALAPPDATA%\Krellbot\bin\krellbot.cmd` |
-| Prior launcher (after update) | `~/.local/bin/krellbot.prior` | `%LOCALAPPDATA%\Krellbot\bin\krellbot.prior.cmd` |
+| Prior launcher (after update) | `~/.local/bin/krellbot.prior` | `%LOCALAPPDATA%\Krellbot\bin\krellbot.cmd.prior` |
 
 `$KRELLBOT_HOME` is independent of the install path and stores paper
-state, the journal, and receipts. Keys connected through the workstation
-are stored in the operating system's keychain.
+state, the journal, and receipts. The workstation uses the operating system’s keychain for exchange keys.
 
 ## Arm your first paper strategy
 
-Start the workstation (the installer leaves a `krellbot` launcher that
-opens it with no arguments; `krellbot ui --open` is the same command), then:
-
-1. Open **Strategies**, choose a free starter example, then **Save** and
-   **Validate**. The starter examples ship with the release.
-2. In the paper-arm form, use venue `kraken` and starting paper balance `1000`,
-   then click **Arm**. This is simulated cash, not an exchange deposit.
-3. Open **Operations**: the deployment must say `paper` and `active`, and live
-   trading must remain disabled. **Workstation** also shows the armed paper row.
+Run `krellbot` to open the local workstation. Follow the [first paper strategy walkthrough](https://krellbot.dev/docs/getting-started) for the version installed by the website. It shows how to save and validate a free starter, arm it with simulated cash, and check its first candle. An armed row confirms the configuration. A completed tick tells you that the engine evaluated the strategy. A strategy can complete a tick without making a trade.
 
 A research run is optional before arming. If you want an offline demonstration,
 [paper trading](docs/paper.md) documents the public repository pack/candle
@@ -107,21 +91,11 @@ HTTPS. The exact launcher flags and Serve command are in
 
 ## Advanced and diagnostic commands
 
-You do not need the command line to install Krellbot or arm a paper strategy.
-The `krellbot` command is plumbing: the launcher, the scheduler entry point and
-diagnostics such as readiness checks. Those commands are documented in
-[docs/cli.md](docs/cli.md).
+Use the terminal to install and launch the workstation. Once it opens, you can configure and arm a paper strategy in the browser. See [CLI commands](docs/cli.md) for diagnostics and scheduled ticks.
 
 ## Live and the UI gate
 
-- The workstation is `127.0.0.1` only; it refuses non-loopback `Host`
-  headers. Successful live arm is the workstation path: grant
-  authorization (typed `LIVE` in the UI), then `live.arm`. The CLI does
-  not prompt `Type LIVE` on stdin — see [docs/live.md](docs/live.md).
-  This release still refuses every live send (`PAPER_ONLY_RELEASE`).
-- Exchange keys are stored in the native OS keychain (see
-  [docs/cli.md](docs/cli.md)). No exchange credentials go to `krellbot.dev`.
-- See [docs/live.md](docs/live.md) for the live arm flow.
+The workstation listens on loopback. The public build blocks live orders, including cancellations and edits. An environment variable, stored key or authorization file cannot turn them on. See [live trading](docs/live.md) for the policy and [paper trading](https://krellbot.dev/docs/paper) to run a simulation.
 
 ## Working on the engine
 

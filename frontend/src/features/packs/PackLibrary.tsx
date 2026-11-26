@@ -328,7 +328,7 @@ export function PackLibrary({
           </p>
         ) : rows === null ? (
           <p className="kbot-pack-library__failed" data-testid="pack-library-failed">
-            Not loaded.
+            Pack list unavailable. Choose Refresh to try again.
           </p>
         ) : rows.length === 0 ? (
           <p className="kbot-pack-library__empty" data-testid="pack-library-empty">

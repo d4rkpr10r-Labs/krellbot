@@ -8,7 +8,7 @@ const LIST_ERROR_PREFIX = "Could not load unresolved orders — check the workst
 const RETRY_TEXT = "Retry";
 const PANEL_TITLE = "Unresolved orders";
 const HELPER_TEXT =
-  "Orders awaiting reconcile after an unknown venue acknowledgement. Read-only.";
+  "Krellbot could not confirm these orders when it sent them. Check the last lookup and match the client order ID to your exchange history before placing another order. Refresh reloads the list without resending orders.";
 const COL_COID = "Client order ID";
 const COL_AGE = "Age";
 const COL_LOOKUP = "Last lookup";

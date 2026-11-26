@@ -155,10 +155,10 @@ describe("LiveWizardPanel", () => {
       /not live order send/i,
     );
     expect(screen.getByTestId("live-wizard-live-ready").textContent).toBe(
-      "Live-ready claim: no",
+      "This screen cannot arm a strategy for live trading.",
     );
     expect(screen.getByTestId("live-wizard-keys-local").textContent).toMatch(
-      /Keys leave this machine: no/,
+      /Keys sent to krellbot\.dev: no/,
     );
   });
 });

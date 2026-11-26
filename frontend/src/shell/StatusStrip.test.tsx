@@ -42,8 +42,8 @@ describe("StatusStrip — static-to-live contract (KRELL-SIGNAL-20261010)", () =
       vi.fn(() => Promise.reject(new Error("no server in this test"))),
     );
     render(<StatusStrip />);
-    // OLD state, still required: without a read there is nothing truthful to
-    // claim, so the strip says live orders are unavailable and reports Paper.
+    // Before the first read, Paper describes the preview, not confirmed activity.
+    expect(screen.getByText("Preview:")).toBeDefined();
     await waitFor(() => {
       expect(screen.getByTestId("live-orders-status").textContent).toBe(
         "Live orders unavailable",
@@ -67,6 +67,7 @@ describe("StatusStrip — static-to-live contract (KRELL-SIGNAL-20261010)", () =
     render(
       <StatusStrip
         live={live({
+          release_policy: "paper_only",
           kill_switch: {
             engaged: true,
             reason: "manual_engaged",
@@ -76,6 +77,7 @@ describe("StatusStrip — static-to-live contract (KRELL-SIGNAL-20261010)", () =
       />,
     );
     const kill = screen.getByTestId("statusstrip-kill").textContent ?? "";
+    expect(screen.getByLabelText("Mode Paper")).toBeDefined();
     expect(kill).toContain("Kill switch engaged");
     expect(kill).toContain("manual_engaged");
     // Human-readable, timezone-explicit form of the server's epoch seconds.
@@ -86,10 +88,11 @@ describe("StatusStrip — static-to-live contract (KRELL-SIGNAL-20261010)", () =
     );
   });
 
-  it("counts authorized venues and switches the mode label to Live", () => {
+  it("shows stored grants in a paper-only release without reporting live trading", () => {
     render(
       <StatusStrip
         live={live({
+          release_policy: "paper_only",
           authorized: [
             { venue: "kraken", pair: "BTC/USD" },
             { venue: "coinbase", pair: "ETH/USD" },
@@ -100,7 +103,19 @@ describe("StatusStrip — static-to-live contract (KRELL-SIGNAL-20261010)", () =
     expect(screen.getByTestId("live-orders-status").textContent).toContain(
       "2 live venues authorized",
     );
-    expect(screen.getByLabelText("Mode Live").textContent).toBe("Live");
+    expect(screen.getByLabelText("Mode Paper").textContent).toBe("Paper");
+  });
+
+  it("labels legacy grants as permissions when the snapshot omits the release policy", () => {
+    render(<StatusStrip live={live({authorized: [{venue: "kraken", pair: "BTC/USD"}]})} />);
+    expect(screen.getByTestId("kbot-status-strip").textContent).toContain("Stored authorization: Live");
+    expect(screen.getByText("Trading mode unconfirmed")).toBeDefined();
+    expect(screen.queryByLabelText("Mode Live")).toBeNull();
+  });
+
+  it("honors a paper-only release even if an inconsistent snapshot sets the live flag", () => {
+    render(<StatusStrip live={live({release_policy: "paper_only", live_enabled: true})} />);
+    expect(screen.getByLabelText("Mode Paper")).toBeDefined();
   });
 
   it("shows the promotion affordance copy only when promotion is available", () => {
@@ -140,6 +155,7 @@ describe("StatusStrip — static-to-live contract (KRELL-SIGNAL-20261010)", () =
           JSON.stringify({
             live: {
               schema_version: "1",
+              release_policy: "live_allowed",
               live_enabled: true,
               authorized: [{ venue: "kraken", pair: "BTC/USD" }],
               kill_switch: { engaged: true, reason: "manual_engaged", engaged_at: 1760000000 },
@@ -159,6 +175,6 @@ describe("StatusStrip — static-to-live contract (KRELL-SIGNAL-20261010)", () =
         "Kill switch: engaged — manual_engaged",
       );
     });
-    expect(screen.getByLabelText("Mode Live").textContent).toBe("Live");
+    expect(screen.getByLabelText("Mode Live enabled").textContent).toBe("Live enabled");
   });
 });

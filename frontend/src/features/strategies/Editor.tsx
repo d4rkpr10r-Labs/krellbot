@@ -504,8 +504,8 @@ export function Editor({ client, initial, copiedDraft, onRevision, onOpenInRun }
         <div className="kbot-strategy-editor__head-copy">
           <h2 className="kbot-strategy-editor__title">Strategy draft</h2>
           <p className="kbot-strategy-editor__intro">
-            Read the rules first, then save and validate the revision. Nothing
-            saves, validates or arms by itself.
+            Choose an example or enter your own rules. Save the draft, then
+            validate the saved revision before arming it for paper trading.
           </p>
         </div>
         <div className="kbot-strategy-editor__head-actions">
@@ -535,7 +535,7 @@ export function Editor({ client, initial, copiedDraft, onRevision, onOpenInRun }
                 Strategy identity and readable rules
               </h3>
               <span className="kbot-strategy-editor__group-note">
-                Readable fields write the real pack bytes
+                Changes also update the JSON below
               </span>
             </header>
             <div className="kbot-strategy-editor__group-body">
@@ -608,14 +608,13 @@ export function Editor({ client, initial, copiedDraft, onRevision, onOpenInRun }
                 Technical JSON, import and export
               </span>
               <span className="kbot-strategy-editor__group-note">
-                Raw bytes stay byte-preserved
+                Import or edit a pack as JSON
               </span>
             </summary>
             <div className="kbot-strategy-editor__technical-body">
               <p className="kbot-strategy-editor__hint">
-                The raw pack is the source of truth. Imported packs that use
-                unsupported features are never converted or stripped — edit them
-                here as JSON only.
+                Edit the JSON directly for rules the form cannot display.
+                Export pack downloads the current draft.
               </p>
               <label
                 className="kbot-strategy-editor__field"
@@ -699,7 +698,7 @@ export function Editor({ client, initial, copiedDraft, onRevision, onOpenInRun }
                 Save and validation
               </h3>
               <span className="kbot-strategy-editor__group-note">
-                Explicit actions only
+                Save before validating
               </span>
             </header>
             <div className="kbot-strategy-editor__group-body">
@@ -768,9 +767,8 @@ export function Editor({ client, initial, copiedDraft, onRevision, onOpenInRun }
                 </button>
               </div>
               <p className="kbot-strategy-editor__hint">
-                Save creates a new revision or edits the loaded one; Validate
-                asks the backend to check the saved revision. Neither runs on
-                navigation.
+                Save keeps earlier revisions. If the same rules are already saved,
+                Krellbot reuses that revision. Validate checks the saved rules.
               </p>
             </div>
           </section>

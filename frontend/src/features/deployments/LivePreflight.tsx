@@ -132,6 +132,8 @@ export function LivePreflight(): JSX.Element {
         <h2 className="kbot-feature__live-preflight-root__title">
           Live preflight
         </h2>
+        <p>Check the selected account and strategy revision. A preflight check
+          cannot place an order or enable live trading.</p>
       </header>
       <form
         className="kbot-feature__live-preflight-root__form"
