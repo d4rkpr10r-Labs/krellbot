@@ -24,6 +24,7 @@ const KNOWN_LABELS: Record<string, string> = {
   unresolved_order_aging: "Unresolved order aging",
   restore_fence: "Restore fence",
   kill_switch: "Kill switch",
+  feed_stale: "Feed stale",
 };
 
 function fallbackLabel(value: string): string {

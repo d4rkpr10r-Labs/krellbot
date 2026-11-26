@@ -6,6 +6,7 @@ v1 API exposes at:
   * ``POST /api/v1/research/jobs``
   * ``GET  /api/v1/jobs/{id}``
   * ``POST /api/v1/jobs/{id}/cancel``
+  * ``GET  /api/v1/jobs/{id}/fills``
   * ``GET  /api/v1/events``
 
 Jobs expose bounded execution and typed observable status.
@@ -22,6 +23,7 @@ import datetime as _dt
 import hashlib
 import json
 import math
+import re
 import secrets
 import threading
 from collections.abc import Callable
@@ -55,6 +57,12 @@ JOB_ERROR_JOB_FAILED = "job_failed"
 JOB_ERROR_MISSING_RESULT_REF = "missing_result_ref"
 JOB_ERROR_NOT_FOUND = "not_found"
 JOB_ERROR_RESULT_UNAVAILABLE = "result_unavailable"
+JOB_ERROR_FILLS_UNAVAILABLE = "fills_unavailable"
+
+# Per-bar fills side-cars live outside ``research-jobs/``: ``_restore_jobs``
+# parses every ``*.json`` file there as a job record.
+FILLS_DIRNAME = "research-fills"
+_SIDE_CAR_JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 CODE_INVALID_DATASET = "invalid_dataset"
 CODE_NO_DATASET_AND_NO_FETCH = "no_dataset_and_no_fetch"
@@ -445,6 +453,27 @@ class JobManager:
             self._jobs[internal.id] = internal
         # No recovered job is queued or started; only a new explicit submission runs.
 
+    def _fills_path(self, job_id: str) -> Path | None:
+        if not isinstance(job_id, str) or _SIDE_CAR_JOB_ID.fullmatch(job_id) is None:
+            return None
+        return self._home / FILLS_DIRNAME / f"{job_id}.json"
+
+    def _write_fills(self, job_id: str, fills: dict) -> None:
+        """Persist a succeeded job's per-bar fills beside, never inside, its job record.
+
+        A write failure leaves no side-car; the fills route then reports
+        ``fills_unavailable`` instead of the job failing or fills being guessed.
+        """
+        path = self._fills_path(job_id)
+        if path is None:
+            return
+        payload = {"schema_version": SCHEMA_VERSION, "job_id": job_id, "fills": fills}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            atomic_write(path, json.dumps(payload).encode("utf-8"))
+        except OSError:
+            return
+
     # ---- public ----------------------------------------------------------
 
     def event_buffer(self) -> EventBuffer:
@@ -552,6 +581,31 @@ class JobManager:
             if internal is None:
                 return None
             return internal.result_snapshot()
+
+    def fills_for(self, job_id: str) -> dict | None:
+        """Return a succeeded job's per-bar fills keyed by ``bar_ts``, or ``None``.
+
+        ``None`` covers an unknown or unfinished job and a succeeded job
+        whose runner recorded no fills (for example one stored before fills
+        were kept). The stored ``{legacy_receipt, trace}`` result is never
+        read or changed here.
+        """
+
+        with self._lock:
+            internal = self._jobs.get(job_id)
+            if internal is None or internal.job.state != JOB_STATE_SUCCEEDED:
+                return None
+        path = self._fills_path(job_id)
+        if path is None:
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(payload, dict) or payload.get("job_id") != job_id:
+            return None
+        fills = payload.get("fills")
+        return fills if isinstance(fills, dict) else None
 
     def cancel(self, job_id: str) -> JobV1 | None:
         """Cancel ``job_id`` if known and not already terminal. Idempotent.
@@ -711,6 +765,12 @@ class JobManager:
                         # the runner's output. The result route reads
                         # this object verbatim.
                         internal.result = _extract_result(outcome)
+                        # Per-bar fills go to a side-car, written before the
+                        # job reads as succeeded so the fills route serves
+                        # them as soon as the result route does.
+                        fills = outcome.get("fills")
+                        if isinstance(fills, dict):
+                            self._write_fills(internal.id, fills)
                         self._finalize_state(internal, JOB_STATE_SUCCEEDED)
                     else:
                         self._finalize_failed(
@@ -784,7 +844,7 @@ class JobManager:
         JobV1 error code.
         """
 
-        from krellbot.application.research import ResearchRequest, ResearchService
+        from krellbot.application.research import ResearchRequest, ResearchService, fills_to_json
 
         pack_path = request_payload.get("pack_path", "")
         revision_id = request_payload.get("revision_id")
@@ -875,4 +935,6 @@ class JobManager:
             "legacy_receipt": legacy_receipt,
             "trace": trace,
             "receipt_canonical_sha256": receipt_digest,
+            # Side-car only: ``_extract_result`` never stores this key.
+            "fills": fills_to_json(result.fills) if result.fills is not None else None,
         }

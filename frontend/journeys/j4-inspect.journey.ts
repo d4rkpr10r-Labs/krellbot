@@ -90,7 +90,6 @@ test.describe("J4 inspect", () => {
     expect(detailText).toMatch(/exit/i);
     // Conditions alone do not disclose the bar's actual decision.
     // Journey gap: https://github.com/d4rk-pri0r/krellbot/issues/103
-    test.fail(true, "https://github.com/d4rk-pri0r/krellbot/issues/103");
     expect.soft(detailText, "selected-bar detail must name its decision").toMatch(/(?:decision|action|target)\s*:?\s*(?:enter|exit|hold|stay flat)/i);
 
     // "open ANY bar": open a middle bar too and get the same shape.
