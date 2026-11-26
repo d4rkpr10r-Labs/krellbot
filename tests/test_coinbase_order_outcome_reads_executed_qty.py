@@ -2,9 +2,11 @@
 
 A Coinbase market IOC entry whose response carries no fill evidence raises
 'coinbase entry was not filled; stop not placed' after the Outbox commit, so
-the intent stays an obligation that holds new live Coinbase entries. The same
-error follows a rejected entry. ``CoinbaseVenue.order_outcome`` finds the
-coid's own order by exact ``client_order_id`` in the bounded order history
+the intent stays an obligation that holds new live Coinbase entries. A
+documented rejection is not this case: it is resolved as not executed (see
+test_live_rejected_send_records_refusal_code.py).
+
+``CoinbaseVenue.order_outcome`` finds the coid's own order by exact ``client_order_id`` in the bounded order history
 (``_find_order``) and reads what executed (``filled_size``), never the
 requested ``base_size``. The run journals that quantity once under
 ``resolved_coid`` and releases the hold. An order the five bounded pages do
@@ -74,15 +76,6 @@ ENTRY_COID = run.coid_for(pack_id=PACK, pack_version="1.0.0", venue=VENUE, pair=
 ACK_WITHOUT_FILL = {
     "success": True,
     "success_response": {"order_id": "entry-order", "product_id": PAIR, "side": "BUY", "client_order_id": ENTRY_COID},
-}
-REJECTED = {
-    "success": False,
-    "failure_reason": "UNKNOWN_FAILURE_REASON",
-    "error_response": {
-        "error": "INSUFFICIENT_FUND",
-        "message": "Insufficient balance in source account",
-        "preview_failure_reason": "PREVIEW_INSUFFICIENT_FUND",
-    },
 }
 
 
@@ -307,7 +300,7 @@ def test_ioc_entry_coinbase_recorded_with_nothing_filled_is_absent_and_releases_
     assert _posts(transport) == []
 
 
-@pytest.mark.parametrize("ack", [ACK_WITHOUT_FILL, REJECTED], ids=["accepted-without-fill", "rejected"])
+@pytest.mark.parametrize("ack", [ACK_WITHOUT_FILL], ids=["accepted-without-fill"])
 def test_entry_coinbase_does_not_list_keeps_the_hold_and_is_never_resent(live, ack):
     _enter(live, ack)
 
