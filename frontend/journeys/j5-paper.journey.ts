@@ -22,8 +22,6 @@ test("J5.1 I can arm a validated strategy in paper mode with a starting balance.
   const visible = (await row.innerText())+" "+(await page.getByTestId("paper-position").innerText());
   // Do not run an unauthorized tick or move this assertion post-tick.
   // This scenario promises the starting balance on the newly armed surface.
-  // Journey gap: https://github.com/d4rk-pri0r/krellbot/issues/99
-  test.fail(true, "https://github.com/d4rk-pri0r/krellbot/issues/99");
   expect.soft(visible,"starting cash must be visible immediately after arming").toContain("2500");
   expect.soft(visible,"the armed surface must label its risk cap").toMatch(/(?:risk|cap)[^\n]*100|100[^\n]*(?:risk|cap)/i);
   const config=JSON.parse(readFileSync(join(journey.workstation.homeDir,"config.json"),"utf8"));
@@ -69,23 +67,22 @@ test("J5.3 As paper ticks run, the status shows position, cash, resting stop and
   const stops=state.open_orders.filter((o: Record<string,unknown>)=>o.stop_price!==undefined);
   expect(stops.length).toBeGreaterThan(0);
   // A blank "New resting stop" input is NOT disclosure of the current stop.
-  const displayed=(await page.getByTestId("paper-status-panel").innerText());
-  // Journey gap: https://github.com/d4rk-pri0r/krellbot/issues/100
-  test.fail(true, "https://github.com/d4rk-pri0r/krellbot/issues/100");
-  expect(displayed,"current resting stop must be shown, not merely editable").toContain(String(stops[0].stop_price));
+  const displayed=page.getByTestId("paper-status-panel").getByTestId("paper-resting-stop");
+  await expect(displayed,"current resting stop must be shown, not merely editable").toHaveText(/^Resting stop \d/);
+  // Compare by value: run/ keeps the stop quantized ("47.5000"); the details route serves it canonical ("47.5").
+  const shown=/^Resting stop (\d+(?:\.\d+)?)\b/.exec(await displayed.innerText())![1];
+  expect(Number(shown),"current resting stop must be shown at its persisted value").toBe(Number(stops[0].stop_price));
 });
 
 test("J5.4 The status shows when it last updated. If a read fails or the data goes stale, it says so instead of showing old numbers as current", async ({journey}) => {
   const page=journey.page; await armPaper(page); await clickNav(page,"Workstation");
   await expect(page.getByTestId("paper-position")).toBeVisible();
-  const statusText=(await page.getByTestId("paper-status-panel").locator(".kbot-paper-status__body p").allInnerTexts()).join("\n");
-  // Journey gap: https://github.com/d4rk-pri0r/krellbot/issues/101
-  test.fail(true, "https://github.com/d4rk-pri0r/krellbot/issues/101");
-  expect.soft(statusText,"ordinary paper status needs a visible last-updated/as-of time").toMatch(/(?:updated|as.of|checked).*(?:\d|just now)/i);
   await page.route("**/api/v1/paper/**",route=>route.abort("connectionreset"));
   await paperRefresh(page).click();
   const error=page.getByRole("alert").filter({hasText:/status refresh failed/i});
   await expect(error).toContainText(/refresh failed/i);
+  const statusText=(await page.getByTestId("paper-status-panel").locator(".kbot-paper-status__body p").allInnerTexts()).join("\n");
+  expect.soft(statusText,"ordinary paper status needs a visible last-updated/as-of time").toMatch(/(?:updated|as.of|checked).*(?:\d|just now)/i);
   // Retained values are acceptable only when explicitly labelled old.
   await expect(error).toContainText(/last confirmed state|stale|unavailable/i);
 });
