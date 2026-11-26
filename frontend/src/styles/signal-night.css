@@ -1,0 +1,131 @@
+/* The website's night palette mapped onto Signal's existing semantic roles.
+   Applying it to the document also themes portaled dialogs and the wizard. */
+:root[data-theme="signal-night"] {
+  --navy: #05070a;
+  --surface: #10171d;
+  --panel: #1b2a32;
+  --line: #36474e;
+  --text: #e6edf0;
+  --muted: #afbec6;
+  --seafoam: #5eead4;
+  --sage: #2dd4bf;
+  --action-primary-text: #04110f;
+  --ambient-violet: #8b5cf6;
+  --ambient-lilac: #c4b5fd;
+  --radius-panel: 14px;
+  --ambient-field:
+    radial-gradient(ellipse 56rem 34rem at 96% 0, rgb(45 212 191 / 15%), transparent 70%),
+    radial-gradient(ellipse 48rem 30rem at 0 10rem, rgb(139 92 246 / 13%), transparent 70%);
+  --panel-light: linear-gradient(135deg, rgb(94 234 212 / 5%), transparent 45%, rgb(139 92 246 / 4%));
+}
+
+[data-theme="signal-night"] body {
+  margin: 0;
+  background-color: var(--navy);
+}
+
+[data-theme="signal-night"] :is(.kbot-shell, .kbot-first-run-wizard) {
+  background: var(--ambient-field), var(--navy);
+}
+
+[data-theme="signal-night"] .kbot-shell__brandbar {
+  background: color-mix(in srgb, var(--navy) 86%, transparent);
+  border-bottom-color: color-mix(in srgb, var(--seafoam) 20%, transparent);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  backdrop-filter: blur(14px) saturate(140%);
+}
+
+[data-theme="signal-night"] .kbot-shell__nav-root .kbot-shell__nav-item--active {
+  color: var(--seafoam);
+  box-shadow: inset 0 -2px var(--seafoam), inset 0 -14px 18px -18px var(--seafoam);
+}
+
+[data-theme="signal-night"] :is(.app-home__hero, .app-home__welcome, .kbot-shell__pagehead) {
+  background:
+    linear-gradient(100deg, var(--surface) 15%, transparent 88%),
+    repeating-linear-gradient(90deg, transparent 0 39px, rgb(94 234 212 / 5%) 39px 40px),
+    repeating-linear-gradient(0deg, transparent 0 39px, rgb(94 234 212 / 5%) 39px 40px),
+    linear-gradient(120deg, var(--panel), #112e31 72%, #24213c);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  padding: clamp(14px, 1.8vw, 24px);
+}
+
+[data-theme="signal-night"] :is(.app-home__title, .kbot-shell__heading) {
+  font-size: clamp(1.65rem, 2.6vw, 2.4rem);
+  line-height: 1.12;
+  letter-spacing: -.04em;
+}
+
+@supports (background-clip: text) {
+  [data-theme="signal-night"] :is(.app-home__title, .kbot-shell__heading) {
+    width: fit-content;
+    background: linear-gradient(100deg, var(--text), var(--seafoam) 56%, var(--ambient-lilac));
+    background-clip: text;
+    color: transparent;
+  }
+}
+
+[data-theme="signal-night"] .kbot-shell__main > section,
+[data-theme="signal-night"] .kbot-shell__main > .kbot-disclosure,
+[data-theme="signal-night"] :is(.app-home__card, .kbot-palette__box, .kbot-jobs__dialog) {
+  background-image: var(--panel-light);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 4%), 0 8px 28px rgb(0 0 0 / 16%);
+}
+
+[data-theme="signal-night"] .kbot-first-run-wizard__chrome {
+  padding: clamp(16px, 3vw, 32px);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: var(--panel-light), var(--surface);
+  box-shadow: 0 20px 70px rgb(0 0 0 / 28%);
+  box-sizing: border-box;
+}
+
+[data-theme="signal-night"] .kbot-first-run-wizard__primary {
+  border-radius: 999px;
+  box-shadow: inset 0 1px rgb(255 255 255 / 35%), 0 5px 24px rgb(45 212 191 / 16%);
+}
+
+[data-theme="signal-night"] .app-home button.app-home__card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  justify-items: start;
+  white-space: normal;
+}
+
+[data-theme="signal-night"] .react-flow {
+  --xy-node-background-color: var(--panel);
+  --xy-node-color: var(--text);
+  --xy-node-border: 1px solid var(--line);
+  --xy-edge-stroke: var(--seafoam);
+  --xy-handle-background-color: var(--seafoam);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  [data-theme="signal-night"] .kbot-shell__pagehead {
+    animation: signal-page-enter var(--motion-duration-enter, 180ms) ease-out both;
+  }
+  [data-theme="signal-night"] :is(.app-home__card, .kbot-first-run-wizard__primary) {
+    transition: box-shadow 180ms ease, border-color 180ms ease;
+  }
+  @keyframes signal-page-enter {
+    from { opacity: .65; translate: 0 4px; }
+    to { opacity: 1; translate: 0; }
+  }
+}
+
+@media (hover: hover) {
+  [data-theme="signal-night"] .app-home__card:hover {
+    box-shadow: inset 0 1px 0 rgb(94 234 212 / 18%), 0 6px 24px rgb(45 212 191 / 9%);
+    border-color: var(--seafoam);
+  }
+}
+
+@media (forced-colors: active) {
+  [data-theme="signal-night"] :is(.app-home__title, .kbot-shell__heading) {
+    color: CanvasText;
+    background: none;
+  }
+}

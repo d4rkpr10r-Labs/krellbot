@@ -38,7 +38,6 @@ from decimal import Decimal
 from pathlib import Path
 
 from krellbot import config as kb_config
-from krellbot.storage.database import OperationalStore
 
 # ---- Result codes ---------------------------------------------------------
 
@@ -120,52 +119,53 @@ def would_over_reserve(
 
 
 def should_block_for_reconcile(home: Path) -> bool:
-    """Return True if any ``needs_reconcile`` ledger row exists.
+    """Return True if any intent anywhere is unresolved, or the store is unreadable.
 
-    The Outbox audits a ``needs_reconcile`` row when a paper send was
-    committed but the venue call did not complete (return state
-    ``"needs_reconcile"``). Until an operator reconciles from the
-    venue snapshot, tick must not submit a new entry on the same
-    venue. The block affects entries only — exits, ensure-stop, and
-    paid-expiry exits continue to run. The check reads the store, not
-    the legacy journal.
+    This is the home-wide view. The tick gates each arm with the scoped
+    ``ObligationsView.blocks_entries(venue=..., mode=...)`` from
+    :mod:`krellbot.execution.obligations`; both read the same durable
+    interpretation: ``sent: false`` Outbox intents and ``needs_reconcile``
+    markers without an ``intent_resolved`` row. Exits are never gated.
     """
-    store = OperationalStore(home / "ops.sqlite")
-    for _row_id, kind, _payload in store.read_ledger():
-        if kind == "needs_reconcile":
-            return True
-    return False
+    from krellbot.execution.obligations import read_obligations
+
+    view = read_obligations(home)
+    return not view.available or bool(view.unresolved)
 
 
 # ---- Flatten ownership rule -----------------------------------------------
 
 
-def _journal_owned_qty(home: Path, *, pack_id: str, pair: str) -> Decimal:
-    """Return the journal projection of owned qty for ``pack_id``/``pair``.
+def _journal_owned_qty(home: Path, *, pack_id: str, venue: str, pair: str, mode: str) -> Decimal | None:
+    """Return the attributable journal qty for one ownership identity.
 
-    Reads the legacy journal's ``kind=tick`` records and sums
-    ``entry_qty - exit_qty - stop_qty``. The reconcile module already
-    exposes this projection; we import the implementation locally to
-    avoid a cycle.
+    Returns ``None`` when journal history that may belong to the identity
+    cannot be attributed: ownership is then unknown, not zero. The reconcile
+    module owns the projection; it is imported locally to avoid a cycle.
     """
-    from krellbot.run.reconcile import _cumulative_owned_from_journal
+    from krellbot.run.reconcile import OwnershipIdentity, project_ownership
 
-    return _cumulative_owned_from_journal(home, pack_id=pack_id, pair=pair)
+    projection = project_ownership(
+        home,
+        OwnershipIdentity(pack_id=pack_id, venue=venue, pair=pair, mode=mode),
+    )
+    return None if projection.ambiguous else projection.attributable_qty
 
 
-def flatten_result(home: Path, *, pack_id: str, pair: str, qty: Decimal) -> str:
-    """Return the typed result of a flatten of ``qty`` for ``pack_id``.
+def flatten_result(home: Path, *, pack_id: str, venue: str, pair: str, mode: str, qty: Decimal) -> str:
+    """Return the typed result of a flatten of ``qty`` for one arm's identity.
 
-    Returns ``CODE_FLATTEN`` when the journal projection of owned qty
-    covers ``qty``. Returns ``CODE_FLATTEN_NOT_OWNED`` when the journal
-    says the pack owns less than ``qty`` — the venue's free balance for
-    the base asset may be larger (external holdings) and must not be
-    sold. ``qty`` of zero is treated as not-owned to make the test for
+    Returns ``CODE_FLATTEN`` when the journal projection of owned qty for
+    ``(pack_id, venue, pair, mode)`` covers ``qty``. Returns
+    ``CODE_FLATTEN_NOT_OWNED`` when it covers less, or when ambiguous history
+    leaves ownership unknown — the venue's free balance for the base asset
+    may be larger (external holdings or another venue's position) and must
+    not be sold. ``qty`` of zero is treated as not-owned to make the test for
     "do not sell external inventory" explicit.
     """
     if qty <= Decimal(0):
         return CODE_FLATTEN_NOT_OWNED
-    owned = _journal_owned_qty(home, pack_id=pack_id, pair=pair)
-    if owned >= Decimal(str(qty)):
+    owned = _journal_owned_qty(home, pack_id=pack_id, venue=venue, pair=pair, mode=mode)
+    if owned is not None and owned >= Decimal(str(qty)):
         return CODE_FLATTEN
     return CODE_FLATTEN_NOT_OWNED

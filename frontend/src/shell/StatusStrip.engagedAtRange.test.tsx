@@ -30,6 +30,7 @@ function live(over: Partial<LiveStatus> = {}): LiveStatus {
 
 function engagedLive(engagedAt: number): LiveStatus {
   return live({
+    release_policy: "paper_only",
     authorized: [{ venue: "kraken", pair: "BTC/USD" }],
     kill_switch: {
       engaged: true,
@@ -61,7 +62,7 @@ describe("StatusStrip engaged_at Date-range containment (issue 297)", () => {
       expect(kill.textContent ?? "").not.toMatch(/\d{4}-\d{2}-\d{2}/);
       expect(kill.textContent ?? "").not.toContain("UTC");
       // The strip still reflects mode, engagement and authorized venues.
-      expect(screen.getByLabelText("Mode Live").textContent).toBe("Live");
+      expect(screen.getByLabelText("Mode Paper").textContent).toBe("Paper");
       expect(screen.getByTestId("live-orders-status").textContent).toBe(
         "Kill switch: engaged — manual_engaged",
       );
@@ -85,7 +86,7 @@ describe("StatusStrip engaged_at Date-range containment (issue 297)", () => {
       expect(kill.querySelector(".kbot-status__kill-at")).toBeNull();
       expect(kill.textContent ?? "").not.toMatch(/\d{4}-\d{2}-\d{2}/);
       expect(kill.textContent ?? "").not.toContain("UTC");
-      expect(screen.getByLabelText("Mode Live").textContent).toBe("Live");
+      expect(screen.getByLabelText("Mode Paper").textContent).toBe("Paper");
       expect(screen.getByTestId("live-orders-status").textContent).toBe(
         "Kill switch: engaged — manual_engaged",
       );
@@ -115,7 +116,7 @@ describe("StatusStrip engaged_at Date-range containment (issue 297)", () => {
 
   it("leaves the healthy-control fixture's mode and venue reflection unchanged", () => {
     render(<StatusStrip live={engagedLive(1700000000)} />);
-    expect(screen.getByLabelText("Mode Live").textContent).toBe("Live");
+    expect(screen.getByLabelText("Mode Paper").textContent).toBe("Paper");
     expect(screen.getByTestId("live-orders-status").textContent).toBe(
       "Kill switch: engaged — manual_engaged",
     );

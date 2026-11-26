@@ -29,9 +29,10 @@ krellbot tick --venue kraken \
     --offline-candles tests/fixtures/candles/kraken_SUIUSD_1h_sample.csv
 ```
 
-The scheduler can fetch public candles for Kraken, Coinbase, and Binance
-spot. Binance uses the credential-free public klines endpoint and fetches
-instrument rules separately. Order simulation remains local. For paper
+The scheduler can fetch public candles for Kraken, Coinbase, Binance, and
+MEXC spot. Binance and MEXC use their credential-free public klines endpoints
+and fetch instrument rules separately. MEXC requests the `60m` interval for
+`1h` packs and returns at most 500 bars per tick. Order simulation remains local. For paper
 venues without a scheduled candle reader, the pinned CSV path is the
 verified end-to-end tick path.
 

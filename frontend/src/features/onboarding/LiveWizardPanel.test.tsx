@@ -152,13 +152,13 @@ describe("LiveWizardPanel", () => {
       /Grant on file: kraken XXBTZUSD/i,
     );
     expect(screen.getByTestId("live-wizard-grant").textContent).toMatch(
-      /not live order send/i,
+      /cannot start a strategy or place an order/i,
     );
     expect(screen.getByTestId("live-wizard-live-ready").textContent).toBe(
-      "Live-ready claim: no",
+      "This screen cannot arm a strategy for live trading.",
     );
     expect(screen.getByTestId("live-wizard-keys-local").textContent).toMatch(
-      /Keys leave this machine: no/,
+      /Keys sent to krellbot\.dev: no/,
     );
   });
 });

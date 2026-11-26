@@ -296,9 +296,7 @@ export function SettingsView({
                 Exchange keys
               </h2>
               <p className="kbot-settings__panel-note">
-                Optional trade-only keys stay in the OS keychain on this
-                computer and never leave your machine. Storing a key does not
-                enable live trading.
+                Paper trading needs no exchange key. If you add one, Krellbot checks its permissions with the exchange and stores it in your OS keychain. Storing a key does not enable live trading.
               </p>
             </header>
             <div className="kbot-settings__keys-grid">

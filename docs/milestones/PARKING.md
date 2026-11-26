@@ -22,3 +22,5 @@ One line per item. Nothing here is work until the owner moves it into a mileston
 - `GET /api/v1/catalogue` returns 502 when the transport fails instead of serving the verified cached catalogue.
 - Canonical-JSON + sha256 is reimplemented in six modules (`backtest/receipt.py`, `packs/launch_family.py`, `strategy_ir/canonical.py`, `strategy_ir/identity.py`, `application/packs.py`, `api/jobs.py`).
 - Paper fee tables are duplicated (`application/paper.py` `_PAPER_TAKER_BPS`, `venues/paper.py` constants, `application/research.py` `_default_fee`).
+- `run._recognized_open_qty` counts an open order's requested qty as owned and sums every matching entry/stop order; it is not proof of executed inventory.
+- `run.tick(home=X)` appends the journal under `$KRELLBOT_HOME` but reads ownership from `X/journal`; harmless while both are the same directory.

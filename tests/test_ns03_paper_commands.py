@@ -371,7 +371,7 @@ def test_pause_suppresses_new_entries_but_keeps_protection(home) -> None:
             "venue": "kraken",
             "pack": "trend-follow",
             "bar_ts": 1,
-            "detail": {"pair": "SUIUSD", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
+            "detail": {"pair": "SUIUSD", "mode": "paper", "entry_qty": "5", "exit_qty": "0", "stop_qty": "0"},
         }
     )
     config = load_config(home)

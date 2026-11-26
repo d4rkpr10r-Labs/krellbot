@@ -54,6 +54,29 @@ class Fill:
     qty: Decimal
     price: Decimal
     ts_ms: int
+    # Client order id of the resting order this fill executed, when the venue
+    # reports it (paper stop fills do). ``coid`` stays the fill's own id.
+    order_coid: str | None = None
+
+
+@dataclass(frozen=True)
+class OrderOutcome:
+    """What a venue can say about one client order id.
+
+    ``status`` is ``filled``, ``partial``, ``open``, ``absent`` or
+    ``unknown``. ``absent`` is only meaningful when ``authoritative`` is
+    true: the venue's record is complete, so no match proves the order never
+    executed. A missing match in a bounded open-order list or recent-fill
+    window is ``unknown``, never ``absent``.
+    """
+
+    status: str
+    filled_qty: Decimal = Decimal(0)
+    fill_ids: tuple[str, ...] = ()
+    authoritative: bool = False
+
+
+UNKNOWN_OUTCOME = OrderOutcome(status="unknown")
 
 
 @dataclass(frozen=True)
