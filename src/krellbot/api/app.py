@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hmac
 import json
+import re
 import sys
 import time
 import urllib.error
@@ -628,6 +629,177 @@ def _tick_refusal_code(record: dict) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
+
+
+# ---- diagnostic Operations section (M28.15) --------------------------------
+
+_DIAGNOSTIC_STORE_CODES = frozenset({"store_error", "store_busy", "store_corrupt", "store_full"})
+
+# The closed alert vocabulary of the diagnostic Operations section. Each kind
+# maps to the codes it may export; any other code exports as "other". ``None``
+# marks a kind whose code is an identifier or free text (a client order id, a
+# scheduler error message), so its code is never exported. ``live_refused`` is
+# left out on purpose: live events stay out until a privacy review (D20).
+_DIAGNOSTIC_ALERT_CODES: dict[str, frozenset[str] | None] = {
+    "kill_switch": frozenset({"kill_switch_engaged"}),
+    "restore_fence": frozenset({"restore_fence_engaged"}),
+    "store_fault": _DIAGNOSTIC_STORE_CODES,
+    "store_refused": _DIAGNOSTIC_STORE_CODES,
+    "intent_refused": _DIAGNOSTIC_STORE_CODES | {"ownership_ambiguous"},
+    "metadata_refusal": frozenset(
+        {"metadata_unavailable", "metadata_stale", "metadata_symbol_mismatch", "metadata_invalid", "minimum_not_met"}
+    ),
+    "scheduler_stale": frozenset({"tick_stale"}),
+    "feed_stale": frozenset({"candle_stale"}),
+    "needs_reconcile": None,
+    "unresolved_order_aging": None,
+    "tick_failure": None,
+}
+_DIAGNOSTIC_ALERT_ID = re.compile(r"[0-9a-f]{16}")
+_DIAGNOSTIC_PAIR = re.compile(r"[A-Z0-9-]{3,24}")
+_DIAGNOSTIC_PACK_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+_DIAGNOSTIC_PACK_VERSION = re.compile(r"[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}")
+_DIAGNOSTIC_ROW_LIMIT = 100
+_UNAVAILABLE = "unavailable"
+
+
+def _diagnostic_paper_scope(
+    armed: list[kb_config.ArmedPack], records: list[dict]
+) -> tuple[set[str], set[tuple[str, str]]]:
+    """Return the venues with a paper arm and the feeds with paper-only evidence.
+
+    A feed (venue, pair) is paper-only when a paper arm or a paper tick names
+    it and no other arm or tick does. Ticks without a mode prove nothing.
+    """
+
+    paper_feeds = {(record.venue, record.pair) for record in armed if record.mode == "paper"}
+    other_feeds = {(record.venue, record.pair) for record in armed if record.mode != "paper"}
+    for record in records:
+        venue = record.get("venue")
+        detail = record.get("detail")
+        if record.get("kind") != "tick" or not isinstance(venue, str) or not isinstance(detail, dict):
+            continue
+        pair = detail.get("pair")
+        mode = detail.get("mode")
+        if not isinstance(pair, str) or mode is None:
+            continue
+        (paper_feeds if mode == "paper" else other_feeds).add((venue, pair))
+    paper_venues = {record.venue for record in armed if record.mode == "paper"}
+    return paper_venues, paper_feeds - other_feeds
+
+
+def _diagnostic_alerts(home: Path, *, now: int, armed: list[kb_config.ArmedPack] | None) -> list[dict] | str:
+    """Project current alerts onto the closed diagnostic alert row.
+
+    An alert tied to a feed or venue is kept only when that feed has
+    paper-only evidence or the venue has a paper arm; without a readable
+    config no such alert is kept.
+    """
+
+    from krellbot import secrets as kb_secrets
+
+    try:
+        collected = alerts_app.collect(home, now=now)
+    except Exception:  # noqa: BLE001 — diagnostics must survive an unreadable source.
+        return _UNAVAILABLE
+    paper_venues, paper_feeds = _diagnostic_paper_scope(armed or [], _read_journal_records(home))
+    rows: list[dict] = []
+    for alert in collected:
+        if alert.kind not in _DIAGNOSTIC_ALERT_CODES:
+            continue
+        if alert.pair is not None or alert.venue is not None:
+            if armed is None or alert.venue not in kb_secrets.VENUES:
+                continue
+            if alert.pair is not None and (alert.venue, alert.pair) not in paper_feeds:
+                continue
+            if alert.pair is None and alert.venue not in paper_venues:
+                continue
+        if not isinstance(alert.id, str) or _DIAGNOSTIC_ALERT_ID.fullmatch(alert.id) is None:
+            continue
+        if alert.severity not in {"critical", "warning"}:
+            continue
+        numbers = (alert.count, alert.first_ts, alert.last_ts)
+        if any(type(value) is not int or value < 0 for value in numbers):
+            continue
+        allowed = _DIAGNOSTIC_ALERT_CODES[alert.kind]
+        if allowed is None or not alert.code:
+            code = None
+        else:
+            code = alert.code if alert.code in allowed else "other"
+        rows.append(
+            {
+                "id": alert.id,
+                "kind": alert.kind,
+                "severity": alert.severity,
+                "code": code,
+                "count": alert.count,
+                "first_ts": alert.first_ts,
+                "last_ts": alert.last_ts,
+            }
+        )
+    return rows[:_DIAGNOSTIC_ROW_LIMIT]
+
+
+def _diagnostic_unresolved_orders(home: Path, *, now: int) -> dict | str:
+    """Return how many orders await reconcile and their ages, oldest first."""
+
+    try:
+        rows = operations_view_app.list_unresolved_orders(home, now=now)
+    except Exception:  # noqa: BLE001 — a store failure reads "unavailable", never its text.
+        return _UNAVAILABLE
+    ages = []
+    for row in rows:
+        age = row.get("age_seconds")
+        ages.append(age if type(age) is int and age >= 0 else None)
+    return {"count": len(rows), "ages_seconds": ages[:_DIAGNOSTIC_ROW_LIMIT]}
+
+
+def _diagnostic_paper_runs(armed: list[kb_config.ArmedPack] | None) -> list[dict] | str:
+    """Return pack id, version and mode of every paper arm, per venue and pair."""
+
+    from krellbot import secrets as kb_secrets
+
+    if armed is None:
+        return _UNAVAILABLE
+    rows = []
+    for record in armed:
+        if record.mode != "paper" or record.venue not in kb_secrets.VENUES:
+            continue
+        if _DIAGNOSTIC_PAIR.fullmatch(record.pair) is None:
+            continue
+        rows.append(
+            {
+                "venue": record.venue,
+                "pair": record.pair,
+                "pack_id": record.pack_id if _DIAGNOSTIC_PACK_ID.fullmatch(record.pack_id) else None,
+                "pack_version": record.pack_version
+                if _DIAGNOSTIC_PACK_VERSION.fullmatch(record.pack_version)
+                else None,
+                "mode": "paper",
+            }
+        )
+    rows.sort(key=lambda row: (row["venue"], row["pair"]))
+    return rows[:_DIAGNOSTIC_ROW_LIMIT]
+
+
+def _diagnostic_operations_section(home: Path, *, now: int) -> dict:
+    """Build the allowlisted Operations section of a diagnostic report.
+
+    Only named fields with closed value sets are copied: no keys, balances,
+    quantities, paths, client order ids, free text or live events. Each part
+    that cannot be read is the string ``"unavailable"``.
+    """
+
+    try:
+        armed: list[kb_config.ArmedPack] | None = kb_config.load_config(home).armed
+    except Exception:  # noqa: BLE001 — an unreadable config reads "unavailable".
+        armed = None
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "alerts": _diagnostic_alerts(home, now=now, armed=armed),
+        "unresolved_orders": _diagnostic_unresolved_orders(home, now=now),
+        "paper_runs": _diagnostic_paper_runs(armed),
+    }
 
 
 def _paper_state_fills(home: Path, venue: str) -> list[dict]:
@@ -2970,6 +3142,23 @@ def create_app(
             "events": events[-100:],
             "reproduction_steps": "",
         }
+        return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/diagnostics/operations")
+    async def diagnostic_operations(request: Request) -> Response:
+        """Return the allowlisted Operations section of a diagnostic report (M28.15).
+
+        Same session gate as ``GET /api/v1/diagnostics/report``
+        (``_gate_get``). Served on its own route so the report's six keys
+        stay unchanged; the web app offers it as a separate, optional
+        download. Read-only: it never acknowledges or notifies an alert.
+        """
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+        body = await asyncio.to_thread(_diagnostic_operations_section, s.home, now=_now_seconds())
         return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/v1/scheduler/install")
