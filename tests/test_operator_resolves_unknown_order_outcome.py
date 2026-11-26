@@ -756,3 +756,31 @@ def test_resolve_command_keeps_the_session_csrf_origin_and_host_gate(home, gate)
     assert status == 403
     assert _writes(home) == before
     assert _held(home, mode="paper")
+
+
+def test_read_only_tailnet_session_cannot_resolve_an_order(home):
+    from krellbot.api.tailnet import write_remote_scope
+    from tests.test_tailnet_session_read_only_scope import _serve, _tailnet_session
+
+    _arm(home)
+    coid = _crash(home=home)
+    before = _writes(home)
+    command = {
+        "command": COMMAND,
+        "payload": {"client_order_id": coid, "outcome": "not_executed", "confirmation": coid},
+    }
+    served = home / "served"
+    served.mkdir()
+
+    with _serve(served, home, tailnet=True) as server:
+        status, _headers, raw = _tailnet_session(server).send("POST", "/api/v1/commands", command)
+        assert (status, json.loads(raw)["code"]) == (403, "remote_read_only")
+        assert _writes(home) == before
+        assert _held(home, mode="paper")
+
+        # Once a loopback session stores scope ``full``, the same request reaches the command.
+        write_remote_scope(home, "full")
+        status, _headers, raw = _tailnet_session(server).send("POST", "/api/v1/commands", command)
+
+    assert (status, json.loads(raw)["code"]) == (200, "order_resolved")
+    assert not _held(home, mode="paper")
