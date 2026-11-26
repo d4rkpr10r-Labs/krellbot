@@ -24,12 +24,39 @@ type LoadState =
 
 type EntriesSentence = "Entries active" | "Entries paused";
 
+/**
+ * One row's risk cap, read from `GET /api/v1/paper/details` for that exact
+ * (venue, pair). The closed `/api/v1/paper/armed` row never carries it.
+ */
+type RiskCapRead =
+  | { kind: "reading" }
+  | { kind: "read"; pct: string }
+  | { kind: "unavailable" };
+
+/** Cap reads belong to the list read they were started for, never a later one. */
+type RiskCaps = {
+  list: LoadState;
+  byKey: Record<string, RiskCapRead>;
+};
+
 function sentenceFor(entries_paused: boolean): EntriesSentence {
   return entries_paused ? "Entries paused" : "Entries active";
 }
 
 function rowKey(record: PaperArmedRecord): string {
   return `${record.venue}:${record.pair}`;
+}
+
+/**
+ * Paper entries are sized as this percent of the paper wallet's free quote
+ * cash at entry (run.tick's balance * cap rule), so the sentence names free
+ * cash. A missing value says 'unavailable' — never a guessed number.
+ */
+function riskCapSentence(read: RiskCapRead): string {
+  if (read.kind === "read") {
+    return `Risk cap ${read.pct}% of free cash per entry`;
+  }
+  return read.kind === "reading" ? "Risk cap: reading…" : "Risk cap unavailable";
 }
 
 /** Armed-run count chip copy: the real total read from the wire. */
@@ -67,8 +94,74 @@ export function ArmedRecordsList({
     typeof client === "object" &&
     client !== null &&
     typeof client.listArmed === "function";
+  const canReadDetails =
+    typeof client === "object" &&
+    client !== null &&
+    typeof client.getDetails === "function";
 
   const listGeneration = useRef(0);
+  const capGeneration = useRef(0);
+  const [riskCaps, setRiskCaps] = useState<RiskCaps | null>(null);
+
+  // Every list read re-reads each row's cap for its own (venue, pair). A
+  // late answer for a superseded list read is dropped, and a row never shows
+  // a cap read for another market.
+  useEffect(() => {
+    if (state.kind !== "ready") {
+      return;
+    }
+    const list = state;
+    const generation = ++capGeneration.current;
+    const byKey: Record<string, RiskCapRead> = {};
+    for (const row of list.records) {
+      byKey[rowKey(row)] = { kind: canReadDetails ? "reading" : "unavailable" };
+    }
+    setRiskCaps({ list, byKey });
+    const read = client.getDetails;
+    if (!canReadDetails || read === undefined) {
+      return;
+    }
+    const settle = (row: PaperArmedRecord, next: RiskCapRead): void => {
+      if (generation !== capGeneration.current) {
+        return;
+      }
+      setRiskCaps((current) =>
+        current === null || current.list !== list
+          ? current
+          : { list, byKey: { ...current.byKey, [rowKey(row)]: next } },
+      );
+    };
+    for (const row of list.records) {
+      read
+        .call(client, { venue: row.venue, pair: row.pair })
+        .then((details) => {
+          const pct =
+            details.armed === true &&
+            details.venue === row.venue &&
+            details.pair === row.pair &&
+            typeof details.risk_cap_pct === "string"
+              ? details.risk_cap_pct
+              : null;
+          settle(row, pct === null ? { kind: "unavailable" } : { kind: "read", pct });
+        })
+        .catch(() => {
+          settle(row, { kind: "unavailable" });
+        });
+    }
+    return () => {
+      capGeneration.current += 1;
+    };
+  }, [client, canReadDetails, state]);
+
+  const riskCapFor = (row: PaperArmedRecord): RiskCapRead => {
+    if (riskCaps !== null && riskCaps.list === state) {
+      const read = riskCaps.byKey[rowKey(row)];
+      if (read !== undefined) {
+        return read;
+      }
+    }
+    return { kind: canReadDetails ? "reading" : "unavailable" };
+  };
 
   useEffect(() => {
     if (!canListArmed) {
@@ -359,6 +452,7 @@ export function ArmedRecordsList({
                       <th scope="col">Mode</th>
                       <th scope="col">Pack</th>
                       <th scope="col">Entries</th>
+                      <th scope="col">Risk cap</th>
                       <th scope="col">
                         <span aria-hidden="true">Open</span>
                       </th>
@@ -400,6 +494,9 @@ export function ArmedRecordsList({
                             >
                               {sentenceFor(row.entries_paused)}
                             </span>
+                          </td>
+                          <td data-testid={`paper-armed-risk-cap-${row.venue}-${row.pair}`}>
+                            {riskCapSentence(riskCapFor(row))}
                           </td>
                           <td className="kbot-paper-armed__row-open">
                             <span aria-hidden="true">›</span>

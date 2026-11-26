@@ -110,6 +110,16 @@ function initialArmBalance(): string {
   return DEFAULT_PAPER_BALANCE;
 }
 
+/**
+ * The resting stop in force for one confirmed market, read from
+ * `GET /api/v1/paper/details?venue=&pair=`. `stop` is the server's decimal
+ * string or null when it could not read one; `readAtMs` is when this panel
+ * received it, so a retained value always says how old it is.
+ */
+type RestingStopRead =
+  | { kind: "read"; identity: string; stop: string | null; readAtMs: number }
+  | { kind: "unavailable"; identity: string };
+
 type PanelState = {
   status: PaperStatus | null;
   sentence: EntriesSentence;
@@ -123,6 +133,8 @@ type PanelState = {
   position: PaperPosition | null;
   /** Honest failure surface for a position read that did not decode. */
   positionError: string | null;
+  /** Resting stop read for the confirmed market; null = none read yet. */
+  restingStop: RestingStopRead | null;
 };
 
 const INITIAL_STATE: PanelState = {
@@ -135,6 +147,7 @@ const INITIAL_STATE: PanelState = {
   raiseStopEcho: null,
   position: null,
   positionError: null,
+  restingStop: null,
 };
 
 type PanelAction =
@@ -145,6 +158,7 @@ type PanelAction =
   | { type: "unknown-outcome"; message: string }
   | { type: "position"; position: PaperPosition }
   | { type: "position-failed"; message: string }
+  | { type: "resting-stop"; read: RestingStopRead }
   | {
       type: "command-ok";
       status: PaperStatus | null;
@@ -200,10 +214,11 @@ function commandLabel(command: CommandName | "arm"): string {
 }
 
 /**
- * The raise-stop read surface is closed-shape (no `stop` on status reads),
- * so the backend's success message — ``stop set: <venue> <pair> -> <new>``
- * — is the only in-tree source for the new resting stop. Mirror it verbatim;
- * the visible sentence quotes it rather than recomputing a value.
+ * The status read is closed-shape (no `stop` on status reads), so the
+ * backend's success message — ``stop set: <venue> <pair> -> <new>`` — is the
+ * immediate confirmation of a raised stop; the follow-up status read then
+ * re-reads the stop in force from `GET /api/v1/paper/details`. Mirror the
+ * message verbatim; the visible sentence quotes it rather than recomputing.
  */
 function raiseStopSentenceFromMessage(message: unknown): string | null {
   if (typeof message !== "string") {
@@ -278,6 +293,64 @@ function positionSentence(position: PaperPosition): string {
 }
 
 /**
+ * A confirmed status for the same market keeps the last stop read (it still
+ * says when it was read) until the re-read lands; any other market, or no
+ * armed market, drops it at once.
+ */
+function keptRestingStop(
+  next: PaperStatus | null,
+  current: RestingStopRead | null,
+): RestingStopRead | null {
+  if (current === null || next?.armed !== true) {
+    return null;
+  }
+  return marketIdentity(next) === current.identity ? current : null;
+}
+
+/**
+ * The resting stop line beside the Owned position sentence. The stop is
+ * quoted as `/api/v1/paper/details` serves it, in the pair's quote asset,
+ * with the time this panel read it. A missing value is 'unavailable'.
+ */
+function RestingStopLine({
+  read,
+  readable,
+  pair,
+}: {
+  read: RestingStopRead | null;
+  readable: boolean;
+  pair: string | undefined;
+}): JSX.Element {
+  if (read === null && readable) {
+    return (
+      <p className="kbot-paper-status__empty" data-testid="paper-resting-stop">
+        Reading resting stop…
+      </p>
+    );
+  }
+  if (read === null || read.kind === "unavailable") {
+    return (
+      <p className="kbot-paper-status__empty" data-testid="paper-resting-stop">
+        Resting stop unavailable
+      </p>
+    );
+  }
+  const quote = quoteAssetFromPair(pair);
+  const readAt = new Date(read.readAtMs);
+  return (
+    <p
+      className={read.stop !== null ? "kbot-paper-status__pack" : "kbot-paper-status__empty"}
+      data-testid="paper-resting-stop"
+    >
+      {read.stop !== null
+        ? `Resting stop ${read.stop}${quote !== "" ? ` ${quote}` : ""}`
+        : "Resting stop unavailable"}
+      , as of <time dateTime={readAt.toISOString()}>{readAt.toLocaleTimeString()}</time>
+    </p>
+  );
+}
+
+/**
  * POST ``paper.raise_stop`` with the same command envelope the paper client
  * uses, dispatched directly from the panel: deliberately not a PaperClient
  * method so this slice touches no client surface. Refusals arrive as
@@ -332,6 +405,7 @@ function reducer(state: PanelState, action: PanelAction): PanelState {
         sentence: next.armed ? sentenceFor(next.entries_paused) : state.sentence,
         position: keepPosition ? state.position : null,
         positionError: keepError ? state.positionError : null,
+        restingStop: keptRestingStop(next, state.restingStop),
       };
     }
     case "unavailable": {
@@ -344,7 +418,16 @@ function reducer(state: PanelState, action: PanelAction): PanelState {
         unknownOutcome: null,
         position: null,
         positionError: null,
+        restingStop: null,
       };
+    }
+    case "resting-stop": {
+      // A read started for another market than the one now confirmed is
+      // dropped: never another market's stop under this heading.
+      if (marketIdentity(state.status) !== action.read.identity) {
+        return state;
+      }
+      return { ...state, restingStop: action.read };
     }
     case "command-start": {
       return {
@@ -404,6 +487,7 @@ function reducer(state: PanelState, action: PanelAction): PanelState {
         raiseStopEcho: action.raiseStopEcho ?? state.raiseStopEcho,
         position: keepPosition ? state.position : null,
         positionError: keepError ? state.positionError : null,
+        restingStop: keptRestingStop(nextStatus, state.restingStop),
       };
     }
   }
@@ -950,6 +1034,59 @@ export function StatusPanel({
       positionEpochRef.current += 1;
     };
   }, [client, positionReadable, state.status, statusSelect]);
+
+  // The resting stop in force: one `GET /api/v1/paper/details` read for the
+  // confirmed venue and pair per confirmed armed status, never polling. The
+  // status and position bodies stay closed; a legacy client without the
+  // method keeps the honest unavailable line.
+  const detailsReadable =
+    typeof client === "object" &&
+    client !== null &&
+    typeof client.getDetails === "function";
+  const detailsEpochRef = useRef(0);
+  useEffect(() => {
+    const confirmed = state.status;
+    const read = client.getDetails;
+    if (!detailsReadable || read === undefined || confirmed?.armed !== true) {
+      return;
+    }
+    const identity = marketIdentity(confirmed);
+    const venue = confirmed.venue;
+    const pair = confirmed.pair;
+    if (identity === null || venue === undefined || pair === undefined) {
+      return;
+    }
+    const epoch = ++detailsEpochRef.current;
+    read
+      .call(client, { venue, pair })
+      .then((details) => {
+        if (epoch !== detailsEpochRef.current) {
+          return;
+        }
+        if (details.armed !== true || details.venue !== venue || details.pair !== pair) {
+          dispatch({ type: "resting-stop", read: { kind: "unavailable", identity } });
+          return;
+        }
+        dispatch({
+          type: "resting-stop",
+          read: {
+            kind: "read",
+            identity,
+            stop: typeof details.resting_stop === "string" ? details.resting_stop : null,
+            readAtMs: Date.now(),
+          },
+        });
+      })
+      .catch(() => {
+        if (epoch !== detailsEpochRef.current) {
+          return;
+        }
+        dispatch({ type: "resting-stop", read: { kind: "unavailable", identity } });
+      });
+    return () => {
+      detailsEpochRef.current += 1;
+    };
+  }, [client, detailsReadable, state.status]);
   const refreshStatus = async (): Promise<void> => {
     if (inFlightRef.current) {
       return;
@@ -1245,6 +1382,13 @@ export function StatusPanel({
                 Owned position unavailable
               </p>
             )}
+            {/* The resting stop in force, beside (never inside) the Owned
+                position sentence, read from `GET /api/v1/paper/details`. */}
+            <RestingStopLine
+              read={state.restingStop}
+              readable={detailsReadable}
+              pair={state.status?.pair}
+            />
             {/* P&L + position (or mark) series from journal/export APIs.
                 One read per armed mount / armEpoch bump; fakes in tests. */}
             <PaperPnlPositionChart
@@ -1307,11 +1451,11 @@ export function StatusPanel({
               </button>
             </div>
             {/* Raise the resting stop. Mounted only in the armed paper
-                branch: the closed-shape status read never carries the
-                current stop, so there is nothing to prefill and no
-                below-current check client-side — the backend's
-                invalid_stop refusal is the single validator. Kept
-                visible as contextual detail next to pause/disarm. */}
+                branch. The current stop is shown read-only above
+                (paper-resting-stop); the input is never prefilled and
+                there is no below-current check client-side — the
+                backend's invalid_stop refusal is the single validator.
+                Kept visible as contextual detail next to pause/disarm. */}
             <div
               className="kbot-paper-status__raise-stop"
               data-testid="paper-raise-stop"
