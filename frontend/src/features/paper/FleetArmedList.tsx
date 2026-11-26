@@ -1,4 +1,12 @@
-import { useEffect, useId, useRef, useState, type JSX, type KeyboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type JSX,
+  type KeyboardEvent,
+} from "react";
 import "./FleetArmedList.signal.css";
 import { UnresolvedOrdersList } from "../operations/UnresolvedOrdersList";
 import type { OperationsClient } from "../operations/client";
@@ -6,6 +14,8 @@ import { PAUSE_NEW_BUYS_DISCLOSURE, STOP_RUN_DISCLOSURE } from "./stopRunDisclos
 import type {
   FleetArmedClient,
   FleetArmedDeployment,
+  FleetFeedFreshness,
+  FleetFreshnessClient,
   PaperClient,
   PaperCommandResult,
 } from "./client";
@@ -19,7 +29,13 @@ export type FleetArmedCommands = Pick<
 >;
 
 export type FleetArmedListProps = {
-  client: FleetArmedClient & Partial<FleetArmedCommands>;
+  /**
+   * ``listFleetFreshness`` is optional: without it every row's candle age
+   * reads "unavailable" rather than a guessed freshness.
+   */
+  client: FleetArmedClient &
+    Partial<FleetArmedCommands> &
+    Partial<FleetFreshnessClient>;
   /** Optional navigate hook used by the shell for in-app deep links. */
   onOpenDetail?: (href: string, venue: string, pair: string) => void;
   /**
@@ -49,10 +65,87 @@ type LoadState =
     }
   | { kind: "unavailable" };
 
+/** Candle evidence per feed, keyed by ``feedKey``; joined client-side. */
+type FreshnessState =
+  | { kind: "loading" }
+  | { kind: "ready"; byFeed: Map<string, FleetFeedFreshness> }
+  | { kind: "unavailable" };
+
 type RowActionKind = "pause" | "resume" | "disarm";
 
 function rowKey(row: FleetArmedDeployment): string {
   return `${row.venue}:${row.pair}`;
+}
+
+/** The fleet row and its feed's freshness row share venue, pack and pair. */
+function feedKey(row: { venue: string; pack_id: string; pair: string }): string {
+  return JSON.stringify([row.venue, row.pack_id, row.pair]);
+}
+
+/** Whole-unit age of a candle, e.g. "45m", "1h 1m", "2d 1h". */
+function formatCandleAge(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  if (total < 60) {
+    return `${total}s`;
+  }
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) {
+    return `${minutes}m`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) {
+    const rest = minutes % 60;
+    return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`;
+  }
+  const days = Math.floor(hours / 24);
+  const rest = hours % 24;
+  return rest === 0 ? `${days}d` : `${days}d ${rest}h`;
+}
+
+/**
+ * The age is measured when the latest tick read the candle. Missing
+ * evidence says "unavailable"; a verdict is shown only beside an age or
+ * when the feed reported one.
+ */
+function CandleAgeCell({
+  freshness,
+  feed,
+}: {
+  freshness: FreshnessState;
+  feed: FleetFeedFreshness | undefined;
+}): JSX.Element {
+  if (freshness.kind === "loading") {
+    return (
+      <span className="kbot-fleet__tick-result" data-testid="fleet-armed-candle-age">
+        Loading…
+      </span>
+    );
+  }
+  const age = feed?.candle_age_s ?? null;
+  const stale = feed?.candle_stale ?? null;
+  return (
+    <>
+      <span className="kbot-fleet__tick-result" data-testid="fleet-armed-candle-age">
+        {age !== null ? `${formatCandleAge(age)} old at last check` : "unavailable"}
+      </span>
+      {stale === true ? (
+        <span
+          className="kbot-fleet__chip kbot-fleet__chip--coral"
+          data-testid="fleet-armed-candle-state"
+        >
+          Stale
+        </span>
+      ) : stale === false ? (
+        <span className="kbot-fleet__mode" data-testid="fleet-armed-candle-state">
+          Fresh
+        </span>
+      ) : age !== null ? (
+        <span className="kbot-fleet__mode" data-testid="fleet-armed-candle-state">
+          Freshness unavailable
+        </span>
+      ) : null}
+    </>
+  );
 }
 
 function fleetCountLabel(count: number): string {
@@ -123,6 +216,48 @@ export function FleetArmedList({
     unresolvedClient !== null &&
     typeof unresolvedClient.listUnresolvedOrders === "function";
 
+  const [freshness, setFreshness] = useState<FreshnessState>({ kind: "loading" });
+  /** Only the latest freshness read may land; bumped on unmount too. */
+  const freshnessReadRef = useRef(0);
+
+  const loadFreshness = useCallback((): void => {
+    const read = freshnessReadRef.current + 1;
+    freshnessReadRef.current = read;
+    if (
+      typeof client !== "object" ||
+      client === null ||
+      typeof client.listFleetFreshness !== "function"
+    ) {
+      setFreshness({ kind: "unavailable" });
+      return;
+    }
+    client.listFleetFreshness().then(
+      (view) => {
+        if (freshnessReadRef.current !== read) {
+          return;
+        }
+        const byFeed = new Map<string, FleetFeedFreshness>();
+        for (const feed of view.feeds) {
+          byFeed.set(feedKey(feed), feed);
+        }
+        setFreshness({ kind: "ready", byFeed });
+      },
+      () => {
+        // A failed read never keeps an earlier verdict on screen.
+        if (freshnessReadRef.current === read) {
+          setFreshness({ kind: "unavailable" });
+        }
+      },
+    );
+  }, [client]);
+
+  useEffect(() => {
+    loadFreshness();
+    return () => {
+      freshnessReadRef.current += 1;
+    };
+  }, [loadFreshness]);
+
   useEffect(() => {
     if (!canListFleet) {
       setState({ kind: "unavailable" });
@@ -190,6 +325,7 @@ export function FleetArmedList({
     if (!canListFleet) {
       return;
     }
+    loadFreshness();
     let cancelled = false;
     client
       .listFleet()
@@ -228,7 +364,7 @@ export function FleetArmedList({
     return () => {
       cancelled = true;
     };
-  }, [refreshKey, client, canListFleet, unresolvedClient]);
+  }, [refreshKey, client, canListFleet, unresolvedClient, loadFreshness]);
 
   // Keep selection truthful after a refresh: drop it when the arm is gone,
   // otherwise refresh the selected snapshot from the new list.
@@ -272,6 +408,7 @@ export function FleetArmedList({
       return;
     }
     setInFlight(true);
+    loadFreshness();
     try {
       const view = await client.listFleet();
       applyReadyView(view);
@@ -470,6 +607,7 @@ export function FleetArmedList({
                     <th scope="col">Pack</th>
                     <th scope="col">Entries</th>
                     <th scope="col">Last tick</th>
+                    <th scope="col">Candle age</th>
                     <th scope="col">Result</th>
                     <th scope="col">Detail</th>
                     {canMutate ? <th scope="col">Actions</th> : null}
@@ -532,6 +670,16 @@ export function FleetArmedList({
                           >
                             {formatTickTime(row.last_tick_ts_ms)}
                           </time>
+                        </td>
+                        <td>
+                          <CandleAgeCell
+                            freshness={freshness}
+                            feed={
+                              freshness.kind === "ready"
+                                ? freshness.byFeed.get(feedKey(row))
+                                : undefined
+                            }
+                          />
                         </td>
                         <td>
                           <span
