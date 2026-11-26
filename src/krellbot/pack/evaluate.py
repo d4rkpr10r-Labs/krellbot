@@ -63,9 +63,10 @@ def stop_price(pack: dict, candles: list[Candle]) -> Decimal | None:
     if not isinstance(stop, dict) or stop.get("type") not in ("pct", "atr"):
         return None
     try:
-        return _stop_at(stop, candles, _atr_series(stop, candles), len(candles) - 1)
+        price = _stop_at(stop, candles, _atr_series(stop, candles), len(candles) - 1)
     except (KeyError, TypeError, ValueError, ArithmeticError):
         return None
+    return price if price is not None and price.is_finite() else None
 
 
 def _atr_series(stop: dict, candles: list[Candle]) -> list[float | None] | None:

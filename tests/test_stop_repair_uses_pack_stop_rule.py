@@ -9,11 +9,14 @@ the arm recorded for the position: the ``stop`` of the position's committed
 entry intent in ``ops.sqlite``, which survives restarts.
 
 When the rule gives no price (too few candles for the ATR, a stop rule the
-engine cannot read), nothing is placed and nothing is sold. The tick journals
-``stop_price_unavailable`` and Operations shows one critical
-``stop_price_unavailable`` alert per arm. Repeated ticks extend that one
-occurrence: it notifies once, an acknowledgement holds, and it clears on the
-first tick that reads a bar without the flag.
+engine cannot read), nothing is guessed and nothing is sold. The stop
+recorded at entry is re-placed; with no recorded stop either, no stop is
+placed. Either way the tick journals ``stop_price_unavailable`` and
+Operations shows one critical ``stop_price_unavailable`` alert per pair.
+Repeated ticks extend that one occurrence: it notifies once and an
+acknowledgement holds. It ends on the first tick that reads a bar without
+the flag but stays listed until acknowledged; only a new occurrence notifies
+again.
 
 Paper venue and fake notifier only. No exchange, key or network is touched.
 The candles are fixtures, not market data, and nothing here describes
@@ -28,6 +31,7 @@ from pathlib import Path
 
 import pytest
 
+from krellbot import journal as kb_journal
 from krellbot import notifications as kb_notifications
 from krellbot import run
 from krellbot.application import alerts
@@ -216,24 +220,120 @@ def test_repaired_atr_stop_is_never_below_the_recorded_entry_stop(home):
     assert "stop_price_unavailable" not in _ticks(home)[-1]["detail"]
 
 
-# ---- no computable price: no stop, a journal flag, one critical alert -------
+# ---- no rule price: the recorded stop or none, a journal flag, one alert -----
 
 
-def test_too_few_candles_place_no_stop_and_raise_one_critical_alert(home):
+class _Alerts:
+    """Operations polling ``collect`` and notifying through a fake notifier."""
+
+    def __init__(self, home: Path) -> None:
+        self.home = home
+        self.notifier = kb_notifications.FakeNotifier()
+        kb_notifications.update_settings(home, {"desktop_enabled": True})
+
+    def poll(self, now: int, *, times: int = 1) -> list[alerts.Alert]:
+        for _ in range(times):
+            collected = alerts.collect(self.home, now=now)
+            kb_notifications.maybe_notify(self.home, collected, notifier=self.notifier, now=now)
+        return [a for a in collected if a.kind == "stop_price_unavailable"]
+
+    def sent(self) -> list[dict[str, str]]:
+        return [row for row in self.notifier.sent if row["title"].endswith(": stop_price_unavailable")]
+
+
+def test_no_rule_price_re_places_the_recorded_stop_and_raises_one_critical_alert(home):
     feed = _Feed(ENTRY_BARS)
     venue = _enter_then_lose_stop(home, _cross_pack(ATR_STOP), feed)
     owned = venue.owned_qty(PAIR)
-    kb_notifications.update_settings(home, {"desktop_enabled": True})
-    notifier = kb_notifications.FakeNotifier()
-
-    def poll(now: int) -> list[alerts.Alert]:
-        collected = alerts.collect(home, now=now)
-        kb_notifications.maybe_notify(home, collected, notifier=notifier, now=now)
-        return [a for a in collected if a.kind == "stop_price_unavailable"]
+    ops = _Alerts(home)
 
     first_ts = None
     for i in (3, 4):
-        # The feed returns a single bar: ATR(2) has no value on it.
+        # The stop is missing again and the feed returns a single bar, on
+        # which ATR(2) has no value: the rule gives no price.
+        venue.cancel_stops(PAIR)
+        feed.candles = [_candle(i, "13")]
+        assert _tick(home, venue, feed) == 0
+
+        assert venue.resting_stop(PAIR) == _quantized(RECORDED_STOP)
+        assert venue.owned_qty(PAIR) == owned
+        assert _sells(venue) == []
+        record = _ticks(home)[-1]
+        assert record["bar_ts"] == i * H
+        assert record["detail"]["stop_price_unavailable"] is True
+        assert record["detail"]["ensure_stop_failed"] is False
+        assert record["detail"]["owned_qty_after"] == str(owned)
+        if first_ts is None:
+            first_ts = record["ts"]
+
+        # Operations polls repeatedly between ticks.
+        (alert,) = ops.poll(int(feed.now()), times=3)
+        assert alert.severity == alerts.SEVERITY_CRITICAL
+        assert (alert.venue, alert.pair) == (VENUE, PAIR)
+        assert alert.first_ts == first_ts
+        assert alert.last_ts == record["ts"]
+        assert alert.count == i - 2
+        assert alert.acknowledged is False
+
+    # One occurrence across both ticks and every poll: one notification.
+    assert len(ops.sent()) == 1
+    assert ops.sent()[0]["title"] == "Krellbot critical: stop_price_unavailable"
+
+    # An acknowledgement holds while the same occurrence continues.
+    alerts.acknowledge(home, alert.id, now=int(feed.now()))
+    venue.cancel_stops(PAIR)
+    feed.candles = [_candle(5, "13")]
+    assert _tick(home, venue, feed) == 0
+    assert _ticks(home)[-1]["detail"]["stop_price_unavailable"] is True
+    (held,) = ops.poll(int(feed.now()))
+    assert (held.acknowledged, held.count, held.first_ts) == (True, 3, first_ts)
+    assert len(ops.sent()) == 1
+
+    # The re-placed stop rests, so the next tick repairs nothing and the
+    # occurrence ends. The alert stays listed, acknowledged, until a new one.
+    feed.candles = [_candle(6, "13")]
+    assert _tick(home, venue, feed) == 0
+    assert "stop_price_unavailable" not in _ticks(home)[-1]["detail"]
+    (ended,) = ops.poll(int(feed.now()))
+    assert (ended.acknowledged, ended.count, ended.first_ts) == (True, 3, first_ts)
+
+    # The stop goes missing again with no rule price: a new occurrence, one
+    # more notification.
+    venue.cancel_stops(PAIR)
+    feed.candles = [_candle(7, "13")]
+    assert _tick(home, venue, feed) == 0
+    (again,) = ops.poll(int(feed.now()), times=3)
+    assert again.first_ts == _ticks(home)[-1]["ts"] > first_ts
+    assert (again.acknowledged, again.count) == (False, 1)
+    assert venue.resting_stop(PAIR) == _quantized(RECORDED_STOP)
+    assert len(ops.sent()) == 2
+
+
+def test_no_rule_price_and_no_recorded_stop_place_no_stop_and_raise_one_critical_alert(home):
+    pack = _cross_pack(ATR_STOP)
+    _arm(home, pack)
+    feed = _Feed(ENTRY_BARS)
+    venue = _venue(home, feed)
+    # A position the journal records whose entry intent is not in the Outbox,
+    # so no stop is recorded for it.
+    venue.place_entry_with_stop("entry-before-the-outbox", Decimal(50), Decimal(8), pair=PAIR)
+    venue.cancel_stops(PAIR)
+    kb_journal.append(
+        {
+            "ts": int(feed.now()),
+            "kind": "tick",
+            "venue": VENUE,
+            "pack": pack["id"],
+            "bar_ts": 2 * H,
+            "detail": {"pair": PAIR, "mode": "paper", "entry_qty": "50", "exit_qty": "0", "stop_qty": "0"},
+        }
+    )
+    owned = venue.owned_qty(PAIR)
+    assert owned == Decimal(50)
+    ops = _Alerts(home)
+
+    first_ts = None
+    for i in (3, 4):
         feed.candles = [_candle(i, "13")]
         assert _tick(home, venue, feed) == 0
 
@@ -241,46 +341,28 @@ def test_too_few_candles_place_no_stop_and_raise_one_critical_alert(home):
         assert venue.owned_qty(PAIR) == owned
         assert _sells(venue) == []
         record = _ticks(home)[-1]
-        assert record["bar_ts"] == i * H
         assert record["detail"]["stop_price_unavailable"] is True
         assert record["detail"]["ensure_stop_failed"] is True
         assert record["detail"]["owned_qty_after"] == str(owned)
         if first_ts is None:
             first_ts = record["ts"]
-
-        # Operations polls repeatedly between ticks.
-        for _ in range(3):
-            raised = poll(int(feed.now()))
-        assert len(raised) == 1
-        alert = raised[0]
+        (alert,) = ops.poll(int(feed.now()), times=3)
         assert alert.severity == alerts.SEVERITY_CRITICAL
-        assert (alert.venue, alert.pair) == (VENUE, PAIR)
-        assert alert.first_ts == first_ts
-        assert alert.last_ts == record["ts"]
-        assert alert.count == i - 2
+        assert (alert.first_ts, alert.count) == (first_ts, i - 2)
+    assert len(ops.sent()) == 1
 
-    # One occurrence across both ticks and every poll: one notification.
-    sent = [row for row in notifier.sent if row["title"].endswith(": stop_price_unavailable")]
-    assert len(sent) == 1
-    assert sent[0]["title"] == "Krellbot critical: stop_price_unavailable"
-
-    # An acknowledgement holds while the same occurrence continues.
-    alerts.acknowledge(home, alert.id, now=int(feed.now()))
-    feed.candles = [_candle(5, "13")]
+    # With enough candles the rule prices the stop (nothing recorded to floor
+    # it). The occurrence ends; the alert stays listed until acknowledged.
+    feed.candles = [*ENTRY_BARS, *(_candle(i, "13") for i in range(3, 7))]
     assert _tick(home, venue, feed) == 0
-    assert _ticks(home)[-1]["detail"]["stop_price_unavailable"] is True
-    (held,) = poll(int(feed.now()))
-    assert held.acknowledged is True
-    assert held.count == 3
-    assert len([row for row in notifier.sent if row["title"].endswith(": stop_price_unavailable")]) == 1
-
-    # With enough candles the rule prices the stop again and the alert clears.
-    feed.candles = [*ENTRY_BARS, _candle(3, "13"), _candle(4, "13"), _candle(5, "13"), _candle(6, "13")]
-    assert _tick(home, venue, feed) == 0
-    expected = max(_atr_rule(feed.candles, length=2, mult=Decimal("1.5")), RECORDED_STOP)
-    assert venue.resting_stop(PAIR) == _quantized(expected)
+    assert venue.resting_stop(PAIR) == _quantized(_atr_rule(feed.candles, length=2, mult=Decimal("1.5")))
     assert "stop_price_unavailable" not in _ticks(home)[-1]["detail"]
-    assert poll(int(feed.now())) == []
+    (ended,) = ops.poll(int(feed.now()))
+    assert (ended.acknowledged, ended.first_ts, ended.count) == (False, first_ts, 2)
+    assert len(ops.sent()) == 1
+    alerts.acknowledge(home, ended.id, now=int(feed.now()))
+    (retired,) = ops.poll(int(feed.now()))
+    assert retired.acknowledged is True
 
 
 @pytest.mark.parametrize(
@@ -293,7 +375,7 @@ def test_too_few_candles_place_no_stop_and_raise_one_critical_alert(home):
     ],
     ids=["unknown-type", "atr-without-mult", "atr-mult-not-a-number", "no-stop-block"],
 )
-def test_an_unreadable_stop_rule_places_no_stop(home, unreadable):
+def test_an_unreadable_stop_rule_re_places_the_recorded_stop_and_alerts(home, unreadable):
     feed = _Feed(ENTRY_BARS)
     pack = _cross_pack(ATR_STOP)
     venue = _enter_then_lose_stop(home, pack, feed)
@@ -308,12 +390,12 @@ def test_an_unreadable_stop_rule_places_no_stop(home, unreadable):
     assert indicators.compute(feed.candles, {"fn": "atr", "len": 2})[-1] is not None
     assert _tick(home, venue, feed) == 0
 
-    assert venue.resting_stop(PAIR) is None
+    assert venue.resting_stop(PAIR) == _quantized(RECORDED_STOP)
     assert venue.owned_qty(PAIR) == owned
     assert _sells(venue) == []
     detail = _ticks(home)[-1]["detail"]
     assert detail["stop_price_unavailable"] is True
-    assert detail["ensure_stop_failed"] is True
+    assert detail["ensure_stop_failed"] is False
     (alert,) = _stop_alerts(home, now=int(feed.now()))
     assert alert.severity == alerts.SEVERITY_CRITICAL
 

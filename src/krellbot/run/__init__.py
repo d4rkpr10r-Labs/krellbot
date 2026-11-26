@@ -7,10 +7,11 @@
     3. Snapshots the venue.
     4. For each armed pack on the venue: ensure a resting stop if owned > 0
        (the venue's ``place_stop``), priced by the pack's own stop rule
-       (``_stop_price``). When that rule gives no price, no stop is placed
-       and the tick journals ``stop_price_unavailable``. If the venue refuses
-       the stop or has no ``place_stop``, market-exit the owned qty in the
-       same tick, journaling only what the venue shows executed.
+       (``_stop_price``). When that rule gives no price, the stop recorded at
+       entry is re-placed (no stop when none is recorded) and the tick
+       journals ``stop_price_unavailable``. If the venue refuses the stop or
+       has no ``place_stop``, market-exit the owned qty in the same tick,
+       journaling only what the venue shows executed.
     5. Acts on the latest closed bar only. Missed bars are coalesced by
        feeding every candle up to and including the latest into evaluate.run
        so indicator state includes them.
@@ -715,13 +716,19 @@ def tick(
                     try:
                         # The pack's own stop rule over this tick's candles, never
                         # below the stop recorded with the position's entry.
-                        repair = _stop_price(pack, candles, home=home, identity=identity)
-                        if repair is None:
-                            # No price can be computed. Nothing is guessed and
-                            # nothing is sold: the tick journals the gap and
-                            # Operations raises a critical alert.
-                            print("ensure_stop failed: the pack's stop rule gives no price", flush=True)
+                        repair, rule_priced = _stop_price(pack, candles, home=home, identity=identity)
+                        if not rule_priced:
+                            # The rule gives no price. Nothing is guessed and
+                            # nothing is sold: the stop recorded at entry is
+                            # re-placed when there is one, the tick journals the
+                            # gap and Operations raises a critical alert.
                             stop_price_unavailable = True
+                            print(
+                                "ensure_stop: the pack's stop rule gives no price; "
+                                + ("re-placing the stop recorded at entry" if repair is not None else "no stop placed"),
+                                flush=True,
+                            )
+                        if repair is None:
                             ensure_stop_failed = True
                         else:
                             stop_body = json.dumps(
@@ -1781,31 +1788,32 @@ def _recognized_open_qty(armed: kb_config.ArmedPack, venue: str, candles: list, 
     return max(resting.values(), default=Decimal(0))
 
 
-def _stop_price(pack: dict, candles: list, *, home: Path, identity: OwnershipIdentity) -> Decimal | None:
-    """The price a missing stop is re-placed at, or ``None`` when there is none.
+def _stop_price(pack: dict, candles: list, *, home: Path, identity: OwnershipIdentity) -> tuple[Decimal | None, bool]:
+    """The price a missing stop is re-placed at, and whether the pack's rule priced it.
 
     A percentage stop is re-placed ``pct`` below the latest close, as before.
     Every other stop uses the rule the entry uses, ``pack/evaluate.stop_price``
     over the tick's candles (an ATR stop: the latest close minus ``mult`` x
     ATR), and is never placed below the stop the arm recorded for the position
-    (``_recorded_entry_stop``). When the rule gives no price (too few candles
-    for the ATR, a stop rule the engine cannot read) or only a non-positive
-    one, this is ``None`` and no stop is placed: a stop is never guessed.
-    ``StoreError`` from reading the recorded stop propagates.
+    (``_recorded_entry_stop``).
+
+    When the rule gives no positive price (too few candles for the ATR, a stop
+    rule the engine cannot read), the second value is False and the price is
+    the recorded stop, or ``None`` when none is recorded either: then no stop
+    is placed. A stop is never guessed. ``StoreError`` from reading the
+    recorded stop propagates.
     """
     stop = (pack.get("risk") or {}).get("stop") or {}
     if stop.get("type") == "pct":
         last_close = Decimal(str(candles[-1].close))
-        return last_close * (Decimal(1) - Decimal(str(stop["pct"])) / Decimal(100))
-    price = kb_evaluate.stop_price(pack, candles)
-    if price is None:
-        return None
+        return last_close * (Decimal(1) - Decimal(str(stop["pct"])) / Decimal(100)), True
+    rule = kb_evaluate.stop_price(pack, candles)
     recorded = _recorded_entry_stop(home, identity)
-    if recorded is not None and price < recorded:
-        price = recorded
-    if not price.is_finite() or price <= 0:
-        return None
-    return price
+    if rule is not None and recorded is not None and rule < recorded:
+        rule = recorded
+    if rule is not None and rule > 0:
+        return rule, True
+    return recorded, False
 
 
 def _recorded_entry_stop(home: Path, identity: OwnershipIdentity) -> Decimal | None:

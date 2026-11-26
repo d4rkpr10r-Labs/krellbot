@@ -28,10 +28,11 @@ Sources (all read-only):
      older than two timeframes ⇒ ``feed_stale``. The rule
      (:func:`candle_is_fresh`) is the one ``/api/v1/paper/health`` and
      ``/api/v1/paper/fleet/freshness`` use.
-  8. Stop repair without a price (M28.29): journal ticks that carry
+  8. Stop repair without a rule price (M28.29): journal ticks that carry
      ``stop_price_unavailable`` (an owned position had no resting stop and
-     the pack's stop rule gave no price, so none was placed) ⇒ one critical
-     ``stop_price_unavailable`` alert per (venue, pair).
+     the pack's stop rule gave no price, so the stop recorded at entry was
+     re-placed, or none) ⇒ one critical ``stop_price_unavailable`` alert per
+     (venue, pair), listed until acknowledged.
 
 Alerts are deduped, severity-sorted (critical first), and ordered by
 ``last_ts`` descending inside each severity band. Acknowledgements
@@ -814,19 +815,24 @@ def _collect_feed_stale(home: Path) -> list[Alert]:
 
 
 def _collect_stop_price_unavailable(home: Path) -> list[Alert]:
-    """Raise a critical alert for each pair whose missing stop has no price.
+    """Raise a critical alert for each pair whose stop repair had no rule price.
 
     ``run.tick`` journals ``stop_price_unavailable`` when a position it owns
     has no resting stop and the pack's stop rule gives no price on the tick's
-    candles, so no stop was placed. One occurrence runs from the first such
-    tick of a (venue, pair) until a later tick of that pair reads a bar
-    without the flag (a stop rests or was placed, or nothing is owned). A
-    tick that read no bar, and a record that accounts a reconciled intent,
-    neither starts nor ends it. ``first_ts`` dates the occurrence, so
-    repeated ticks notify once and an ack holds until it clears and recurs.
+    candles; it then re-placed the stop recorded at entry, or no stop when
+    none was recorded. One occurrence runs from the first such tick of a
+    (venue, pair) until a later tick of that pair reads a bar without the
+    flag (a stop rests or was priced, or nothing is owned). A tick that read
+    no bar, and a record that accounts a reconciled intent, neither starts
+    nor ends it. The pair's latest occurrence stays listed after it ends,
+    because a re-placed recorded stop ends it on the next tick and a critical
+    alert must not vanish unseen; an ack retires it. ``first_ts`` dates the
+    occurrence, so repeated ticks notify once, an ack holds, and only a new
+    occurrence notifies again.
     """
 
-    open_occurrences: dict[tuple[str, str], dict[str, int]] = {}
+    latest: dict[tuple[str, str], dict[str, int]] = {}
+    ended: set[tuple[str, str]] = set()
     for record in _read_journal_dicts(home):
         ts = record.get("ts")
         venue = record.get("venue")
@@ -840,11 +846,14 @@ def _collect_stop_price_unavailable(home: Path) -> list[Alert]:
             continue
         key = (venue, pair)
         if detail.get(STOP_PRICE_UNAVAILABLE_KEY) is True:
-            occurrence = open_occurrences.setdefault(key, {"first_ts": ts, "last_ts": ts, "count": 0})
+            if key in ended or key not in latest:
+                ended.discard(key)
+                latest[key] = {"first_ts": ts, "last_ts": ts, "count": 0}
+            occurrence = latest[key]
             occurrence["last_ts"] = max(occurrence["last_ts"], ts)
             occurrence["count"] += 1
-        elif _read_candle(record) is not None:
-            open_occurrences.pop(key, None)
+        elif key in latest and _read_candle(record) is not None:
+            ended.add(key)
 
     return [
         Alert(
@@ -859,7 +868,7 @@ def _collect_stop_price_unavailable(home: Path) -> list[Alert]:
             last_ts=occurrence["last_ts"],
             acknowledged=False,
         )
-        for (venue, pair), occurrence in open_occurrences.items()
+        for (venue, pair), occurrence in latest.items()
     ]
 
 
