@@ -1769,6 +1769,40 @@ def create_app(
                 },
                 status_code=200,
             )
+        if command == "operations.resolve_order":
+            # Retire one unresolved order from recorded venue evidence, or on
+            # the operator's assertion with the client order id typed back.
+            # Never sends an order; the engine takes the venue's tick lock.
+            from krellbot.run import OperatorResolveResult, resolve_order_by_operator
+
+            client_order_id = inner.get("client_order_id")
+            outcome = inner.get("outcome")
+            if not isinstance(client_order_id, str) or (outcome is not None and not isinstance(outcome, str)):
+                resolved = OperatorResolveResult(code="bad_input")
+            else:
+                resolved = resolve_order_by_operator(
+                    home=s.home,
+                    coid=client_order_id,
+                    outcome=outcome,
+                    executed_qty=inner.get("executed_qty"),
+                    confirmation=inner.get("confirmation"),
+                )
+            return JSONResponse(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "code": resolved.code,
+                    "ok": resolved.ok,
+                    "effect": resolved.effect,
+                    "message": resolved.message,
+                    "client_order_id": client_order_id if isinstance(client_order_id, str) else None,
+                    "outcome": resolved.outcome,
+                    "filled_qty": None if resolved.filled_qty is None else str(resolved.filled_qty),
+                    "evidence": resolved.evidence,
+                    "attributed": resolved.attributed,
+                },
+                status_code=200,
+                headers={"Cache-Control": "no-store"},
+            )
         if command == "alerts.ack":
             alert_id = inner.get("alert_id")
             if not isinstance(alert_id, str):
