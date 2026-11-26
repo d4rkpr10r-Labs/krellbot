@@ -28,7 +28,9 @@ Same as any schema_version 1 pack: `schema_version`, `id`, `version`, `label`,
 - Long-only DSL constraints stay in force (no short / leverage / futures).
 - Interval and bar cadence use `timeframe` (`1h` / `4h` / `1d`). There is no
   hidden CLI scheduler product for modes.
-- Slice / position sizing uses `risk.max_account_pct` (and the pack stop).
+- Position sizing uses `risk.max_account_pct` (and the pack stop). The
+  engine buys only while flat, sized at that percent of equity, and never
+  adds to an open position.
 
 ## Optional `mode` metadata (additive)
 
@@ -37,9 +39,12 @@ and packs without `mode` remain valid.
 
 ### DCA (`kind: "dca"`)
 
-No extra `mode` keys. Interval = `timeframe`. Per-buy sizing =
-`risk.max_account_pct`. Entry/exit conditions in the DSL decide when a slice
-is eligible; evaluation is still last-bar long/flat.
+No extra `mode` keys. `timeframe` sets the decision cadence: one
+closed-candle decision per bar. Evaluation is still last-bar long/flat, so
+the engine places one buy while flat, sized at `risk.max_account_pct` of
+equity, and holds it. It does not buy again each interval. It buys again only
+after the exit or the stop leaves it flat. The built-in pack's exit
+(`close <= 0`) never fires, so its 15% stop is what closes the position.
 
 ```json
 "mode": { "kind": "dca" }

@@ -328,6 +328,51 @@
   overflow-wrap: anywhere;
 }
 
+/* ============ per calendar year (metrics.per_year) ============ */
+
+.kbot-research__per-year-scroll {
+  overflow-x: auto;
+  min-width: 0;
+}
+
+.kbot-research__per-year-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.kbot-research__per-year-table th,
+.kbot-research__per-year-table td {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.kbot-research__per-year-table th[scope="col"] {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.kbot-research__per-year-table th[scope="col"]:first-child,
+.kbot-research__per-year-table th[scope="row"] {
+  text-align: left;
+}
+
+.kbot-research__per-year-table th[scope="row"],
+.kbot-research__per-year-table td {
+  font-family: var(--font-mono);
+  font-weight: 400;
+  color: var(--text);
+}
+
+.kbot-research__per-year-table td.kbot-research__per-year-value--unavailable {
+  color: var(--muted);
+}
+
 /* ============ equity curve (receipt.equity_curve) ============ */
 
 .kbot-research__equity-curve {

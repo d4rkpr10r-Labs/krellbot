@@ -27,8 +27,9 @@ Enforced by `krellbot.packs.launch_family` and pinned by
 Package resource: `krellbot.packs.launch/paid-launch-dca.json`
 
 - Ordinary schema_version 1 DSL with the same DCA teaching shape as
-  `mode-dca` (interval = `timeframe`; slice = `risk.max_account_pct`;
-  wave `XXBTZUSD`)
+  `mode-dca`: one buy while flat, sized at `risk.max_account_pct` of equity
+  and held until its stop, with no new buy each `timeframe` bar; wave
+  `XXBTZUSD`
 - Does **not** claim the reserved built-in id / `mode` object (`mode-dca`
   stays the built-in mode pack); the launch SKU is `paid-launch-dca`
 - Pack `origin` stays within schema maxLength and carries honesty phrases
