@@ -66,8 +66,8 @@ def _probe(venue: str, api_key: str, api_secret: str, transport: Any = None) -> 
         KeyMalformedError,
         KeyProbeOutcome,
         KeyTradeOffError,
+        KeyUnknownPermissionError,
         KeyUnverifiableError,
-        KrakenKeyUnknownPermissionError,
         WithdrawCapableError,
     )
 
@@ -117,7 +117,7 @@ def _probe(venue: str, api_key: str, api_secret: str, transport: Any = None) -> 
         KeyUnverifiableError,
         KeyMalformedError,
         KeyTradeOffError,
-        KrakenKeyUnknownPermissionError,
+        KeyUnknownPermissionError,
     ) as exc:
         # Distinguish reasons so the CLI can tell invalid / malformed /
         # trade-off / unknown-permission cases apart. Each subclass is
@@ -161,8 +161,8 @@ def _outcome_for(exc: BaseException) -> str:
         KeyMalformedError,
         KeyProbeOutcome,
         KeyTradeOffError,
+        KeyUnknownPermissionError,
         KeyUnverifiableError,
-        KrakenKeyUnknownPermissionError,
     )
 
     if isinstance(exc, KeyUnverifiableError):
@@ -171,7 +171,7 @@ def _outcome_for(exc: BaseException) -> str:
         return KeyProbeOutcome.MALFORMED
     if isinstance(exc, KeyTradeOffError):
         return KeyProbeOutcome.TRADE_OFF
-    if isinstance(exc, KrakenKeyUnknownPermissionError):
+    if isinstance(exc, KeyUnknownPermissionError):
         return KeyProbeOutcome.UNKNOWN_PERMISSION
     # Any other typed subclass collapses to trade_off; callers narrow via reason.
     return KeyProbeOutcome.TRADE_OFF
@@ -194,8 +194,8 @@ def _reason_for(exc: BaseException) -> str:
     from krellbot.venues.base import (
         KeyMalformedError,
         KeyTradeOffError,
+        KeyUnknownPermissionError,
         KeyUnverifiableError,
-        KrakenKeyUnknownPermissionError,
         WithdrawCapableError,
     )
 
@@ -205,7 +205,7 @@ def _reason_for(exc: BaseException) -> str:
         return "venue response shape unknown; refused"
     if isinstance(exc, KeyTradeOffError):
         return "missing required trade permission; refused"
-    if isinstance(exc, KrakenKeyUnknownPermissionError):
+    if isinstance(exc, KeyUnknownPermissionError):
         return "venue returned an unrecognized permission; refused"
     if isinstance(exc, WithdrawCapableError):
         # Bare `WithdrawCapableError` or unrecognised subclass. The

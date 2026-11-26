@@ -28,10 +28,14 @@ from krellbot import release_policy, sanitize
 from krellbot.venues.base import (
     Balance,
     Fill,
+    KeyMalformedError,
     KeyPerms,
+    KeyTradeOffError,
+    KeyUnknownPermissionError,
     OpenOrder,
     OrderRef,
     PairRules,
+    ProtectiveStopRejectedError,
     Truth,
     WithdrawCapableError,
 )
@@ -39,6 +43,19 @@ from krellbot.venues.base import (
 API_HOST = "api.binance.com"
 BASE_URL = f"https://{API_HOST}"
 STOP_BUFFER = Decimal("0.005")  # limit = stop * (1 - 0.5%)
+# Recent orders scanned when looking up a client order id (allOrders limit).
+ORDER_LOOKUP_LIMIT = 100
+
+# GET /sapi/v1/account/apiRestrictions. A trade-only key grants exactly
+# these two permissions. Withdrawal and transfer permissions can move funds
+# off the spot account and are refused as withdraw-capable. Any other
+# ``enable*`` / ``permits*`` flag set to true (margin, futures, options,
+# FIX, or a flag Binance adds later) fails closed.
+REQUIRED_KEY_PERMISSIONS = ("enableReading", "enableSpotAndMarginTrading")
+FUND_MOVING_KEY_PERMISSIONS = ("enableWithdrawals", "enableInternalTransfer", "permitsUniversalTransfer")
+_PERMISSION_PREFIXES = ("enable", "permits")
+_FILLED_STATUSES = frozenset({"FILLED", "PARTIALLY_FILLED", "EXPIRED"})
+_ACTIVE_STOP_STATUSES = frozenset({"NEW", "PARTIALLY_FILLED"})
 
 
 class Transport(Protocol):
@@ -194,6 +211,10 @@ class BinanceVenue:
         if not pair:
             raise ValueError("binance entry requires a pair")
         rules = self.rules(pair)
+        found = self._existing_entry(coid, pair, rules)
+        if found is not None:
+            self._recent[coid] = found
+            return found
         lot = _quantize_qty(qty, rules.lot_decimals)
         price_stop = _quantize_price(stop, rules.price_decimals)
         _reject_size(lot, rules, self._prices.get(pair))
@@ -209,32 +230,39 @@ class BinanceVenue:
                 "type": "MARKET",
                 "quantity": format(lot, "f"),
                 "newClientOrderId": coid,
+                "newOrderRespType": "FULL",
             },
         )
-        if not _entry_filled(entry):
+        filled = _filled_qty(entry, rules.lot_decimals)
+        if filled is None:
             raise RuntimeError("binance entry was not filled; stop not placed")
-        stop_resp = self._signed_post(
-            "/api/v3/order",
-            {
-                "symbol": pair,
-                "side": "SELL",
-                "type": "STOP_LOSS_LIMIT",
-                "quantity": format(lot, "f"),
-                "price": format(limit_price, "f"),
-                "stopPrice": format(price_stop, "f"),
-                "timeInForce": "GTC",
-                "newClientOrderId": coid + "_stop",
-            },
-        )
+        # The entry filled. From here any failure leaves a position whose
+        # protection is unknown, so it is a reconcile case, not a no-op.
+        try:
+            stop_resp = self._signed_post(
+                "/api/v3/order",
+                {
+                    "symbol": pair,
+                    "side": "SELL",
+                    "type": "STOP_LOSS_LIMIT",
+                    "quantity": format(filled, "f"),
+                    "price": format(limit_price, "f"),
+                    "stopPrice": format(price_stop, "f"),
+                    "timeInForce": "GTC",
+                    "newClientOrderId": coid + "_stop",
+                },
+            )
+        except Exception as exc:
+            raise ProtectiveStopRejectedError("binance stop outcome unknown after entry fill") from exc
         if not _order_ok(stop_resp):
-            raise RuntimeError("binance stop was not accepted")
+            raise ProtectiveStopRejectedError("binance stop was not accepted")
         ref = OrderRef(
             id=str(entry.get("orderId") or stop_resp.get("orderId") or ""),
             coid=coid,
             pair=pair,
             side="buy",
             qty=lot,
-            filled_qty=lot,
+            filled_qty=filled,
             stop_price=price_stop,
         )
         self._recent[coid] = ref
@@ -295,7 +323,7 @@ class BinanceVenue:
                 "/api/v3/order",
                 {"symbol": pair, "orderId": order.id},
             )
-            self._signed_post(
+            replaced = self._signed_post(
                 "/api/v3/order",
                 {
                     "symbol": pair,
@@ -308,10 +336,17 @@ class BinanceVenue:
                     "newClientOrderId": (order.coid or order.id) + "_raised",
                 },
             )
+            if not _order_ok(replaced):
+                # The old stop is already cancelled. The next tick sees no
+                # resting stop and runs the engine's ensure-stop path.
+                raise ProtectiveStopRejectedError("binance replacement stop was not accepted")
 
     def order_by_coid(self, coid: str) -> OpenOrder | None:
         ref = self._recent.get(coid)
         if ref is None:
+            for order in self.snapshot().open_orders:
+                if order.coid == coid:
+                    return order
             return None
         return OpenOrder(
             id=ref.id,
@@ -324,14 +359,60 @@ class BinanceVenue:
 
     def check_key(self) -> KeyPerms:
         perms = self._signed_get("/sapi/v1/account/apiRestrictions")
-        if not isinstance(perms, dict):
-            raise TypeError("binance apiRestrictions response missing")
-        if perms.get("enableWithdrawals") is True:
-            raise WithdrawCapableError("binance key can withdraw; trade-only keys refused")
-        can_trade = perms.get("enableSpotAndMarginTrading") is True
-        return KeyPerms(can_trade=can_trade, can_withdraw=False)
+        if not isinstance(perms, dict) or not any(name in perms for name in REQUIRED_KEY_PERMISSIONS):
+            raise KeyMalformedError("binance apiRestrictions response shape unknown; refused")
+        if any(perms.get(name) is True for name in FUND_MOVING_KEY_PERMISSIONS):
+            raise WithdrawCapableError("binance key can move funds; trade-only keys refused")
+        missing = [name for name in REQUIRED_KEY_PERMISSIONS if perms.get(name) is not True]
+        if missing:
+            raise KeyTradeOffError(f"binance key missing required permissions: {missing}; refused")
+        extra = sorted(
+            name
+            for name, value in perms.items()
+            if value is True and name.startswith(_PERMISSION_PREFIXES) and name not in REQUIRED_KEY_PERMISSIONS
+        )
+        if extra:
+            raise KeyUnknownPermissionError(f"binance key grants permissions beyond spot trading: {extra}; refused")
+        return KeyPerms(can_trade=True, can_withdraw=False)
 
     # ---- internals ------------------------------------------------------
+
+    def _find_order(self, coid: str, pair: str) -> dict | None:
+        """Return the venue's record of ``coid`` on ``pair``, or None.
+
+        Scans recent orders so a client order id sent by an earlier process
+        is found without resubmitting. A response that is not a list cannot
+        prove absence, so it raises instead of returning None.
+        """
+        orders = self._signed_get("/api/v3/allOrders", {"symbol": pair, "limit": str(ORDER_LOOKUP_LIMIT)})
+        if not isinstance(orders, list):
+            # RuntimeError, not TypeError: the tick treats it as a refused send.
+            raise RuntimeError("binance allOrders response is not a list; order lookup refused")  # noqa: TRY004
+        for raw in orders:
+            if isinstance(raw, dict) and str(raw.get("clientOrderId") or "") == coid:
+                return raw
+        return None
+
+    def _existing_entry(self, coid: str, pair: str, rules: PairRules) -> OrderRef | None:
+        """Rebuild the ref for an entry an earlier process already sent."""
+        entry = self._find_order(coid, pair)
+        if entry is None:
+            return None
+        filled = _filled_qty(entry, rules.lot_decimals)
+        if filled is None:
+            raise RuntimeError("binance entry already sent and not filled; reconcile before resending")
+        stop = self._find_order(coid + "_stop", pair)
+        if stop is None or str(stop.get("status") or "").upper() not in _ACTIVE_STOP_STATUSES:
+            raise ProtectiveStopRejectedError("binance entry already filled without an active protective stop")
+        return OrderRef(
+            id=str(entry.get("orderId") or ""),
+            coid=coid,
+            pair=pair,
+            side="buy",
+            qty=_optional_decimal(entry.get("origQty")) or filled,
+            filled_qty=filled,
+            stop_price=_optional_decimal(stop.get("stopPrice")),
+        )
 
     def _headers(self) -> dict[str, str]:
         return {"X-MBX-APIKEY": self._api_key}
@@ -394,14 +475,21 @@ def _reject_size(qty: Decimal, rules: PairRules, price: Decimal | None) -> None:
         raise ValueError("notional below costmin")
 
 
-def _entry_filled(resp: Any) -> bool:
+def _filled_qty(resp: Any, lot_decimals: int) -> Decimal | None:
+    """Executed base quantity of a market order, or None when nothing filled.
+
+    Uses ``executedQty`` only. A partial fill (``PARTIALLY_FILLED``, or
+    ``EXPIRED`` after the book ran out) protects what actually filled, never
+    the requested quantity.
+    """
     if not isinstance(resp, dict):
-        return False
+        return None
     status = str(resp.get("status") or "").upper()
-    if status in {"FILLED", "PARTIALLY_FILLED"}:
-        return True
     executed = _optional_decimal(resp.get("executedQty"))
-    return executed is not None and executed > 0
+    if executed is None or not executed.is_finite() or status not in _FILLED_STATUSES:
+        return None
+    filled = _quantize_qty(executed, lot_decimals)
+    return filled if filled > 0 else None
 
 
 def _order_ok(resp: Any) -> bool:
