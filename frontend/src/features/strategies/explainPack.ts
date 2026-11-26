@@ -32,6 +32,17 @@ export type MarketExplanation = {
   text: string;
 };
 
+export type StopExplanation = {
+  text: string;
+  supported: boolean;
+  /**
+   * What the engine does with this stop today: where it is set, when it is
+   * raised and how a missing one is re-placed. Empty when the stop is
+   * unsupported. Optional so hand-built results stay valid.
+   */
+  semantics?: string[];
+};
+
 export type ExplainResult = {
   /** Revision the explanation was built from, as supplied. */
   revisionId: string | null;
@@ -53,7 +64,7 @@ export type ExplainResult = {
   exit: ConditionExplanation;
   markets: MarketExplanation[];
   allocation: { text: string; supported: boolean };
-  stop: { text: string; supported: boolean };
+  stop: StopExplanation;
   /** True when at least one construct was unsupported or malformed. */
   hasUnknowns: boolean;
   /** Number of characters of the stored bytes. */
@@ -383,9 +394,47 @@ function describeAllocation(value: Json): { text: string; supported: boolean } {
   };
 }
 
-function describeStop(value: Json): { text: string; supported: boolean } {
+/*
+ * Stop semantics, true of the engine today:
+ * - placement: `pack/evaluate._decide` computes the stop from the close of
+ *   the signal bar (the closed bar on which the entry condition fired), and
+ *   the entry body carries that price; the fill price is not used.
+ * - raise: `run.tick` calls `raise_stop` only on a bar whose target is
+ *   long (entry condition holds, exit does not) and only when the new price
+ *   is above the resting stop. Flat bars leave the stop alone.
+ * - repair: a position with no resting stop gets `run._stop_price(pack,
+ *   latest close)`: `close × (1 − pct/100)` for a percentage stop and
+ *   `close / 2` for every other stop type.
+ */
+const STOP_RAISE_SENTENCE =
+  "After entry it is only raised, never lowered: on each later closed bar where the entry condition still holds, it is recomputed from that bar's close and moves up if the new price is higher. Once the entry condition stops holding, the stop stays where it is.";
+
+const SIGNAL_BAR_SENTENCE =
+  "The signal bar is the closed bar on which the entry condition fired; the fill price is not used.";
+
+function pctStopSemantics(pct: number): string[] {
+  return [
+    `The engine sets this stop from the signal bar's close, ${pct}% below it. ${SIGNAL_BAR_SENTENCE}`,
+    STOP_RAISE_SENTENCE,
+    `If the position has no resting stop, the engine re-places one ${pct}% below the latest closed bar's close.`,
+  ];
+}
+
+function atrStopSemantics(len: number, mult: number): string[] {
+  return [
+    `The engine sets this stop from the signal bar's close, ${formatNumber(mult)} × that bar's ${len}-bar average true range below it. ${SIGNAL_BAR_SENTENCE}`,
+    STOP_RAISE_SENTENCE,
+    "If the position has no resting stop, the engine re-places one at half the latest closed bar's close (50% below it), not with this ATR rule.",
+  ];
+}
+
+function describeStop(value: Json): StopExplanation {
   if (!isRecord(value)) {
-    return { supported: false, text: `an unsupported stop (${safelyStringify(value)})` };
+    return {
+      supported: false,
+      text: `an unsupported stop (${safelyStringify(value)})`,
+      semantics: [],
+    };
   }
   const type = value.type;
   if (type === "pct") {
@@ -394,11 +443,13 @@ function describeStop(value: Json): { text: string; supported: boolean } {
       return {
         supported: false,
         text: `a percentage stop with an unsupported value (${safelyStringify(pct)})`,
+        semantics: [],
       };
     }
     return {
       supported: true,
       text: `a percentage stop ${pct}% below the entry price`,
+      semantics: pctStopSemantics(pct),
     };
   }
   if (type === "atr") {
@@ -410,14 +461,20 @@ function describeStop(value: Json): { text: string; supported: boolean } {
       return {
         supported: false,
         text: `an ATR stop with unsupported values (len ${safelyStringify(len)}, mult ${safelyStringify(mult)})`,
+        semantics: [],
       };
     }
     return {
       supported: true,
       text: `an ATR stop ${formatNumber(mult)} × the ${len}-bar average true range below the entry price`,
+      semantics: atrStopSemantics(len, mult),
     };
   }
-  return { supported: false, text: `an unsupported stop type (${safelyStringify(type)})` };
+  return {
+    supported: false,
+    text: `an unsupported stop type (${safelyStringify(type)})`,
+    semantics: [],
+  };
 }
 
 function readMetadataString(pack: Record<string, Json>, key: string): string | null {
@@ -467,9 +524,13 @@ export function explainPack(bytes: string, revisionId: string | null): ExplainRe
   const allocation = isRecord(pack.risk)
     ? describeAllocation(pack.risk.max_account_pct)
     : { supported: false, text: `an unsupported risk block (${safelyStringify(pack.risk)})` };
-  const stop = isRecord(pack.risk)
+  const stop: StopExplanation = isRecord(pack.risk)
     ? describeStop(pack.risk.stop)
-    : { supported: false, text: `an unsupported risk block (${safelyStringify(pack.risk)})` };
+    : {
+        supported: false,
+        text: `an unsupported risk block (${safelyStringify(pack.risk)})`,
+        semantics: [],
+      };
 
   const hasUnknowns =
     !parsed ||

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef, useState, type JSX } from "react";
+import { useCallback, useEffect, useId, useReducer, useRef, useState, type JSX } from "react";
 import { DisclosureSection } from "../../components/disclosure/DisclosureSection";
 import { DiagnosticReport } from "../diagnostics/DiagnosticReport";
 import { getCsrf } from "../../session";
@@ -18,6 +18,7 @@ import { TradingViewAlertPreview } from "./TradingViewAlertPreview";
 import { PaperHealthDetails, usePaperHealth } from "./paperHealth";
 import type { RehearsalClient } from "./rehearsalClient";
 import { summarizePaperCommandRefusal } from "./paperCommandRefusalSummary";
+import { PAUSE_NEW_BUYS_DISCLOSURE, STOP_RUN_DISCLOSURE } from "./stopRunDisclosure";
 import "./StatusPanel.position.css";
 import "./StatusPanel.signal.css";
 
@@ -1094,6 +1095,7 @@ export function StatusPanel({
 
   const [raiseStopValue, setRaiseStopValue] = useState("");
   const raiseStopValid = isValidPaperBalance(raiseStopValue);
+  const runControlsDisclosureId = useId();
 
   const handleRaiseStop = (): Promise<void> => {
     const current = state.status;
@@ -1250,16 +1252,19 @@ export function StatusPanel({
               armed={true}
               refreshKey={armEpoch}
             />
-            <p className="kbot-paper-status__empty">
-              Pause new buys leaves exit rules active. Stop paper run removes
-              this market from future evaluations and leaves any open simulated
-              position in place.
+            <p
+              className="kbot-paper-status__empty"
+              id={runControlsDisclosureId}
+              data-testid="paper-stop-run-disclosure"
+            >
+              {PAUSE_NEW_BUYS_DISCLOSURE} {STOP_RUN_DISCLOSURE}
             </p>
             <div className="kbot-paper-status__actions">
               <button
                 type="button"
                 className="kbot-paper-status__action"
                 disabled={busy}
+                aria-describedby={runControlsDisclosureId}
                 onClick={() => {
                   void handlePause();
                 }}
@@ -1282,6 +1287,7 @@ export function StatusPanel({
                 type="button"
                 className="kbot-paper-status__action"
                 disabled={busy}
+                aria-describedby={runControlsDisclosureId}
                 onClick={() => {
                   void handleDisarm();
                 }}
