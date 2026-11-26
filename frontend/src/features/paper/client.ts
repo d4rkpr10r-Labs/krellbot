@@ -230,6 +230,32 @@ export type FleetArmedClient = {
   listFleet(select?: { venue?: string; pair?: string }): Promise<FleetArmedView>;
 };
 
+/**
+ * Candle evidence for one armed feed from ``GET /api/v1/paper/fleet/freshness``,
+ * read from the current arm's latest tick. Joined to a fleet row on
+ * ``(venue, pack_id, pair)``; ``null`` means no evidence, never "fresh".
+ */
+export type FleetFeedFreshness = {
+  venue: string;
+  pack_id: string;
+  pair: string;
+  /** Open time of the candle the latest tick read. */
+  last_bar_ts_ms: number | null;
+  /** That candle's age when the tick read it. */
+  candle_age_s: number | null;
+  /** Older than two timeframes when read; null when it cannot be judged. */
+  candle_stale: boolean | null;
+};
+
+export type FleetFreshnessView = {
+  schema_version: string;
+  feeds: FleetFeedFreshness[];
+};
+
+export type FleetFreshnessClient = {
+  listFleetFreshness(): Promise<FleetFreshnessView>;
+};
+
 /** One owned holding from the persisted paper state file. */
 export type PaperPositionHolding = {
   symbol: string;
@@ -816,6 +842,57 @@ async function listFleet(select?: {
   return adaptFleetView(raw);
 }
 
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function adaptFeedFreshness(row: Record<string, unknown>): FleetFeedFreshness | null {
+  if (
+    typeof row.venue !== "string" ||
+    typeof row.pack_id !== "string" ||
+    typeof row.pair !== "string"
+  ) {
+    return null;
+  }
+  const age = finiteOrNull(row.candle_age_s);
+  return {
+    venue: row.venue,
+    pack_id: row.pack_id,
+    pair: row.pair,
+    last_bar_ts_ms: finiteOrNull(row.last_bar_ts_ms),
+    candle_age_s: age !== null && age >= 0 ? age : null,
+    candle_stale: typeof row.candle_stale === "boolean" ? row.candle_stale : null,
+  };
+}
+
+async function listFleetFreshness(): Promise<FleetFreshnessView> {
+  const response = await fetch("/api/v1/paper/fleet/freshness", {
+    method: "GET",
+    credentials: "include",
+    headers: {
+      "X-Krellbot-CSRF": getCsrf(),
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`paper fleet freshness failed: ${response.status}`);
+  }
+  const raw = (await response.json()) as Record<string, unknown>;
+  const feeds: FleetFeedFreshness[] = [];
+  for (const entry of Array.isArray(raw.feeds) ? raw.feeds : []) {
+    if (entry === null || typeof entry !== "object") {
+      continue;
+    }
+    const adapted = adaptFeedFreshness(entry as Record<string, unknown>);
+    if (adapted !== null) {
+      feeds.push(adapted);
+    }
+  }
+  return {
+    schema_version: typeof raw.schema_version === "string" ? raw.schema_version : "1",
+    feeds,
+  };
+}
+
 /**
  * Decode the closed-shape ``GET /api/v1/paper/position`` body. The
  * adapter is strict: an armed body without the projection fields, or a
@@ -987,6 +1064,7 @@ export function createHttpClient(): PaperClient &
   PaperArmedClient &
   PaperChartClient &
   FleetArmedClient &
+  FleetFreshnessClient &
   ForwardPaperLedgerClient &
   Required<Pick<PaperClient, "raiseStop">> {
   return {
@@ -1017,6 +1095,7 @@ export function createHttpClient(): PaperClient &
       return getArmedJson("/api/v1/paper/armed");
     },
     listFleet,
+    listFleetFreshness,
     pauseEntries(venue: string, pair: string): Promise<PaperCommandResult> {
       return postCommand("paper.pause_entries", { venue, pair });
     },
@@ -1048,8 +1127,8 @@ export function createHttpClient(): PaperClient &
   };
 }
 
-export function createFleetHttpClient(): FleetArmedClient {
-  return { listFleet };
+export function createFleetHttpClient(): FleetArmedClient & FleetFreshnessClient {
+  return { listFleet, listFleetFreshness };
 }
 
 export function createLastRunsHttpClient(): PaperRunsClient {

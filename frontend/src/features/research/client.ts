@@ -38,10 +38,25 @@ export type ResearchJobSnapshot = {
   error?: { code: string; message: string };
 };
 
+/** One simulated backtest fill leg. Decimal values stay exact strings. */
+export type FillLeg = {
+  side: "buy" | "sell";
+  price: string;
+  qty: string;
+  fee: string;
+  is_stop: boolean;
+};
+
+/** Per-bar fills of one research run, keyed by the bar_ts they filled on. */
+export type ResearchFills = {
+  fills: Record<string, FillLeg[]>;
+};
+
 /**
  * The research costs side-car served at `GET /api/v1/jobs/{id}/costs`.
  * Money and returns are exact Decimal text; `null` means the engine could
- * not compute that figure (for example a rerun outside its numeric range).
+ * not compute that figure (for example a rerun outside its numeric range,
+ * or fills that did not reconcile with the ledger).
  */
 export type ResearchCosts = {
   fee_model: string;
@@ -49,7 +64,7 @@ export type ResearchCosts = {
   slippage_bps: number;
   slippage_mult: number;
   starting_cash: string | null;
-  fill_count: number;
+  fill_count: number | null;
   total_fees: string | null;
   net_return_pct: string | null;
   gross_return_pct: string | null;
@@ -68,6 +83,8 @@ export type ResearchClient = {
   getResult(jobId: string): Promise<StoredResult | null>;
   getJob(jobId: string): Promise<ResearchJobSnapshot | null>;
   getResultDownload(jobId: string): Promise<Response>;
+  /** Null when the run recorded no fills (404) or the body is malformed. */
+  getFills?(jobId: string): Promise<ResearchFills | null>;
   /** `null` when the job has no cost side-car (404) or it is malformed. */
   getCosts?(jobId: string): Promise<ResearchCosts | null>;
 };
@@ -109,7 +126,7 @@ export function readResearchCosts(raw: unknown): ResearchCosts | null {
   const feeBps = readFiniteNumber(obj.fee_bps);
   const slippageBps = readFiniteNumber(obj.slippage_bps);
   const slippageMult = readFiniteNumber(obj.slippage_mult);
-  const fillCount = readFiniteNumber(obj.fill_count);
+  const fillCount = obj.fill_count === null ? null : readFiniteNumber(obj.fill_count);
   const factor = readFiniteNumber(stressedObj.factor);
   const stressedFeeBps = readFiniteNumber(stressedObj.fee_bps);
   const stressedSlippageBps = readFiniteNumber(stressedObj.slippage_bps);
@@ -124,7 +141,7 @@ export function readResearchCosts(raw: unknown): ResearchCosts | null {
     feeBps === null ||
     slippageBps === null ||
     slippageMult === null ||
-    fillCount === null ||
+    (fillCount === null && obj.fill_count !== null) ||
     factor === null ||
     stressedFeeBps === null ||
     stressedSlippageBps === null ||
@@ -155,6 +172,57 @@ export function readResearchCosts(raw: unknown): ResearchCosts | null {
       return_pct: stressedReturn,
     },
   };
+}
+
+function readFillLeg(raw: unknown): FillLeg | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const leg = raw as Record<string, unknown>;
+  if (leg.side !== "buy" && leg.side !== "sell") {
+    return null;
+  }
+  if (
+    typeof leg.price !== "string" ||
+    typeof leg.qty !== "string" ||
+    typeof leg.fee !== "string" ||
+    typeof leg.is_stop !== "boolean"
+  ) {
+    return null;
+  }
+  return {
+    side: leg.side,
+    price: leg.price,
+    qty: leg.qty,
+    fee: leg.fee,
+    is_stop: leg.is_stop,
+  };
+}
+
+function readFills(raw: unknown): ResearchFills | null {
+  if (raw === null || typeof raw !== "object") {
+    return null;
+  }
+  const fills = (raw as { fills?: unknown }).fills;
+  if (fills === null || typeof fills !== "object" || Array.isArray(fills)) {
+    return null;
+  }
+  const out: Record<string, FillLeg[]> = {};
+  for (const [barTs, legs] of Object.entries(fills as Record<string, unknown>)) {
+    if (!Array.isArray(legs)) {
+      return null;
+    }
+    const parsed: FillLeg[] = [];
+    for (const rawLeg of legs) {
+      const leg = readFillLeg(rawLeg);
+      if (leg === null) {
+        return null;
+      }
+      parsed.push(leg);
+    }
+    out[barTs] = parsed;
+  }
+  return { fills: out };
 }
 
 async function postJson(url: string, body: unknown): Promise<unknown> {
@@ -333,6 +401,12 @@ export function createHttpClient(): ResearchClient {
         throw new Error(`download failed: ${response.status}`);
       }
       return response;
+    },
+    async getFills(jobId: string): Promise<ResearchFills | null> {
+      const raw = await getJson(
+        `/api/v1/jobs/${encodeURIComponent(jobId)}/fills`,
+      );
+      return readFills(raw);
     },
   };
 }

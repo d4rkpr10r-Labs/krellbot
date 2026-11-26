@@ -10,6 +10,7 @@ import {
 import {
   RESEARCH_DEFAULT_SLIPPAGE_BPS,
   RESEARCH_FEE_MODEL_LABEL,
+  type FillLeg,
   type ResearchClient,
   type ResearchCosts,
   type StoredResult,
@@ -37,16 +38,39 @@ export type ResearchViewProps = {
   openedJob?: { id: string } | null;
 };
 
+type TraceOperands = {
+  left?: unknown;
+  op?: unknown;
+  right?: unknown;
+  left_value?: unknown;
+  right_value?: unknown;
+};
+
 type TraceCondition = {
   path?: unknown;
   outcome?: unknown;
+  operands?: TraceOperands;
+};
+
+type TraceTarget = {
+  long?: unknown;
+  stop_price?: unknown;
+  reason?: unknown;
 };
 
 type TraceBar = {
   bar_ts?: unknown;
   input?: { close?: unknown };
   conditions?: TraceCondition[];
+  target?: TraceTarget;
 };
+
+/** The run's simulated fills, read from GET /api/v1/jobs/{id}/fills. */
+type FillsState =
+  | { status: "loading" }
+  | { status: "ready"; byBar: Record<string, FillLeg[]> }
+  | { status: "unavailable" }
+  | { status: "error"; message: string };
 
 type MetricCell = {
   label: string;
@@ -306,6 +330,174 @@ function readPath(condition: TraceCondition): string {
   return "";
 }
 
+function formatOperand(token: unknown, value: unknown): string {
+  if (typeof token === "number" && Number.isFinite(token)) {
+    return String(token);
+  }
+  const shown =
+    typeof value === "number" && Number.isFinite(value) ? String(value) : "unknown";
+  return typeof token === "string" ? `${token} = ${shown}` : shown;
+}
+
+/** "close = 101.5 crosses_above sma2 = 100.25", or null without operands. */
+function readOperands(condition: TraceCondition): string | null {
+  const operands = condition.operands;
+  if (!operands || typeof operands !== "object" || typeof operands.op !== "string") {
+    return null;
+  }
+  return [
+    formatOperand(operands.left, operands.left_value),
+    operands.op,
+    formatOperand(operands.right, operands.right_value),
+  ].join(" ");
+}
+
+function readStopPrice(bar: TraceBar | undefined): string | null {
+  const stop = bar?.target?.stop_price;
+  return typeof stop === "number" && Number.isFinite(stop) ? String(stop) : null;
+}
+
+function readConfigHash(receipt: Record<string, unknown>): string {
+  const sha = receipt.pack_sha256;
+  return typeof sha === "string" && sha !== "" ? sha : "unavailable";
+}
+
+type BarDecision = {
+  decision: "enter" | "exit" | "hold" | "stay flat" | "unavailable" | "loading…";
+  note: string;
+  stop: string;
+  /** The bar's fill legs, or null when they are not known yet. */
+  legs: FillLeg[] | null;
+};
+
+/**
+ * Name what the backtest decided at the close of ``trace[index]``.
+ *
+ * The rule target (``target.reason`` and ``target.long``) says which rule
+ * fired; it is long only on an entry signal, so it cannot tell a held
+ * position from a flat one. The run's own fills supply that: the engine
+ * enters only from flat, exits only while long, acts only when a later
+ * bar exists, and ignores a bar's signal when its stop filled on that bar.
+ *
+ * A fill needs a signal on the bar before it, so up to and including the
+ * first bar that could signal an entry (``firstEntryIndex``) the backtest
+ * is flat with no fills, and the decision needs no fills. Past it, without
+ * the run's fills the decision is unavailable, never guessed.
+ */
+function describeBarDecision(
+  trace: TraceBar[],
+  index: number,
+  fills: FillsState,
+  fillBars: number[],
+  firstEntryIndex: number,
+): BarDecision {
+  const bar = trace[index];
+  const reason = typeof bar.target?.reason === "string" ? bar.target.reason : null;
+  const knownFlat = firstEntryIndex === -1 || index <= firstEntryIndex;
+  if (reason === null) {
+    return {
+      decision: "unavailable",
+      note: "This bar has no recorded rule target.",
+      stop: "Stop price: unavailable",
+      legs: knownFlat
+        ? []
+        : fills.status === "ready" && typeof bar.bar_ts === "number"
+          ? fills.byBar[String(bar.bar_ts)] ?? []
+          : null,
+    };
+  }
+  let long = false;
+  let lastBuyAt: string | null = null;
+  let legs: FillLeg[] = [];
+  if (!knownFlat) {
+    if (fills.status === "loading") {
+      return {
+        decision: "loading…",
+        note: "Reading this run's fills…",
+        stop: "Stop price: loading…",
+        legs: null,
+      };
+    }
+    if (fills.status !== "ready" || typeof bar.bar_ts !== "number") {
+      return {
+        decision: "unavailable",
+        note: "Without this run's fills, the backtest's position at this bar is unknown.",
+        stop: "Stop price: unavailable",
+        legs: null,
+      };
+    }
+    const barTs = bar.bar_ts;
+    for (const filledAt of fillBars) {
+      if (filledAt > barTs) break;
+      for (const leg of fills.byBar[String(filledAt)] ?? []) {
+        if (leg.side === "buy" && Number(leg.qty) > 0) {
+          long = true;
+          lastBuyAt = String(filledAt);
+        } else if (leg.side === "sell") {
+          long = false;
+        }
+      }
+    }
+    legs = fills.byBar[String(barTs)] ?? [];
+  }
+  // The engine sets the stop from the bar before the buy filled.
+  const stopOfBuy = (): string => {
+    if (lastBuyAt === null) return "unavailable";
+    const buyIndex = trace.findIndex((row) => String(row.bar_ts) === lastBuyAt);
+    return (buyIndex > 0 ? readStopPrice(trace[buyIndex - 1]) : null) ?? "unavailable";
+  };
+  const hasNextBar = index + 1 < trace.length;
+  const signalStop = reason === "entry" ? readStopPrice(bar) : null;
+
+  if (legs.some((leg) => leg.side === "sell" && leg.is_stop)) {
+    return {
+      decision: "stay flat",
+      note: "The stop closed the position on this bar, so this bar's signal is not acted on.",
+      stop: `Stop price: ${stopOfBuy()} (hit on this bar)`,
+      legs,
+    };
+  }
+  if (!long) {
+    if (reason === "entry" && bar.target?.long === true && hasNextBar) {
+      return {
+        decision: "enter",
+        note: "The entry rule fired while flat. The buy fills at the next bar's open.",
+        stop: `Stop price: ${signalStop ?? "unavailable"} (set from this bar's close)`,
+        legs,
+      };
+    }
+    const note =
+      reason === "warmup"
+        ? "Indicators are still warming up, so no rule can fire."
+        : reason === "entry" && !hasNextBar
+          ? "No later bar in this window, so this entry signal cannot fill."
+          : reason === "exit"
+            ? "The exit rule fired, but there is no position to sell."
+            : "Flat at this close with no entry signal.";
+    return { decision: "stay flat", note, stop: "Stop price: none (no open position)", legs };
+  }
+  const resting = `Stop price: ${stopOfBuy()} (resting since the buy on bar ${lastBuyAt})`;
+  if (reason === "exit" && hasNextBar) {
+    return {
+      decision: "exit",
+      note: "The exit rule fired while long. The sell fills at the next bar's open.",
+      stop: resting,
+      legs,
+    };
+  }
+  const note =
+    reason === "exit"
+      ? "No later bar in this window, so this exit signal cannot fill."
+      : reason === "entry"
+        ? "The entry rule fired, but the backtest is already long, so it keeps the position."
+        : "Long at this close with no exit signal, so the backtest keeps the position.";
+  return { decision: "hold", note, stop: resting, legs };
+}
+
+function formatFillLeg(leg: FillLeg): string {
+  return `${leg.side} ${leg.qty} @ ${leg.price} · fee ${leg.fee}${leg.is_stop ? " · stop" : ""}`;
+}
+
 export function ResearchView({
   client,
   revisionId,
@@ -373,6 +565,55 @@ export function ResearchView({
     setCostsResult(storedResult);
     setCostsLoad(null);
   }
+  // A fills read belongs to the exact stored result and job it was made
+  // for; any other pairing reads as loading until its own read settles.
+  const [fillsRead, setFillsRead] = useState<{
+    result: StoredResult;
+    jobId: string;
+    state: FillsState;
+  } | null>(null);
+  const fillsRequested = useRef<{
+    client: ResearchClient;
+    result: StoredResult;
+    jobId: string;
+  } | null>(null);
+
+  // Fills are only shown in the selected-bar detail, so they are read once
+  // per loaded result, when a bar is first selected. A run never selected
+  // costs no extra request.
+  useEffect(() => {
+    const readFills = client.getFills;
+    if (
+      selectedBarTs === null ||
+      storedResult === null ||
+      jobId === null ||
+      readFills === undefined
+    ) {
+      return;
+    }
+    const requested = fillsRequested.current;
+    if (
+      requested !== null &&
+      requested.client === client &&
+      requested.result === storedResult &&
+      requested.jobId === jobId
+    ) {
+      return;
+    }
+    const key = { client, result: storedResult, jobId };
+    fillsRequested.current = key;
+    const settle = (state: FillsState): void => {
+      if (fillsRequested.current === key) {
+        setFillsRead({ result: storedResult, jobId, state });
+      }
+    };
+    readFills.call(client, jobId).then(
+      (body) =>
+        settle(body === null ? { status: "unavailable" } : { status: "ready", byBar: body.fills }),
+      (err: unknown) =>
+        settle({ status: "error", message: err instanceof Error ? err.message : String(err) }),
+    );
+  }, [client, storedResult, jobId, selectedBarTs]);
 
   // Explicit Jobs selection replaces the visible result, not the saved
   // strategy or the form. Never submit a new run to reopen stored evidence.
@@ -768,11 +1009,17 @@ export function ResearchView({
   const trace: TraceBar[] = storedResult
     ? (storedResult.trace as TraceBar[])
     : [];
-  const selectedBar: TraceBar | null =
+  const selectedIndex =
     selectedBarTs === null
-      ? null
-      : trace.find((bar) => readBarTs(bar, trace.indexOf(bar)) === selectedBarTs) ??
-        null;
+      ? -1
+      : trace.findIndex((bar, index) => readBarTs(bar, index) === selectedBarTs);
+  const selectedBar: TraceBar | null = selectedIndex >= 0 ? trace[selectedIndex] : null;
+  const fills: FillsState =
+    storedResult === null || jobId === null || client.getFills === undefined
+      ? { status: "unavailable" }
+      : fillsRead !== null && fillsRead.result === storedResult && fillsRead.jobId === jobId
+        ? fillsRead.state
+        : { status: "loading" };
 
   // In-use strip: a truthful echo of what the NEXT Run submits — the exact
   // current field texts, never a reformatted or inferred configuration.
@@ -1225,6 +1472,8 @@ export function ResearchView({
           selectedBarTs={selectedBarTs}
           onSelectBar={setSelectedBarTs}
           selectedBar={selectedBar}
+          selectedIndex={selectedIndex}
+          fills={fills}
           costs={costsLoad?.load ?? null}
           canLoadCosts={client.getCosts !== undefined}
           onLoadCosts={() => {
@@ -1313,6 +1562,8 @@ type ResultPanelProps = {
   selectedBarTs: string | null;
   onSelectBar: (barTs: string) => void;
   selectedBar: TraceBar | null;
+  selectedIndex: number;
+  fills: FillsState;
   costs: CostsLoad | null;
   canLoadCosts: boolean;
   onLoadCosts: () => void;
@@ -1325,10 +1576,32 @@ function ResultPanel({
   selectedBarTs,
   onSelectBar,
   selectedBar,
+  selectedIndex,
+  fills,
   costs,
   canLoadCosts,
   onLoadCosts,
 }: ResultPanelProps): JSX.Element {
+  const fillBars = useMemo(
+    () =>
+      fills.status === "ready"
+        ? Object.keys(fills.byBar)
+            .map(Number)
+            .filter(Number.isFinite)
+            .sort((a, b) => a - b)
+        : [],
+    [fills],
+  );
+  // The first bar whose target could have opened a position: an entry
+  // signal, or a reason the view cannot read.
+  const firstEntryIndex = useMemo(
+    () =>
+      trace.findIndex((row) => {
+        const reason = row.target?.reason;
+        return reason !== "warmup" && reason !== "flat" && reason !== "exit";
+      }),
+    [trace],
+  );
   const metrics = buildMetricCells(receipt);
   const equitySeries = readEquityCurve(receipt);
   const priceSeries = readPriceSeries(trace as Array<Record<string, unknown>>);
@@ -1437,41 +1710,107 @@ function ResultPanel({
           onSelectBar={onSelectBar}
         />
         {selectedBar ? (
-          <div
-            className="kbot-research__bar-detail"
-            data-testid="research-bar-detail"
-          >
-            <p className="kbot-research__bar-detail-title">
-              Selected bar detail
-            </p>
-            <p className="kbot-research__bar-close">
-              close: {readBarClose(selectedBar)}
-            </p>
-            <ul className="kbot-research__conditions">
-              {(selectedBar.conditions ?? []).map((condition, index) => {
-                const outcome = readOutcome(condition);
-                return (
-                  <li
-                    key={`cond-${index}`}
-                    className="kbot-research__condition"
-                  >
-                    <span className="kbot-research__condition-path">
-                      {readPath(condition)}
-                    </span>
-                    <span
-                      className={
-                        "kbot-research__condition-outcome" +
-                        ` kbot-research__condition-outcome--${outcome}`
-                      }
-                    >
-                      {outcome}
-                    </span>
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
+          <SelectedBarDetail
+            bar={selectedBar}
+            decision={describeBarDecision(
+              trace,
+              selectedIndex,
+              fills,
+              fillBars,
+              firstEntryIndex,
+            )}
+            configHash={readConfigHash(receipt)}
+            fills={fills}
+          />
         ) : null}
+      </div>
+    </div>
+  );
+}
+
+type SelectedBarDetailProps = {
+  bar: TraceBar;
+  decision: BarDecision;
+  configHash: string;
+  fills: FillsState;
+};
+
+function SelectedBarDetail({
+  bar,
+  decision,
+  configHash,
+  fills,
+}: SelectedBarDetailProps): JSX.Element {
+  const legs = decision.legs;
+  return (
+    <div className="kbot-research__bar-detail" data-testid="research-bar-detail">
+      <p className="kbot-research__bar-detail-title">Selected bar detail</p>
+      <p className="kbot-research__bar-close">close: {readBarClose(bar)}</p>
+      <p className="kbot-research__bar-decision" data-testid="research-bar-decision">
+        {`Decision: ${decision.decision}`}
+      </p>
+      <p className="kbot-research__bar-note" data-testid="research-bar-decision-note">
+        {decision.note}
+      </p>
+      <p className="kbot-research__bar-stop" data-testid="research-bar-stop">
+        {decision.stop}
+      </p>
+      <p className="kbot-research__bar-hash" data-testid="research-bar-config-hash">
+        {`Configuration hash (pack sha256): ${configHash}`}
+      </p>
+      <ul className="kbot-research__conditions">
+        {(bar.conditions ?? []).map((condition, index) => {
+          const outcome = readOutcome(condition);
+          const operands = readOperands(condition);
+          return (
+            <li key={`cond-${index}`} className="kbot-research__condition">
+              <span className="kbot-research__condition-rule">
+                <span className="kbot-research__condition-path">
+                  {readPath(condition)}
+                </span>
+                {operands !== null ? (
+                  <span className="kbot-research__condition-operands">{operands}</span>
+                ) : null}
+              </span>
+              <span
+                className={
+                  "kbot-research__condition-outcome" +
+                  ` kbot-research__condition-outcome--${outcome}`
+                }
+              >
+                {outcome}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+      <div className="kbot-research__bar-fills" data-testid="research-bar-fills">
+        <p className="kbot-research__bar-fills-title">
+          Simulated fills on this bar (backtest, not venue fills)
+        </p>
+        {legs === null ? (
+          <p className="kbot-research__bar-note">
+            {fills.status === "error"
+              ? `Fills unavailable for this run: reading them failed (${fills.message}).`
+              : fills.status === "loading"
+                ? "Reading this run's fills…"
+                : "Fills unavailable for this run."}
+          </p>
+        ) : legs.length === 0 ? (
+          <p className="kbot-research__bar-note">No fill on this bar.</p>
+        ) : (
+          <ul className="kbot-research__bar-fill-list">
+            {legs.map((leg, index) => (
+              <li
+                key={`fill-${index}`}
+                className="kbot-research__bar-fill"
+                data-testid="research-bar-fill"
+              >
+                {formatFillLeg(leg)}
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </div>
   );
@@ -1498,7 +1837,11 @@ function formatDecimalPercent(value: string | null): string {
 }
 
 function buildCostFigureCells(costs: ResearchCosts): MetricCell[] {
-  const fills = `${costs.fill_count} fill${costs.fill_count === 1 ? "" : "s"}`;
+  const count = costs.fill_count;
+  const fills =
+    count === null
+      ? "fills that did not reconcile with the ledger"
+      : `${count} fill${count === 1 ? "" : "s"}`;
   const stressed = costs.stressed;
   return [
     {

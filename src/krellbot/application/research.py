@@ -23,11 +23,16 @@ Strategy compatibility contracts:
   * The trace explains evaluator output, not venue execution or fill
     certainty. Warmup/unknown is a separate state from false and from
     numeric zero. Values only ever come from bars at or before `bar_ts`.
+  * `ResearchResult.fills` holds the backtest's simulated fills keyed by
+    the `bar_ts` they filled on, outside `detail` and the receipt. It adds
+    the entry leg that `BarRecord.fill` drops when a fresh long is stopped
+    on its own entry candle, and every leg is checked against the ledger.
   * A success also carries `costs`: the fee model, the fee and slippage in
-    force, the Decimal total of every fill fee and the run's exact return.
-    It lives beside `legacy_receipt` and `detail`, never inside them. `run`
-    constructs the backtester once; `run_with_cost_reruns` adds the return
-    of a zero-cost rerun and of a rerun at twice the fee and slippage.
+    force, the Decimal total of every fee in `fills` and the run's exact
+    return. It lives beside `legacy_receipt` and `detail`, never inside
+    them. `run` constructs the backtester once; `run_with_cost_reruns` adds
+    the return of a zero-cost rerun and of a rerun at twice the fee and
+    slippage.
 """
 
 from __future__ import annotations
@@ -120,12 +125,17 @@ class ResearchResult:
     refusal). `detail` is the versioned object that carries the refusal code
     or the decision trace; it is always present and starts with
     `schema_version: "1"`.
+
+    `fills` maps each `bar_ts` that filled to its simulated legs, in the
+    order they executed (see `bar_fills`). It is None on a refusal, or when
+    the legs could not be reconciled with the ledger; never a guess.
     """
 
     ok: bool
     legacy_receipt: dict | None
     detail: dict = field(default_factory=dict)
     refusal: dict | None = None
+    fills: dict[int, list[dict]] | None = None
     # Cost assumptions (see `cost_assumptions`), completed with the reruns by
     # `run_with_cost_reruns`. ``None`` on a refusal. Never part of
     # `legacy_receipt` or `detail`.
@@ -423,9 +433,17 @@ class ResearchService:
             # never live market performance.
             "data_source": "pinned_csv" if request.dataset_csv is not None else "fetch",
         }
+        fills = bar_fills(
+            records,
+            starting_cash=Decimal(request.starting_cash),
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            slippage_mult=slippage_mult,
+        )
         costs: dict | None
         try:
             costs = cost_assumptions(
+                fills,
                 records,
                 starting_cash=Decimal(request.starting_cash),
                 fee_bps=fee_bps,
@@ -435,7 +453,14 @@ class ResearchService:
         except (DecimalException, OverflowError):
             # The receipt already stands; costs are then reported unavailable.
             costs = None
-        return ResearchResult(ok=True, legacy_receipt=receipt, detail=detail, refusal=None, costs=costs)
+        return ResearchResult(
+            ok=True,
+            legacy_receipt=receipt,
+            detail=detail,
+            refusal=None,
+            fills=fills,
+            costs=costs,
+        )
 
     def run_with_cost_reruns(self, request: ResearchRequest) -> ResearchResult:
         """Run ``request``, then rerun it with no costs and with stressed costs.
@@ -606,63 +631,8 @@ class ResearchService:
 # ---- costs ---------------------------------------------------------------
 
 
-def research_fills(
-    records: list[BarRecord],
-    *,
-    fee_bps: int,
-    slippage_bps: int,
-    slippage_mult: float,
-) -> list[dict]:
-    """Return every fill a backtest made, in bar order, keyed by ``bar_ts``.
-
-    ``BarRecord.fill`` holds one terminal fill per bar. When a fresh long is
-    stopped on the candle that filled it, that slot keeps only the stop and
-    drops the entry leg (``backtest/engine.py``). The entry leg is rebuilt
-    here with the engine's own arithmetic: price ``open * (1 + slip)``, the
-    stop's quantity (the stop sells the whole position), and a fee of
-    ``qty * price * fee_bps / 10000``. A stop can only find the book flat at
-    the start of its bar when the same bar opened the position.
-
-    Each fill is ``{bar_ts, side, price, qty, fee, is_stop}`` with Decimal
-    money fields. A zero-quantity buy (no budget) stays in the list with a
-    zero fee, exactly as the engine recorded it.
-    """
-
-    slip = (Decimal(int(slippage_bps)) / _TEN_THOUSAND) * Decimal(str(slippage_mult))
-    fee_rate = Decimal(int(fee_bps))
-    fills: list[dict] = []
-    qty_before = _ZERO
-    for record in records:
-        fill = record.fill
-        if fill is not None:
-            if fill["is_stop"] and qty_before == _ZERO:
-                price = record.open * (_ONE + slip)
-                qty = fill["qty"]
-                fills.append(
-                    {
-                        "bar_ts": record.ts_ms,
-                        "side": "buy",
-                        "price": price,
-                        "qty": qty,
-                        "fee": qty * price * fee_rate / _TEN_THOUSAND,
-                        "is_stop": False,
-                    }
-                )
-            fills.append(
-                {
-                    "bar_ts": record.ts_ms,
-                    "side": fill["side"],
-                    "price": fill["price"],
-                    "qty": fill["qty"],
-                    "fee": fill["fee"],
-                    "is_stop": fill["is_stop"],
-                }
-            )
-        qty_before = record.qty_after
-    return fills
-
-
 def cost_assumptions(
+    fills: dict[int, list[dict]] | None,
     records: list[BarRecord],
     *,
     starting_cash: Decimal,
@@ -672,21 +642,19 @@ def cost_assumptions(
 ) -> dict:
     """Build the nominal costs block for one completed backtest.
 
-    ``records`` are the run's bars. The block names the fee model, the fee
-    and slippage in force, the Decimal total of every fill fee (entry legs
-    included, see `research_fills`) and the run's exact return. Money and
-    returns are plain Decimal text (no exponent); counts and basis points
-    are ints. `ResearchService.run_with_cost_reruns` adds the zero-cost and
-    stressed reruns. These are backtest figures, not live trading costs.
+    ``fills`` is `bar_fills` output for ``records``: every leg, including the
+    entry leg an entry-candle stop drops from `BarRecord.fill`, reconciled
+    with the ledger. The block names the fee model, the fee and slippage in
+    force, the Decimal total of every leg's fee and the run's exact return.
+    When the legs could not be reconciled (``fills`` is None) the fee total
+    and fill count are ``None``, never a guess. Money and returns are plain
+    Decimal text (no exponent); counts and basis points are ints.
+    `ResearchService.run_with_cost_reruns` adds the zero-cost and stressed
+    reruns. These are backtest figures, not live trading costs.
     """
 
-    fills = research_fills(
-        records,
-        fee_bps=fee_bps,
-        slippage_bps=slippage_bps,
-        slippage_mult=slippage_mult,
-    )
-    total_fees = sum((fill["fee"] for fill in fills), _ZERO)
+    legs = None if fills is None else [leg for bar_legs in fills.values() for leg in bar_legs]
+    total_fees = None if legs is None else sum((leg["fee"] for leg in legs), _ZERO)
     net = _return_pct(records[-1].equity, starting_cash) if records else None
     return {
         "schema_version": COSTS_SCHEMA_VERSION,
@@ -696,7 +664,7 @@ def cost_assumptions(
         "slippage_bps": int(slippage_bps),
         "slippage_mult": float(slippage_mult),
         "starting_cash": _decimal_text(starting_cash),
-        "fill_count": sum(1 for fill in fills if fill["qty"] > _ZERO),
+        "fill_count": None if legs is None else len(legs),
         "total_fees": _decimal_text(total_fees),
         "net_return_pct": _decimal_text(net),
     }
@@ -724,6 +692,90 @@ def _candles_to_canonical_bytes(candles: list[Candle]) -> bytes:
     for c in candles:
         parts.append(f"{c.ts_ms},{c.open},{c.high},{c.low},{c.close},{c.volume}")
     return ("\n".join(parts) + "\n").encode("utf-8")
+
+
+def bar_fills(
+    records: list[BarRecord],
+    *,
+    starting_cash: Decimal,
+    fee_bps: int,
+    slippage_bps: int,
+    slippage_mult: float,
+) -> dict[int, list[dict]] | None:
+    """Return the backtest's simulated fills keyed by the `bar_ts` they filled on.
+
+    Each leg is `{side, price, qty, fee, is_stop}` with exact Decimal values,
+    in execution order. A zero-quantity buy bought nothing and is left out.
+
+    `BarRecord.fill` keeps one slot per bar. When a fresh long is stopped on
+    its own entry candle, that slot holds only the stop, so the entry leg is
+    rebuilt here exactly as `Backtester._execute_pending` priced it: the
+    bar's open plus slippage, the stop's quantity, and the fee on that cost.
+    Every bar's legs must reproduce the ledger's `cash_after` and
+    `qty_after` exactly; if any bar does not, this returns None rather than
+    report fills that disagree with the result.
+    """
+    fee = Decimal(int(fee_bps))
+    slip = (Decimal(int(slippage_bps)) / _TEN_THOUSAND) * Decimal(str(slippage_mult))
+    out: dict[int, list[dict]] = {}
+    cash = Decimal(starting_cash)
+    qty = Decimal(0)
+    for record in records:
+        legs: list[dict] = []
+        slot = record.fill
+        if slot is not None:
+            if slot["side"] == "sell" and slot["is_stop"] and qty == 0:
+                # Entry-candle stop: the buy filled at this bar's open first.
+                price = record.open * (Decimal(1) + slip)
+                legs.append(
+                    {
+                        "side": "buy",
+                        "price": price,
+                        "qty": slot["qty"],
+                        "fee": slot["qty"] * price * fee / _TEN_THOUSAND,
+                        "is_stop": False,
+                    }
+                )
+            if slot["qty"] > 0:
+                legs.append(
+                    {
+                        "side": slot["side"],
+                        "price": slot["price"],
+                        "qty": slot["qty"],
+                        "fee": slot["fee"],
+                        "is_stop": bool(slot["is_stop"]),
+                    }
+                )
+        for leg in legs:
+            amount = leg["qty"] * leg["price"]
+            if leg["side"] == "buy":
+                cash -= amount + leg["fee"]
+                qty += leg["qty"]
+            else:
+                cash += amount - leg["fee"]
+                qty -= leg["qty"]
+        if cash != record.cash_after or qty != record.qty_after:
+            return None
+        if legs:
+            out[record.ts_ms] = legs
+    return out
+
+
+def fills_to_json(fills: dict[int, list[dict]]) -> dict[str, list[dict]]:
+    """Render `bar_fills` output for JSON: string `bar_ts` keys, plain decimal strings."""
+    return {
+        str(bar_ts): [
+            {
+                "side": leg["side"],
+                "price": format(leg["price"], "f"),
+                "qty": format(leg["qty"], "f"),
+                "fee": format(leg["fee"], "f"),
+                "is_stop": bool(leg["is_stop"]),
+            }
+            for leg in legs
+        ]
+        for bar_ts, legs in fills.items()
+    }
 
 
 def _receipt_has_non_finite(value: object) -> bool:

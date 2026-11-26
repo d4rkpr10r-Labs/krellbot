@@ -224,17 +224,18 @@ def test_total_fees_include_the_entry_leg_an_entry_candle_stop_drops(tmp_path, m
     assert slot_fees == stop_fee
     assert total_fees - slot_fees == buy_fee
 
-    # The rebuilt fill list names the entry leg on the bar that filled it.
-    fills = research_module.research_fills(records, fee_bps=10, slippage_bps=20, slippage_mult=1.0)
-    assert [(f["bar_ts"], f["side"], f["is_stop"]) for f in fills] == [
+    # The total is summed from the run's ledger-reconciled fills, which name
+    # the entry leg on the bar that filled it.
+    legs = [(bar_ts, leg) for bar_ts, bar_legs in result.fills.items() for leg in bar_legs]
+    assert [(bar_ts, leg["side"], leg["is_stop"]) for bar_ts, leg in legs] == [
         (10_800_000, "buy", False),
         (10_800_000, "sell", True),
     ]
-    assert fills[0]["price"] == Decimal("100.2")
-    assert fills[0]["qty"] == Decimal(100)
-    assert fills[0]["fee"] == buy_fee
-    assert fills[1]["price"] == Decimal("89.82")
-    assert fills[1]["fee"] == stop_fee
+    assert legs[0][1]["price"] == Decimal("100.2")
+    assert legs[0][1]["qty"] == Decimal(100)
+    assert legs[0][1]["fee"] == buy_fee
+    assert legs[1][1]["price"] == Decimal("89.82")
+    assert legs[1][1]["fee"] == stop_fee
 
 
 def test_total_fees_sum_every_fill_across_round_trips(tmp_path, monkeypatch):
@@ -298,24 +299,15 @@ def test_total_fees_sum_every_fill_across_round_trips(tmp_path, monkeypatch):
     assert costs["stressed"]["slippage_bps"] == 0
     assert Decimal(costs["stressed"]["return_pct"]) == _pct(s_cash, cash0)
 
-    # Every rebuilt fill reconciles with the ledger bar by bar.
-    records = Backtester(
-        _pack(), _candles(ROUND_TRIP_THEN_ENTRY_STOP_BARS), starting_cash=cash0, fee_bps=10, slippage_bps=0
-    ).run()
-    fills = research_module.research_fills(records, fee_bps=10, slippage_bps=0, slippage_mult=1.0)
-    assert [(f["bar_ts"], f["side"], f["is_stop"]) for f in fills] == [
+    # The total is summed over every leg of the run's fills, in bar order.
+    legs = [(bar_ts, leg) for bar_ts, bar_legs in result.fills.items() for leg in bar_legs]
+    assert [(bar_ts, leg["side"], leg["is_stop"]) for bar_ts, leg in legs] == [
         (10_800_000, "buy", False),
         (18_000_000, "sell", False),
         (28_800_000, "buy", False),
         (28_800_000, "sell", True),
     ]
-    assert [f["fee"] for f in fills] == fees
-    cash = cash0
-    for record in records:
-        for fill in (f for f in fills if f["bar_ts"] == record.ts_ms):
-            notional = fill["qty"] * fill["price"]
-            cash = cash - (notional + fill["fee"]) if fill["side"] == "buy" else cash + (notional - fill["fee"])
-        assert cash == record.cash_after
+    assert [leg["fee"] for _bar_ts, leg in legs] == fees
 
 
 def test_costs_leave_receipt_and_detail_shapes_unchanged(tmp_path, monkeypatch):
@@ -449,6 +441,13 @@ def test_costs_route_serves_the_side_car_and_keeps_the_stored_result(home: Path)
     assert Decimal(body["gross_return_pct"]) == Decimal(-10)
     assert body["stressed"]["fee_bps"] == 20
     assert body["stressed"]["slippage_bps"] == 40
+
+    # The fee total is the sum of the same job's served fills, entry leg included.
+    status, fills = _get(app, f"/api/v1/jobs/{job_id}/fills", _read_headers(csrf, session))
+    assert status == 200, fills
+    served_fees = [Decimal(leg["fee"]) for legs in fills["fills"].values() for leg in legs]
+    assert len(served_fees) == body["fill_count"] == 2
+    assert sum(served_fees, Decimal(0)) == Decimal(body["total_fees"])
 
     status, stored = _get(app, f"/api/v1/jobs/{job_id}/result", _read_headers(csrf, session))
     assert status == 200
