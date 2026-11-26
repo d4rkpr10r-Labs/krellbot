@@ -381,6 +381,266 @@ async function postRaiseStop(
   return (await response.json()) as PaperCommandResult;
 }
 
+/**
+ * ``GET /api/v1/paper/daily-loss-limit``: the run's daily loss limit and the
+ * entry gate as of its last tick. Values are decimal strings from the run's
+ * recorded fills, quoted, never recomputed.
+ */
+type DailyLossLimitRead = {
+  armed?: boolean;
+  daily_loss_limit_pct?: string | null;
+  limit_amount?: string | null;
+  code?: string | null;
+  reason?: string | null;
+};
+
+const DAILY_LOSS_LIMIT_COMMAND = "risk.set_daily_loss_limit";
+
+/** A plain decimal percent above 0 and at most 100; the backend re-checks it exactly. */
+export function isValidLossLimitPct(value: string): boolean {
+  return DECIMAL_PATTERN.test(value) && Number(value) > 0 && Number(value) <= 100;
+}
+
+async function readDailyLossLimit(venue: string, pair: string): Promise<DailyLossLimitRead> {
+  const params = new URLSearchParams({ venue, pair });
+  const response = await fetch(`/api/v1/paper/daily-loss-limit?${params.toString()}`, {
+    method: "GET",
+    credentials: "include",
+    headers: { "X-Krellbot-CSRF": getCsrf() },
+  });
+  if (!response.ok) {
+    throw new Error(`daily loss limit read failed: ${response.status}`);
+  }
+  return (await response.json()) as DailyLossLimitRead;
+}
+
+/** POST ``risk.set_daily_loss_limit``; ``pct: null`` turns the limit off. */
+async function postDailyLossLimit(
+  venue: string,
+  pair: string,
+  pct: string | null,
+): Promise<PaperCommandResult> {
+  const response = await fetch("/api/v1/commands", {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Krellbot-CSRF": getCsrf(),
+    },
+    body: JSON.stringify({
+      schema_version: "1",
+      command: DAILY_LOSS_LIMIT_COMMAND,
+      payload: { venue, pair, pct },
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`${DAILY_LOSS_LIMIT_COMMAND} failed: ${response.status}`);
+  }
+  return (await response.json()) as PaperCommandResult;
+}
+
+function dailyLossLimitSentence(read: DailyLossLimitRead): string {
+  const pct = read.daily_loss_limit_pct ?? null;
+  if (pct === null) {
+    return "Off. New buys are never held for a daily loss.";
+  }
+  const limit =
+    typeof read.limit_amount === "string" && read.limit_amount !== ""
+      ? `${pct}% of starting cash (${read.limit_amount})`
+      : `${pct}% of starting cash`;
+  if (read.code === "daily_loss_limit") {
+    return `New buys held until 00:00 UTC: today's loss reached the limit of ${limit}. Exits and stops keep running.`;
+  }
+  if (read.code === "loss_limit_unavailable") {
+    const reason = typeof read.reason === "string" && read.reason !== "" ? ` (${read.reason})` : "";
+    return `New buys held: today's loss can't be worked out${reason}. Exits and stops keep running.`;
+  }
+  return `Limit: ${limit}. When today's loss reaches it, new buys stop until 00:00 UTC; exits and stops keep running.`;
+}
+
+/**
+ * The run's optional daily loss limit, collapsed by default. It reads the
+ * limit only when opened (one read per open or confirmed change, never
+ * polling), and changes it only through the authenticated command; the
+ * backend is the single validator and its refusal message is shown as-is.
+ */
+function DailyLossLimitControl({ venue, pair }: { venue: string; pair: string }): JSX.Element {
+  const bodyId = useId();
+  const inputId = useId();
+  const [open, setOpen] = useState(false);
+  const [read, setRead] = useState<DailyLossLimitRead | null>(null);
+  const [readError, setReadError] = useState<string | null>(null);
+  const [value, setValue] = useState("");
+  const [pending, setPending] = useState(false);
+  const [echo, setEcho] = useState<string | null>(null);
+  const [refusal, setRefusal] = useState<string | null>(null);
+  const [unknown, setUnknown] = useState<string | null>(null);
+  const inFlightRef = useRef(false);
+  // A late read for a superseded request or another market never lands.
+  const readEpochRef = useRef(0);
+
+  const load = useCallback(async (): Promise<void> => {
+    const epoch = ++readEpochRef.current;
+    setReadError(null);
+    try {
+      const next = await readDailyLossLimit(venue, pair);
+      if (epoch !== readEpochRef.current) {
+        return;
+      }
+      setRead(next);
+      setValue(next.daily_loss_limit_pct ?? "");
+    } catch (reason) {
+      if (epoch !== readEpochRef.current) {
+        return;
+      }
+      // A failed read is unknown, never an "off" claim.
+      setRead(null);
+      setReadError(transportDetail(reason));
+    }
+  }, [venue, pair]);
+
+  useEffect(() => {
+    if (open) {
+      void load();
+    }
+    return () => {
+      readEpochRef.current += 1;
+    };
+  }, [open, load]);
+
+  const submit = async (pct: string | null): Promise<void> => {
+    if (inFlightRef.current) {
+      return;
+    }
+    inFlightRef.current = true;
+    setPending(true);
+    setEcho(null);
+    setRefusal(null);
+    setUnknown(null);
+    try {
+      let result: PaperCommandResult;
+      try {
+        result = await postDailyLossLimit(venue, pair, pct);
+      } catch (reason) {
+        // The command may or may not have been applied: no optimistic state, no retry.
+        setUnknown(
+          `Daily loss limit outcome unknown: ${transportDetail(reason)}. ` +
+            "Read the limit again before retrying.",
+        );
+        return;
+      }
+      if (!isConfirmedOk(result)) {
+        setRefusal(summarizePaperCommandRefusal("Daily loss limit", result).label);
+        return;
+      }
+      setEcho(typeof result.message === "string" && result.message !== "" ? result.message : null);
+      await load();
+    } finally {
+      setPending(false);
+      inFlightRef.current = false;
+    }
+  };
+
+  const valid = isValidLossLimitPct(value);
+  const limitSet = typeof read?.daily_loss_limit_pct === "string";
+
+  return (
+    <div className="kbot-paper-status__loss-limit" data-testid="paper-daily-loss-limit">
+      <button
+        type="button"
+        className="kbot-paper-status__action"
+        aria-expanded={open}
+        aria-controls={bodyId}
+        data-testid="paper-daily-loss-limit-toggle"
+        onClick={() => {
+          setOpen((current) => !current);
+        }}
+      >
+        Daily loss limit
+      </button>
+      {open ? (
+        <div id={bodyId} role="region" aria-label="Daily loss limit" data-testid="paper-daily-loss-limit-body">
+          {readError !== null ? (
+            <p
+              className="kbot-paper-status__empty"
+              role="alert"
+              data-testid="paper-daily-loss-limit-unavailable"
+            >
+              Daily loss limit unavailable: {readError}
+            </p>
+          ) : read === null ? (
+            <p className="kbot-paper-status__empty" data-testid="paper-daily-loss-limit-loading">
+              Reading daily loss limit…
+            </p>
+          ) : (
+            <p className="kbot-paper-status__empty" data-testid="paper-daily-loss-limit-state">
+              {dailyLossLimitSentence(read)}
+            </p>
+          )}
+          {/* The same inline field + action layout as the stop control. */}
+          <div className="kbot-paper-status__raise-stop">
+            <label className="kbot-paper-status__field" htmlFor={inputId}>
+              Daily loss limit, % of starting cash
+              <input
+                id={inputId}
+                className="kbot-paper-status__input"
+                data-testid="paper-daily-loss-limit-input"
+                type="text"
+                inputMode="decimal"
+                value={value}
+                onChange={(event) => {
+                  setValue(event.target.value);
+                }}
+                disabled={pending}
+              />
+            </label>
+            <button
+              type="button"
+              className="kbot-paper-status__action"
+              data-testid="paper-daily-loss-limit-apply"
+              disabled={pending || !valid}
+              onClick={() => {
+                void submit(value);
+              }}
+            >
+              {pending ? "Saving…" : "Set limit"}
+            </button>
+            {limitSet ? (
+              <button
+                type="button"
+                className="kbot-paper-status__action"
+                data-testid="paper-daily-loss-limit-off"
+                disabled={pending}
+                onClick={() => {
+                  void submit(null);
+                }}
+              >
+                Turn off
+              </button>
+            ) : null}
+            {value !== "" && !valid ? (
+              <p className="kbot-paper-status__error" data-testid="paper-daily-loss-limit-error">
+                Enter a percent above 0 and at most 100, e.g. 5 or 2.5
+              </p>
+            ) : null}
+          </div>
+          {echo !== null ? <p data-testid="paper-daily-loss-limit-ok">{echo}</p> : null}
+          {unknown !== null ? (
+            <p className="kbot-paper-status__unknown" role="alert" data-testid="paper-daily-loss-limit-unknown">
+              {unknown}
+            </p>
+          ) : null}
+          {refusal !== null ? (
+            <p className="kbot-paper-status__error" role="alert" data-testid="paper-daily-loss-limit-refused">
+              {refusal}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function reducer(state: PanelState, action: PanelAction): PanelState {
   switch (action.type) {
     case "status": {
@@ -1503,6 +1763,11 @@ export function StatusPanel({
             {state.raiseStopEcho !== null ? (
               <p data-testid="paper-raise-stop-ok">{state.raiseStopEcho}</p>
             ) : null}
+            <DailyLossLimitControl
+              key={`${state.status?.venue ?? ""}\0${state.status?.pair ?? ""}`}
+              venue={state.status?.venue ?? ""}
+              pair={state.status?.pair ?? ""}
+            />
             {unknownAlert}
             {state.errorMessage !== null ? (
               <div>

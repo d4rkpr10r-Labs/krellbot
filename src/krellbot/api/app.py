@@ -582,6 +582,72 @@ def _select_armed_for_request(
     return config.armed[0], count
 
 
+# The optional per-arm daily loss limit, a percent of the arm's starting cash
+# (run/daily_loss.py). ``pct`` is a plain decimal string in (0, 100], or null
+# to turn the limit off. It only ever holds new entries, so paper and live arms
+# may both carry one.
+DAILY_LOSS_LIMIT_COMMAND = "risk.set_daily_loss_limit"
+_LOSS_LIMIT_PCT = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?")
+_LOSS_LIMIT_MESSAGES = {
+    "bad_input": "Send venue, pair and pct: a percent as text, or null to turn the limit off.",
+    "invalid_loss_limit": "Enter the daily loss limit as a plain percent above 0 and at most 100, e.g. 5 or 2.5.",
+    "not_armed": "No strategy is armed on this venue and pair.",
+    "starting_cash_unknown": "This run has no starting cash to take a percent of.",
+    "config_busy": "Another command is updating this run. Try again in a moment.",
+}
+
+
+def _set_daily_loss_limit(s: _AppState, inner: dict) -> Response:
+    """Handle ``risk.set_daily_loss_limit``; refusals are 200 bodies with ``ok: false``."""
+
+    from krellbot.run import daily_loss as kb_daily_loss
+
+    venue, pair, raw = inner.get("venue"), inner.get("pair"), inner.get("pct")
+    pct: Decimal | None = None
+    if not isinstance(venue, str) or not venue or not isinstance(pair, str) or not pair or "pct" not in inner:
+        code = "bad_input"
+    elif raw is not None and (
+        not isinstance(raw, str) or not _LOSS_LIMIT_PCT.fullmatch(raw) or not Decimal(0) < Decimal(raw) <= 100
+    ):
+        code = "invalid_loss_limit"
+    else:
+        pct = None if raw is None else Decimal(raw)
+        outcome = kb_config.set_daily_loss_limit(s.home, venue=venue, pair=pair, pct=pct)
+        code = {"busy": "config_busy"}.get(outcome, outcome)
+    if code in ("changed", "unchanged"):
+        shown = None if pct is None else kb_daily_loss.plain(pct)
+        message = (
+            f"daily loss limit off: {venue} {pair}"
+            if shown is None
+            else f"daily loss limit set: {venue} {pair} -> {shown}% of starting cash"
+        )
+        body = {
+            "code": "daily_loss_limit_off" if pct is None else "daily_loss_limit_set",
+            "ok": True,
+            "effect": code,
+            "message": message,
+            "daily_loss_limit_pct": shown,
+        }
+    else:
+        body = {
+            "code": code,
+            "ok": False,
+            "effect": "refused",
+            "message": _LOSS_LIMIT_MESSAGES.get(code, code),
+            "daily_loss_limit_pct": None,
+        }
+    return JSONResponse(
+        {
+            "schema_version": SCHEMA_VERSION,
+            **body,
+            "venue": venue if isinstance(venue, str) else None,
+            "pair": pair if isinstance(pair, str) else None,
+        },
+        status_code=200,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def _with_armed_count(body: dict, armed_count: int) -> dict:
     """Attach ``armed_count`` only when more than one pack is armed.
 
@@ -1834,6 +1900,8 @@ def create_app(
                 },
                 status_code=200,
             )
+        if command == DAILY_LOSS_LIMIT_COMMAND:
+            return _set_daily_loss_limit(s, inner)
         if command == "live.arm":
             # Web live arm behind the existing gate. While PAPER_ONLY_RELEASE
             # is active, refuse with an honest structured 403 before any
@@ -3801,6 +3869,40 @@ def create_app(
         pair = (request.query_params.get("pair") or "").strip() or None
         body = project_paper_assumptions(s.home, venue=venue, pair=pair)
         return JSONResponse(body, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/paper/daily-loss-limit")
+    async def paper_daily_loss_limit(request: Request) -> Response:
+        """Return an armed record's daily loss limit and the gate as of its last tick.
+
+        Same session gate as ``GET /api/v1/paper/status`` (``_gate_get``).
+        ``venue``+``pair`` select the record as for the status read. The body
+        names the limit (a percent of ``starting_cash``) and its amount, the
+        UTC ``day`` of the last tick that measured the arm, that day's
+        opening, lowest and latest equity, and ``code``: ``daily_loss_limit``
+        or ``loss_limit_unavailable`` (with ``reason``) while new entries are
+        held, otherwise null. These are bookkeeping values from the run's
+        recorded fills, not market performance. Read-only; changes go through
+        ``risk.set_daily_loss_limit``.
+        """
+
+        from krellbot.run import daily_loss as kb_daily_loss
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+
+        config = kb_config.load_config(s.home)
+        armed, _armed_count = _select_armed_for_request(config, request)
+        if armed is None:
+            body: dict = {"schema_version": SCHEMA_VERSION, "armed": False}
+        else:
+            body = {
+                "schema_version": SCHEMA_VERSION,
+                "armed": True,
+                **kb_daily_loss.project(s.home, armed, now=_app_now(s)),
+            }
+        return JSONResponse(body, status_code=200, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/v1/paper/position")
     async def paper_position(request: Request) -> Response:
