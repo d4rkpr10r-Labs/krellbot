@@ -44,7 +44,7 @@ import socket
 import sys
 import xml.etree.ElementTree as ET
 from decimal import Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -504,7 +504,11 @@ def test_heartbeat_units_fire_the_check_every_15_minutes(home: Path) -> None:
 def test_the_tick_unit_bytes_are_unchanged() -> None:
     from krellbot.service import render
 
-    home = Path("/home/op/.krellbot")
+    # The renderers only stringify ``home``. A PurePosixPath reads
+    # "/home/op/.krellbot" on every OS (a Path would read
+    # "\home\op\.krellbot" on Windows), so these are main's exact bytes for
+    # the same input everywhere.
+    home = PurePosixPath("/home/op/.krellbot")
 
     def digest(body: bytes) -> str:
         return hashlib.sha256(body).hexdigest()
