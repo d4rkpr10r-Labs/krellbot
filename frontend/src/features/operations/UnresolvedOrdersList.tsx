@@ -28,6 +28,8 @@ const EVIDENCE_HELP_SUFFIX =
 const ACCEPT_EVIDENCE_LABEL = "Resolve from venue record";
 const ASSERT_HELP =
   "No venue lookup is recorded for this order. Check your exchange history, then say what happened. Krellbot journals what you assert once and sends nothing to the exchange.";
+const WORKING_HELP =
+  "The last venue lookup does not show a final outcome: the order may still be working. Cancel it at the exchange if it is, check your exchange history, then say what happened. Krellbot journals what you assert once and sends nothing to the exchange.";
 const ASSERT_LEGEND = "What happened at the exchange?";
 const NOT_EXECUTED_LABEL = "It did not execute";
 const EXECUTED_LABEL = "It executed";
@@ -71,8 +73,18 @@ function lookupLabel(result: string): string {
   return LOOKUP_LABELS[result] ?? result;
 }
 
-function hasVenueEvidence(row: UnresolvedOrderRow): boolean {
-  return row.last_lookup_result !== "none" && row.last_lookup_result !== "";
+// Only a lookup that is an outcome settles an order without typed confirmation.
+// An open order may still fill. A partly executed one is listed as "filled" by
+// the closed row shape; the server refuses it as still working and the form
+// then asks for an assertion instead.
+const SETTLED_LOOKUPS: ReadonlySet<string> = new Set(["filled", "absent"]);
+const ASSERT_INSTEAD_CODES: ReadonlySet<string> = new Set([
+  "order_still_working",
+  "no_venue_evidence",
+]);
+
+function settlesFromLookup(row: UnresolvedOrderRow): boolean {
+  return SETTLED_LOOKUPS.has(row.last_lookup_result);
 }
 
 export function UnresolvedOrdersList({ client }: UnresolvedOrdersListProps): JSX.Element {
@@ -87,6 +99,7 @@ export function UnresolvedOrdersList({ client }: UnresolvedOrdersListProps): JSX
   const [pending, setPending] = useState(false);
   const [resolveError, setResolveError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [assertOnly, setAssertOnly] = useState<ReadonlySet<string>>(() => new Set());
   const canResolve = typeof client.resolveOrder === "function";
 
   const load = useCallback(async (): Promise<void> => {
@@ -146,6 +159,14 @@ export function UnresolvedOrdersList({ client }: UnresolvedOrdersListProps): JSX
           await load();
         } else {
           setResolveError(result.message ?? result.code ?? REFUSED_FALLBACK);
+          if (
+            request.outcome === undefined &&
+            typeof result.code === "string" &&
+            ASSERT_INSTEAD_CODES.has(result.code)
+          ) {
+            // The venue record does not settle this order: ask the operator.
+            setAssertOnly((prev) => new Set(prev).add(request.client_order_id));
+          }
         }
       } catch (err) {
         setResolveError(
@@ -166,7 +187,7 @@ export function UnresolvedOrdersList({ client }: UnresolvedOrdersListProps): JSX
       confirmation === coid;
     return (
       <div className="kbot-ops__unresolved-resolve" data-testid="ops-unresolved-resolve-form">
-        {hasVenueEvidence(row) ? (
+        {settlesFromLookup(row) && !assertOnly.has(coid) ? (
           <>
             <p className="kbot-ops__unresolved-resolve-help">
               {EVIDENCE_HELP_PREFIX} <strong>{lookupLabel(row.last_lookup_result)}</strong>.{" "}
@@ -189,7 +210,9 @@ export function UnresolvedOrdersList({ client }: UnresolvedOrdersListProps): JSX
           </>
         ) : (
           <>
-            <p className="kbot-ops__unresolved-resolve-help">{ASSERT_HELP}</p>
+            <p className="kbot-ops__unresolved-resolve-help">
+              {row.last_lookup_result === "none" ? ASSERT_HELP : WORKING_HELP}
+            </p>
             <fieldset className="kbot-ops__unresolved-resolve-outcome" disabled={pending}>
               <legend>{ASSERT_LEGEND}</legend>
               <label className="kbot-ops__unresolved-resolve-choice">

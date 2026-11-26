@@ -1080,6 +1080,9 @@ def reconcile_intents(*, venue: str, venue_obj: Any, home: Path | None = None, c
 
 OPERATOR_EXECUTED = "executed"
 OPERATOR_NOT_EXECUTED = "not_executed"
+# Venue observations that are an outcome. ``open`` and ``partial`` are not:
+# the order may still be working, so only a typed assertion settles it.
+_SETTLED_OBSERVATIONS = frozenset({"filled", "absent"})
 # Lock for an intent committed without a venue: no tick accounts those, but two
 # operator resolves of the same one must still not interleave.
 _UNSCOPED_INTENT_LOCK = "unscoped-intents"
@@ -1091,6 +1094,10 @@ _OPERATOR_RESOLVE_MESSAGES = {
     "order_not_found": "No unresolved order has this client order ID.",
     "tick_running": "A tick for this venue is running. Try again in a moment.",
     "no_venue_evidence": "No venue lookup is recorded for this order. Say what happened and type its client order ID.",
+    "order_still_working": (
+        "The last venue lookup shows this order still working. Cancel it at the exchange and wait for the next "
+        "lookup, or say what happened and type its client order ID."
+    ),
     "confirmation_required": "Type the client order ID to confirm what you assert.",
     "confirmation_mismatch": "The typed client order ID does not match this order.",
     "executed_qty_invalid": "Executed quantity must be a non-negative decimal number.",
@@ -1142,9 +1149,12 @@ def resolve_order_by_operator(
     """Retire one unresolved intent on the operator's word. Never sends an order.
 
     Without ``outcome`` the intent's latest recorded venue observation settles
-    it, and no confirmation is needed. With ``outcome`` (``not_executed``, or
-    ``executed`` with ``executed_qty``) the operator asserts what happened
-    without venue evidence and must type ``coid`` back as ``confirmation``.
+    it, and no confirmation is needed, but only when that observation is an
+    outcome (``filled`` or ``absent``); an ``open`` or ``partial`` order may
+    still fill and is refused as ``order_still_working``. With ``outcome``
+    (``not_executed``, or ``executed`` with ``executed_qty``) the operator
+    asserts what happened without venue evidence and must type ``coid`` back
+    as ``confirmation``.
 
     Runs under the intent venue's tick lock (``tick_running`` while a tick
     holds it). Durable writes follow ``_resolve_obligations``: evidence (the
@@ -1232,6 +1242,10 @@ def _settle_by_operator(
     if outcome is None:
         if intent.last_observation is None or intent.observed_status is None or intent.observed_qty is None:
             return OperatorResolveResult(code="no_venue_evidence")
+        if intent.observed_status not in _SETTLED_OBSERVATIONS:
+            # An open or partly executed order may still fill: its lookup is not
+            # an outcome, so settling on it would lift the entry hold too early.
+            return OperatorResolveResult(code="order_still_working")
         status = intent.observed_status
         # An observation row is written once per change of kind; later partial
         # lookups may have journaled more than the row shows.

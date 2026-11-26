@@ -322,29 +322,49 @@ def test_did_not_execute_assertion_retires_the_order_without_accounting(live):
     assert not _held(live)
 
 
-# ---- recorded venue evidence: no typed confirmation ------------------------------
+# ---- recorded venue evidence: no typed confirmation, but only for an outcome -------
 
 
-def _partial_evidence(home: Path, transport) -> Decimal:
-    """Kraken shows the entry working with some volume executed; return that volume."""
+def _observations(home: Path) -> list[tuple[str, str]]:
+    return [
+        (k, p.get("status")) for k, p in _ledger(home) if p.get("coid") == ENTRY_COID and k.startswith("reconcile_")
+    ]
+
+
+def _working_evidence(home: Path, transport, *, executed: bool) -> Decimal:
+    """Kraken shows the entry still on the book, partly executed or not; return what executed."""
     requested = _requested(home, ENTRY_COID)
-    first = (requested / 4).quantize(Decimal("0.00001"))
+    first = (requested / 4).quantize(Decimal("0.00001")) if executed else Decimal(0)
     transport.set_order_books(open_rows=_entry_row(vol=requested, vol_exec=first, status="open"))
     transport.balances["SUI"] = str(first)
     _tick(home, transport, ENTRY_BARS)
-    assert _reconciled_entry_qty(home) == [first]
-    assert [k for k, p in _ledger(home) if p.get("coid") == ENTRY_COID and k.startswith("reconcile_")] == [
-        "reconcile_filled"
-    ]
+    assert _reconciled_entry_qty(home) == ([first] if executed else [])
+    assert _observations(home) == ([("reconcile_filled", "partial")] if executed else [("reconcile_open", "open")])
     assert _held(home)
     return first
+
+
+def _partial_evidence(home: Path, transport) -> Decimal:
+    return _working_evidence(home, transport, executed=True)
+
+
+def _filled_unprotected_evidence(home: Path, transport) -> Decimal:
+    """Kraken shows the entry closed and executed, with no stop resting: the tick holds it."""
+    requested = _requested(home, ENTRY_COID)
+    transport.set_order_books(closed_rows=_entry_row(vol=requested, vol_exec=requested, status="closed"))
+    transport.balances["SUI"] = str(requested)
+    _tick(home, transport, ENTRY_BARS)
+    assert _reconciled_entry_qty(home) == [requested]
+    assert _observations(home) == [("reconcile_filled", "filled")]
+    assert _held(home)
+    return requested
 
 
 @live_release
 def test_recorded_venue_observation_resolves_without_typed_confirmation(live):
     transport = _transport()
     _enter(live, transport)
-    first = _partial_evidence(live, transport)
+    executed = _filled_unprotected_evidence(live, transport)
     assert kb_operations.list_unresolved_orders(live, now=0)[0]["last_lookup_result"] == "filled"
     calls_before = len(transport.calls)
 
@@ -352,13 +372,55 @@ def test_recorded_venue_observation_resolves_without_typed_confirmation(live):
 
     assert (body["ok"], body["code"], body["effect"]) == (True, "order_resolved", "changed")
     assert (body["outcome"], Decimal(body["filled_qty"]), body["evidence"]) == (
-        "partial",
-        first,
+        "filled",
+        executed,
         "operator_accepted_venue_observation",
     )
     assert transport.calls[calls_before:] == []
-    assert _reconciled_entry_qty(live) == [first]  # already accounted: journaled once, not again
-    assert project_ownership(live, IDENTITY).attributable_qty == first
+    assert _reconciled_entry_qty(live) == [executed]  # already accounted: journaled once, not again
+    assert project_ownership(live, IDENTITY).attributable_qty == executed
+    assert not _held(live)
+    assert len(_add_orders(transport)) == 1
+
+
+@live_release
+@pytest.mark.parametrize("executed", [False, True], ids=["open", "partial"])
+def test_order_still_working_is_not_settled_from_its_lookup(live, executed):
+    transport = _transport()
+    _enter(live, transport)
+    _working_evidence(live, transport, executed=executed)
+    before = _writes(live)
+    calls_before = len(transport.calls)
+
+    body = _resolve(live, client_order_id=ENTRY_COID)
+
+    assert (body["ok"], body["code"], body["effect"]) == (False, "order_still_working", "refused")
+    assert "still working" in body["message"]
+    assert _writes(live) == before
+    assert _held(live)  # the entry hold on kraken/live stays
+    assert transport.calls[calls_before:] == []
+
+
+@live_release
+@pytest.mark.parametrize("executed", [False, True], ids=["open", "partial"])
+def test_typed_assertion_settles_an_order_still_working(live, executed):
+    transport = _transport()
+    _enter(live, transport)
+    first = _working_evidence(live, transport, executed=executed)
+    asserted = (_requested(live, ENTRY_COID) / 2).quantize(Decimal("0.00001")) if executed else Decimal(0)
+    payload = {"client_order_id": ENTRY_COID, "confirmation": ENTRY_COID}
+    payload.update({"outcome": "executed", "executed_qty": str(asserted)} if executed else {"outcome": "not_executed"})
+    assert _resolve(live, **{**payload, "confirmation": CANARY})["code"] == "confirmation_mismatch"
+    calls_before = len(transport.calls)
+
+    body = _resolve(live, **payload)
+
+    assert (body["ok"], body["code"], body["evidence"]) == (True, "order_resolved", "operator_asserted")
+    assert (body["outcome"], Decimal(body["filled_qty"])) == (("filled", asserted) if executed else ("absent", 0))
+    assert transport.calls[calls_before:] == []
+    assert sum(_reconciled_entry_qty(live), Decimal(0)) == asserted
+    assert _reconciled_entry_qty(live) == ([first, asserted - first] if executed else [])
+    assert project_ownership(live, IDENTITY).attributable_qty == asserted
     assert not _held(live)
     assert len(_add_orders(transport)) == 1
 
@@ -571,12 +633,16 @@ def test_paper_obligation_is_resolved_in_the_paper_only_release(home):
     assert [p["sent"] for p in outbox] == [False]  # retired, never resent
 
 
-def test_lookup_row_without_detail_still_settles_an_order_that_executed_nothing(home):
-    _arm(home)
-    coid = _crash(home=home)
+def _detail_free_lookup(home: Path, coid: str, kind: str) -> None:
     store = OperationalStore(home / "ops.sqlite")
     with store.transaction() as conn:  # an older lookup row: no status, no quantity
-        conn.execute("INSERT INTO ledger (kind, payload) VALUES ('reconcile_absent', ?)", (json.dumps({"coid": coid}),))
+        conn.execute("INSERT INTO ledger (kind, payload) VALUES (?, ?)", (kind, json.dumps({"coid": coid})))
+
+
+def test_lookup_row_without_detail_still_settles_an_absent_order(home):
+    _arm(home)
+    coid = _crash(home=home)
+    _detail_free_lookup(home, coid, "reconcile_absent")
     assert kb_operations.list_unresolved_orders(home, now=0)[0]["last_lookup_result"] == "absent"
 
     body = _resolve(home, client_order_id=coid)
@@ -588,6 +654,22 @@ def test_lookup_row_without_detail_still_settles_an_order_that_executed_nothing(
         Decimal(0),
     )
     assert body["evidence"] == "operator_accepted_venue_observation"
+    assert not _held(home, mode="paper")
+
+
+def test_lookup_row_without_detail_showing_open_is_still_working(home):
+    _arm(home)
+    coid = _crash(home=home)
+    _detail_free_lookup(home, coid, "reconcile_open")
+    assert kb_operations.list_unresolved_orders(home, now=0)[0]["last_lookup_result"] == "open"
+    before = _writes(home)
+
+    body = _resolve(home, client_order_id=coid)
+
+    assert (body["ok"], body["code"], body["effect"]) == (False, "order_still_working", "refused")
+    assert _writes(home) == before
+    assert _held(home, mode="paper")
+    assert _resolve(home, client_order_id=coid, outcome="not_executed", confirmation=coid)["code"] == "order_resolved"
     assert not _held(home, mode="paper")
 
 

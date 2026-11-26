@@ -165,6 +165,80 @@ describe("UnresolvedOrdersList resolve", () => {
     );
   });
 
+  it("asks for a typed assertion when the last lookup shows the order still open", async () => {
+    const resolveOrder = vi.fn().mockResolvedValue(resolved({ outcome: "absent", filled_qty: "0" }));
+    const client = makeClient({
+      listUnresolvedOrders: vi.fn().mockResolvedValue([order({ last_lookup_result: "open" })]),
+      resolveOrder,
+    });
+    render(<UnresolvedOrdersList client={client} />);
+
+    const form = await openResolve();
+    expect(within(form).queryByTestId("ops-unresolved-accept-evidence")).toBeNull();
+    expect(form.textContent).toContain("may still be working");
+    fireEvent.click(within(form).getByLabelText("It did not execute"));
+    const submit = within(form).getByTestId("ops-unresolved-submit") as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    fireEvent.change(within(form).getByTestId("ops-unresolved-confirm"), {
+      target: { value: COID },
+    });
+    fireEvent.click(submit);
+
+    await waitFor(() =>
+      expect(resolveOrder).toHaveBeenCalledWith({
+        client_order_id: COID,
+        outcome: "not_executed",
+        confirmation: COID,
+      }),
+    );
+    expectNothingElseSent(client);
+  });
+
+  it("switches to a typed assertion when the server says the order is still working", async () => {
+    const listUnresolvedOrders = vi.fn().mockResolvedValue([order({ last_lookup_result: "filled" })]);
+    const resolveOrder = vi
+      .fn()
+      .mockResolvedValueOnce({
+        schema_version: "1",
+        code: "order_still_working",
+        ok: false,
+        effect: "refused",
+        message:
+          "The last venue lookup shows this order still working. Cancel it at the exchange and wait for the next lookup, or say what happened and type its client order ID.",
+      })
+      .mockResolvedValueOnce(resolved({ filled_qty: "0.4" }));
+    const client = makeClient({ listUnresolvedOrders, resolveOrder });
+    render(<UnresolvedOrdersList client={client} />);
+
+    const form = await openResolve();
+    fireEvent.click(within(form).getByTestId("ops-unresolved-accept-evidence"));
+
+    const refusal = await screen.findByTestId("ops-unresolved-resolve-error");
+    expect(refusal.textContent).toContain("still working");
+    const assertForm = screen.getByTestId("ops-unresolved-resolve-form");
+    expect(within(assertForm).queryByTestId("ops-unresolved-accept-evidence")).toBeNull();
+    expect(listUnresolvedOrders).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(within(assertForm).getByLabelText("It executed"));
+    fireEvent.change(within(assertForm).getByTestId("ops-unresolved-executed-qty"), {
+      target: { value: "0.4" },
+    });
+    fireEvent.change(within(assertForm).getByTestId("ops-unresolved-confirm"), {
+      target: { value: COID },
+    });
+    fireEvent.click(within(assertForm).getByTestId("ops-unresolved-submit"));
+
+    await waitFor(() => expect(resolveOrder).toHaveBeenCalledTimes(2));
+    expect(resolveOrder).toHaveBeenNthCalledWith(1, { client_order_id: COID });
+    expect(resolveOrder).toHaveBeenNthCalledWith(2, {
+      client_order_id: COID,
+      outcome: "executed",
+      executed_qty: "0.4",
+      confirmation: COID,
+    });
+    expectNothingElseSent(client);
+  });
+
   it("shows a refusal and keeps the order listed and the form open", async () => {
     const listUnresolvedOrders = vi.fn().mockResolvedValue([order()]);
     const resolveOrder = vi.fn().mockResolvedValue({
