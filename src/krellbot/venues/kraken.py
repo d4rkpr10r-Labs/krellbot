@@ -7,7 +7,8 @@ Docs:
 
 Auth: HMAC-SHA512 over `path + SHA256(nonce + postdata)`, key =
 base64decode(secret); the signature is base64 and goes in `API-Sign`. Tests
-inject `now_ns` for monotonic nonces and `min_interval_ns` for the 1-per-second
+inject the epoch-microsecond clock (`now_ms`, a historical name) that feeds
+the monotonic nonces, a `sleep`, and `min_interval_ms` for the 1-per-second
 private-call budget; the journal is appended only on the third rate-limit
 failure.
 """
@@ -50,7 +51,9 @@ PUBLIC_PATH = "/0/public"
 PRIVATE_PATH = "/0/private"
 GET_API_KEY_INFO = "GetApiKeyInfo"
 ADD_ORDER = "AddOrder"
-TIME_MS = 1000
+NS_PER_US = 1_000
+US_PER_MS = 1_000
+US_PER_S = 1_000_000
 
 # `GetApiKeyInfo` permissions as documented at
 # https://docs.kraken.com/api-reference/account-data/get-api-key-info.
@@ -101,7 +104,8 @@ ALL_KNOWN_PERMISSIONS = REQUIRED_PERMISSIONS | FORBIDDEN_PERMISSIONS | DOCUMENTE
 
 
 def _default_now_us() -> int:
-    return time.time_ns() // TIME_MS
+    """Wall clock in epoch microseconds: the nonce scale Kraken has accepted."""
+    return time.time_ns() // NS_PER_US
 
 
 NONCE_FILENAME = "kraken.nonce"
@@ -341,8 +345,10 @@ def _quantize_price(value: Decimal, price_decimals: int) -> Decimal:
 class _NonceStore:
     """Monotonic nonce counter, persisted at `paths.home()/run/kraken.nonce`.
 
-    `now_ms()` returns the current time in milliseconds; tests inject a clock
-    so the nonce never reuses across simulated restarts.
+    `next(now_us)` takes the current time in epoch microseconds. Nonces stay
+    on that scale so a fresh home never sends one below a nonce Kraken
+    already accepted for the key; tests inject a clock so the nonce never
+    reuses across simulated restarts.
     """
 
     home: Path
@@ -363,9 +369,9 @@ class _NonceStore:
         target = self._path()
         paths.atomic_write(target, f"{nonce}\n".encode())
 
-    def next(self, now_ms: int) -> int:
+    def next(self, now_us: int) -> int:
         last = self._read_last()
-        nonce = max(last + 1, now_ms)
+        nonce = max(last + 1, now_us)
         self._write(nonce)
         return nonce
 
@@ -377,8 +383,11 @@ class RateLimitStop(RuntimeError):
 class KrakenVenue:
     """Kraken spot adapter.
 
-    `transport` is injected; tests pass a fake. `now_ms`/`min_interval_ms`
-    allow tests to drive the nonce clock and the 1-per-second rate budget.
+    `transport` is injected; tests pass a fake. `now_ms` is the clock and,
+    despite its historical name, returns epoch microseconds: it feeds the
+    nonce, the private-call spacing and the journal's seconds. Private calls
+    are spaced `min_interval_ms` real milliseconds apart through `sleep`
+    (seconds); tests inject all three.
     """
 
     def __init__(
@@ -396,10 +405,10 @@ class KrakenVenue:
         self._api_key = api_key
         self._secret = secret_b64
         self._transport = transport
-        self._now_ms = now_ms or _default_now_us
+        self._now_us = now_ms or _default_now_us
         self._min_interval_ms = min_interval_ms
         self._nonce = _NonceStore(home if home is not None else paths.home())
-        self._last_call_ms: int = 0
+        self._last_call_us: int | None = None
         self._rate_failures: int = 0
         self._sleep = sleep or time.sleep
 
@@ -705,23 +714,32 @@ class KrakenVenue:
         raise RateLimitStop("kraken rate limit: stopped after 3 failures")
 
     def _send_once(self, endpoint: str, form: dict[str, str]) -> Any:
-        nonce_str = str(self._nonce.next(int(self._now_ms())))
+        # Wait for the slot before drawing the nonce, so a nonce never sits
+        # through the wait while another process on this home sends a higher
+        # one. One POST per call: throttling never resends.
+        self._wait_for_private_slot()
+        nonce_str = str(self._nonce.next(int(self._now_us())))
         body = dict(form)
         body["nonce"] = nonce_str
         path = f"{PRIVATE_PATH}/{endpoint}"
         postdata = urllib.parse.urlencode(body)
         signature = sign(self._secret, path, nonce_str, postdata)
         headers = {"API-Key": self._api_key, "API-Sign": signature}
-        return self._dispatch(f"{BASE_URL}{path}", body, headers)
+        return self._transport.post(f"{BASE_URL}{path}", body, headers)
 
-    def _dispatch(self, url: str, body: dict[str, str], headers: dict[str, str]) -> Any:
-        now_ms = int(self._now_ms())
-        delta = now_ms - self._last_call_ms
-        if self._last_call_ms and delta < self._min_interval_ms:
-            self._sleep((self._min_interval_ms - delta) / 1000)
-            now_ms = int(self._now_ms())
-        self._last_call_ms = now_ms
-        return self._transport.post(url, body, headers)
+    def _wait_for_private_slot(self) -> None:
+        # Space private calls `min_interval_ms` real milliseconds apart. The
+        # clock is in microseconds, so the interval is converted to it before
+        # comparing, and `sleep` takes seconds. A wall clock that steps back
+        # waits one interval, never longer.
+        interval_us = self._min_interval_ms * US_PER_MS
+        now_us = int(self._now_us())
+        if self._last_call_us is not None:
+            wait_us = min(interval_us - (now_us - self._last_call_us), interval_us)
+            if wait_us > 0:
+                self._sleep(wait_us / US_PER_S)
+                now_us = int(self._now_us())
+        self._last_call_us = now_us
 
     def _note_rate_limit(self) -> None:
         self._rate_failures += 1
@@ -733,7 +751,7 @@ class KrakenVenue:
     def _journal_rate_limit(self) -> None:
         journal.append(
             {
-                "ts": int(self._now_ms()) // 1_000_000,
+                "ts": int(self._now_us()) // US_PER_S,
                 "kind": "rate_limit",
                 "venue": "kraken",
                 "pack": "",

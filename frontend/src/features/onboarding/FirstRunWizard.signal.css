@@ -356,3 +356,87 @@
   background: var(--navy, #0e1c29);
   font: inherit;
 }
+
+/*
+ * Status step: what the paper run assumes (F11). A resting --surface panel
+ * with a --line border; values are read from the backend, never invented.
+ * The portrait shrinks here so the card and the sage CTA share the viewport.
+ */
+.kbot-first-run-wizard[data-wizard-step="status"] .kbot-first-run-wizard__visual {
+  width: min(48vw, 180px);
+  max-height: 24vh;
+}
+
+.kbot-first-run-wizard__assumptions {
+  display: grid;
+  gap: 10px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 14px 16px;
+  border: 1px solid var(--line, #22465d);
+  border-radius: var(--radius-panel, 11px);
+  background: var(--surface, #14222e);
+  text-align: left;
+}
+
+.kbot-first-run-wizard__assumptions-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 650;
+  color: var(--text, #e9f0f5);
+}
+
+.kbot-first-run-wizard__assumptions-list {
+  margin: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.kbot-first-run-wizard__assumption {
+  display: grid;
+  grid-template-columns: minmax(0, 8.5rem) minmax(0, 1fr);
+  gap: 10px;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+.kbot-first-run-wizard__assumption dt {
+  color: var(--muted, #abc4d8);
+}
+
+.kbot-first-run-wizard__assumption dd {
+  margin: 0;
+  color: var(--text, #e9f0f5);
+  overflow-wrap: anywhere;
+}
+
+.kbot-first-run-wizard__assumptions-honesty {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text, #e9f0f5);
+}
+
+.kbot-first-run-wizard__assumptions-next {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 650;
+  color: var(--muted, #abc4d8);
+}
+
+.kbot-first-run-wizard__next-actions {
+  margin: 0;
+  padding-left: 1.1rem;
+  display: grid;
+  gap: 4px;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  color: var(--muted, #abc4d8);
+}
+
+@media (max-width: 479px) {
+  .kbot-first-run-wizard__assumption {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+}
