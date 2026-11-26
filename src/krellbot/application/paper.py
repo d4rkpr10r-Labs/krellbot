@@ -48,6 +48,7 @@ from pathlib import Path
 
 from krellbot import config as kb_config
 from krellbot import secrets as kb_secrets
+from krellbot.data import TF_MS
 from krellbot.data.instruments import PAPER_WAVE_KRAKEN_BTC_USD
 from krellbot.execution import reservations
 from krellbot.pack import lint as kb_pack_lint
@@ -237,6 +238,12 @@ _PAPER_TAKER_BPS = {
     "btcc": 30,
     "cryptocom": 50,
 }
+
+# Slippage the paper venue moves every simulated fill by: a buy fills above
+# the close, a sell or stop fill below it. A copy of
+# ``krellbot.venues.paper.SLIPPAGE_BPS`` so the assumptions read never imports
+# the venue risk path; tests/test_paper_assumptions_route.py pins the two equal.
+_PAPER_SLIPPAGE_BPS = 5
 
 
 def _chart_decimal(value: object) -> str | None:
@@ -444,6 +451,94 @@ def project_paper_pnl_position_chart(home: Path) -> dict:
         "position": position,
         "marks": marks,
     }
+
+
+def _positive_number_text(value: object) -> str | None:
+    """A finite positive JSON number as plain Decimal text, else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    text = _chart_decimal(value)
+    if text is None or Decimal(text) <= 0:
+        return None
+    return text
+
+
+def _assumption_stop(pack: dict) -> dict | None:
+    """The pack's ``risk.stop`` rule as the engine reads it, or None.
+
+    ``pct`` and ``atr`` are the stop types ``run.arm_pack`` and the tick
+    compute; any other shape is not described.
+    """
+    risk = pack.get("risk")
+    stop = risk.get("stop") if isinstance(risk, dict) else None
+    if not isinstance(stop, dict):
+        return None
+    if stop.get("type") == "pct":
+        pct = _positive_number_text(stop.get("pct"))
+        return {"type": "pct", "pct": pct} if pct is not None else None
+    if stop.get("type") == "atr":
+        length = stop.get("len")
+        mult = _positive_number_text(stop.get("mult"))
+        if isinstance(length, int) and not isinstance(length, bool) and length > 0 and mult is not None:
+            return {"type": "atr", "len": length, "mult": mult}
+    return None
+
+
+def project_paper_assumptions(home: Path, *, venue: str, pair: str | None = None) -> dict:
+    """What a paper run on ``venue`` assumes, as the paper engine uses it.
+
+    * ``fee_bps`` — the venue's taker fee from ``_PAPER_TAKER_BPS``, charged
+      on every buy and every sell fill (``fee_model``, the research label).
+    * ``slippage_bps`` — ``_PAPER_SLIPPAGE_BPS``, applied against each fill.
+
+    Both are None for a venue the paper engine does not list. With ``pair``,
+    the paper-mode armed record for ``(venue, pair)`` adds what that run was
+    armed with: the pack's ``timeframe`` (decisions act on closed candles of
+    it), its ``stop`` rule, and ``starting_cash`` in the pair's ``quote``
+    asset. Each is None when the record or its pack does not give it.
+
+    Read-only: reads config and the armed pack file as ``run`` does, and
+    never constructs a venue or writes.
+    """
+    from krellbot.application.research import FEE_MODEL
+
+    known = venue in _PAPER_TAKER_BPS
+    body: dict = {
+        "schema_version": SCHEMA_VERSION,
+        "venue": venue,
+        "pair": pair or None,
+        "fee_model": FEE_MODEL if known else None,
+        "fee_bps": _PAPER_TAKER_BPS[venue] if known else None,
+        "slippage_bps": _PAPER_SLIPPAGE_BPS if known else None,
+        "timeframe": None,
+        "stop": None,
+        "starting_cash": None,
+        "quote": None,
+    }
+    if not known or not pair:
+        return body
+    try:
+        config = kb_config.load_config(Path(home))
+    except (OSError, ValueError):
+        return body
+    armed = kb_config.find_armed(config, venue, pair)
+    if armed is None or armed.mode != "paper":
+        return body
+
+    # Same read as ``run.armed_pack_dict``: the pack file the tick evaluates.
+    try:
+        pack = json.loads(Path(armed.pack_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        pack = {}
+    if not isinstance(pack, dict):
+        pack = {}
+    timeframe = pack.get("timeframe")
+    body["timeframe"] = timeframe if isinstance(timeframe, str) and timeframe in TF_MS else None
+    body["stop"] = _assumption_stop(pack)
+    if armed.starting_cash is not None:
+        body["starting_cash"] = _chart_decimal(armed.starting_cash)
+    body["quote"] = base_quote(armed.pair)[1] or None
+    return body
 
 
 # Cap for portfolio deployment cards — same order of magnitude as the
