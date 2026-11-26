@@ -27,13 +27,80 @@ export type ResearchJobSnapshot = {
   error?: { code: string; message: string };
 };
 
+/** One simulated backtest fill leg. Decimal values stay exact strings. */
+export type FillLeg = {
+  side: "buy" | "sell";
+  price: string;
+  qty: string;
+  fee: string;
+  is_stop: boolean;
+};
+
+/** Per-bar fills of one research run, keyed by the bar_ts they filled on. */
+export type ResearchFills = {
+  fills: Record<string, FillLeg[]>;
+};
+
 export type ResearchClient = {
   submitRun(request: RunRequest): Promise<ResearchJobSummary>;
   cancelJob(jobId: string): Promise<void>;
   getResult(jobId: string): Promise<StoredResult | null>;
   getJob(jobId: string): Promise<ResearchJobSnapshot | null>;
   getResultDownload(jobId: string): Promise<Response>;
+  /** Null when the run recorded no fills (404) or the body is malformed. */
+  getFills?(jobId: string): Promise<ResearchFills | null>;
 };
+
+function readFillLeg(raw: unknown): FillLeg | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const leg = raw as Record<string, unknown>;
+  if (leg.side !== "buy" && leg.side !== "sell") {
+    return null;
+  }
+  if (
+    typeof leg.price !== "string" ||
+    typeof leg.qty !== "string" ||
+    typeof leg.fee !== "string" ||
+    typeof leg.is_stop !== "boolean"
+  ) {
+    return null;
+  }
+  return {
+    side: leg.side,
+    price: leg.price,
+    qty: leg.qty,
+    fee: leg.fee,
+    is_stop: leg.is_stop,
+  };
+}
+
+function readFills(raw: unknown): ResearchFills | null {
+  if (raw === null || typeof raw !== "object") {
+    return null;
+  }
+  const fills = (raw as { fills?: unknown }).fills;
+  if (fills === null || typeof fills !== "object" || Array.isArray(fills)) {
+    return null;
+  }
+  const out: Record<string, FillLeg[]> = {};
+  for (const [barTs, legs] of Object.entries(fills as Record<string, unknown>)) {
+    if (!Array.isArray(legs)) {
+      return null;
+    }
+    const parsed: FillLeg[] = [];
+    for (const rawLeg of legs) {
+      const leg = readFillLeg(rawLeg);
+      if (leg === null) {
+        return null;
+      }
+      parsed.push(leg);
+    }
+    out[barTs] = parsed;
+  }
+  return { fills: out };
+}
 
 async function postJson(url: string, body: unknown): Promise<unknown> {
   const response = await fetch(url, {
@@ -202,6 +269,12 @@ export function createHttpClient(): ResearchClient {
         throw new Error(`download failed: ${response.status}`);
       }
       return response;
+    },
+    async getFills(jobId: string): Promise<ResearchFills | null> {
+      const raw = await getJson(
+        `/api/v1/jobs/${encodeURIComponent(jobId)}/fills`,
+      );
+      return readFills(raw);
     },
   };
 }
