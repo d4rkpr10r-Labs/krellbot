@@ -31,6 +31,11 @@ import {
   createReferralHttpClient,
   type ReferralClient,
 } from "../referral/client";
+import {
+  createEntitlementsHttpClient,
+  EntitlementsCard,
+  type EntitlementsClient,
+} from "./EntitlementsCard";
 import "./SettingsView.signal.css";
 
 type SectionMeta = {
@@ -89,6 +94,7 @@ export type SettingsViewProps = {
   versionClient?: VersionClient;
   packsClient?: Pick<PacksClient, "getTelemetryConsent" | "setTelemetryConsent"> &
     Partial<Pick<PacksClient, "redeemActivation" | "requestRefund">>;
+  entitlementsClient?: EntitlementsClient;
 };
 
 export function SettingsView({
@@ -105,6 +111,7 @@ export function SettingsView({
   referralClient,
   versionClient,
   packsClient,
+  entitlementsClient,
 }: SettingsViewProps): JSX.Element {
   const sessionReady = !sessionPending && !sessionFailed;
 
@@ -125,6 +132,15 @@ export function SettingsView({
     fallbackReferralRef.current = createReferralHttpClient();
   }
   const referral = referralClient ?? fallbackReferralRef.current!;
+
+  const fallbackEntitlementsRef = useRef<EntitlementsClient | null>(null);
+  if (
+    fallbackEntitlementsRef.current === null &&
+    entitlementsClient === undefined
+  ) {
+    fallbackEntitlementsRef.current = createEntitlementsHttpClient();
+  }
+  const entitlements = entitlementsClient ?? fallbackEntitlementsRef.current!;
 
   const fallbackPacksRef = useRef<PacksClient | null>(null);
   if (
@@ -380,11 +396,12 @@ export function SettingsView({
                 Trust &amp; billing
               </h2>
               <p className="kbot-settings__panel-note">
-                Honest disclosures, activation keys, refunds, and exchange
-                referral attribution. The engine is free and open-source; packs
-                are optional.
+                What a license gates, honest disclosures, activation keys,
+                refunds, and exchange referral attribution. The engine is free
+                and open-source; packs are optional.
               </p>
             </header>
+            <EntitlementsCard client={entitlements} enabled={sessionReady} />
             <PaidDisclosuresPanel variant="settings" />
             <PackBillingForms client={billingApi} />
             <ReferralDisclosurePanel
