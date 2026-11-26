@@ -22,6 +22,12 @@ A channel is recorded as sent only when its notifier returns; a notifier
 reports failure by raising, the failure is kept per channel for
 ``GET /api/v1/notifications/delivery``, and a failing channel is retried at
 most once every ``RETRY_SECONDS``.
+
+Two processes deliver: the workstation on each Operations read and the
+scheduled tick after each tick, so alerts arrive without a tab open. They
+share the occurrence store, and each pass holds
+``<home>/run/notifications-sent.lock`` from reading the store to writing it,
+so an occurrence is sent once whichever process sees it first.
 """
 
 from __future__ import annotations
@@ -33,6 +39,8 @@ import smtplib
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from pathlib import Path
@@ -43,6 +51,7 @@ from krellbot import paths as kb_paths
 SCHEMA_VERSION = "1"
 CONFIG_FILE = "notifications.json"
 SENT_FILE = "notifications-sent.json"
+SENT_LOCK_FILE = "notifications-sent.lock"
 SMTP_PASSWORD_ENV = "KRELLBOT_SMTP_PASSWORD"
 
 # The occurrence store's shape. A file without it is the earlier flat
@@ -337,6 +346,63 @@ def _save_store(home: Path, store: dict) -> None:
     _save_json(_sent_path(home), store)
 
 
+@contextmanager
+def _store_lock(home: Path) -> Iterator[bool]:
+    """Hold the occurrence store's lock for one read-send-record pass.
+
+    Yields True when held. The lock is never waited for: when another
+    process holds it, that process is delivering, so this pass yields False
+    and must neither send nor write; what is still pending goes out on a
+    later pass. A lock that cannot be taken for any other reason also
+    yields False, because sending without it could send an occurrence
+    twice. The file stays after release so every contender locks the same
+    inode; the kernel releases the lock if its holder exits.
+    """
+
+    path = Path(home) / "run" / SENT_LOCK_FILE
+    fd: int | None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        fd = None
+    if fd is None:
+        yield False
+        return
+    acquired = False
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except OSError:
+            acquired = False
+        yield acquired
+    finally:
+        try:
+            if acquired:
+                if os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+
 def _current_occurrence(record: dict | None, first_ts: int) -> dict | None:
     """Return the stored record when it is this occurrence, else None."""
 
@@ -575,6 +641,16 @@ def _ready_channels(data: dict) -> dict[str, bool]:
     }
 
 
+def delivery_enabled(home: Path) -> bool:
+    """True when the operator has opted in to at least one ready channel.
+
+    Reads only the settings file, so a caller can skip collecting alerts
+    when nothing would be sent.
+    """
+
+    return any(_ready_channels(_load(home)).values())
+
+
 def maybe_notify(
     home: Path,
     alerts: list,
@@ -595,6 +671,10 @@ def maybe_notify(
     retried at most once every ``RETRY_SECONDS``. A notifier exception never
     propagates. When both channels are disabled nothing is read, written or
     called. Returns the number of successful deliveries.
+
+    The workstation and the scheduled tick both call this. The pass holds the
+    store's lock from reading it to writing it; when the other process holds
+    it, this pass sends and writes nothing and returns 0.
     """
 
     data = _load(home)
@@ -602,6 +682,22 @@ def maybe_notify(
     enabled = [name for name in CHANNELS if ready[name]]
     if not enabled:
         return 0
+
+    with _store_lock(home) as held:
+        if not held:
+            return 0
+        return _notify_locked(home, alerts, enabled=enabled, notifier=notifier, now=now)
+
+
+def _notify_locked(
+    home: Path,
+    alerts: list,
+    *,
+    enabled: list[Channel],
+    notifier: Notifier | None,
+    now: int | None,
+) -> int:
+    """One ``maybe_notify`` pass. The caller holds the store's lock."""
 
     now_s = int(time.time()) if now is None else int(now)
     active = notifier if notifier is not None else default_notifier(home)
