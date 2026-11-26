@@ -26,6 +26,36 @@ your Tailscale devices, use the Tailscale Serve + `--tailscale-origin` /
 `--tailscale-user` flow documented in [cli.md](cli.md) — never expose the
 backend directly or use Funnel.
 
+## The heartbeat check
+
+The tick delivers opted-in alert notifications after it runs, so a tick
+that never runs reports nothing. A second scheduler entry,
+`krellbot service heartbeat`, runs every 15 minutes from its own units,
+independently of the tick. It is plumbing for the scheduler, not a command
+to run by hand.
+
+Each check reads only scheduler and journal state: the scheduler's
+`last_error`, the armed venues and the journal. It sends `scheduler_stale`
+(an armed venue's last tick is two hours old or more) and `tick_failure`
+(a scheduler install or enable error) to the desktop and email channels
+you opted in to. It shares the workstation's and the tick's record of what
+was sent, and their lock, so each alert occurrence is still sent once. It
+never fetches candles, builds a venue, reads keys or ticks. With every
+channel off it does nothing. A failing notifier is recorded in the
+Operations Notifications panel and never stops the check.
+
+The heartbeat runs on the same computer as the tick, so it
+**cannot report a powered-off computer**: while the computer is off or
+asleep, neither runs. It also stays quiet about ticks missed while the
+computer was off. On wake the scheduler runs the missed tick, so neither
+the first check nor the first after a gap of more than 45 minutes sends
+`scheduler_stale`. If the tick still does not run, the next check reports
+it.
+
+Installing from the workstation (the Operations Scheduler panel) writes and
+enables both the tick and the heartbeat units. `krellbot service install`
+writes only the tick unit. `krellbot service uninstall` removes both.
+
 ## Renderers
 
 Three platforms, one body shape:
@@ -58,6 +88,18 @@ Three platforms, one body shape:
   there too. All three platforms now set `KRELLBOT_HOME` in their unit so
   the tick writes to the same home the logs use.
 
+The heartbeat units sit beside them and run `<executable> service heartbeat`
+with the same `KRELLBOT_HOME`; the tick units are unchanged:
+
+- **macOS** — `dev.krellbot.heartbeat.plist` with `StartInterval = 900`,
+  logging to `<home>/logs/heartbeat.out.log` and `heartbeat.err.log`.
+- **Linux** — `krellbot-heartbeat.timer` and `krellbot-heartbeat.service`.
+  The timer fires on `OnCalendar=*-*-* *:00/15:00` with `Persistent=false`,
+  so a check missed during sleep is skipped rather than run on wake.
+- **Windows** — `krellbot-heartbeat.xml`, task `\krellbot\heartbeat`, a
+  `CalendarTrigger` repeating every 15 minutes (`PT15M`) with
+  `<StartWhenAvailable>false</StartWhenAvailable>`.
+
 ## Installing
 
 ```
@@ -81,7 +123,8 @@ krellbot service uninstall
 ```
 
 Deletes only the unit files `install` wrote: the plist, both Linux units,
-or the Windows task XML. Files outside the named set are never touched.
+or the Windows task XML. It also deletes the heartbeat units the
+workstation install wrote. Files outside the named set are never touched.
 
 ## Scheduler install vs. release install
 
