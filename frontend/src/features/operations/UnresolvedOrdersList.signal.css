@@ -144,9 +144,136 @@
   white-space: nowrap;
 }
 
+/* Operator resolve (M28.22): neutral controls, never success-colored. */
+
+.kbot-ops__unresolved .kbot-ops__unresolved-feedback {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text, #e9f0f5);
+}
+
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-toggle,
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-submit {
+  margin: 0;
+  min-height: 34px;
+  padding: 6px 12px;
+  border: 1px solid var(--line, #22465d);
+  border-radius: 7px;
+  background: var(--panel, #18354a);
+  color: var(--text, #e9f0f5);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-toggle[aria-expanded="true"] {
+  border-color: var(--seafoam, #a8d8d1);
+}
+
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-toggle:disabled,
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-submit:disabled {
+  opacity: 0.65;
+  cursor: default;
+}
+
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  max-width: 72ch;
+}
+
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-help {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted, #abc4d8);
+}
+
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-outcome {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line, #22465d);
+  border-radius: 7px;
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-outcome legend {
+  padding: 0 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted, #abc4d8);
+}
+
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-choice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  min-height: 34px;
+}
+
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-field {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-field label {
+  font-size: 12px;
+  color: var(--muted, #abc4d8);
+  overflow-wrap: anywhere;
+}
+
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-field code {
+  font-family: var(--font-mono, "IBM Plex Mono", ui-monospace, monospace);
+  color: var(--text, #e9f0f5);
+}
+
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-field input {
+  min-height: 34px;
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--line, #22465d);
+  border-radius: 7px;
+  background: var(--navy, #0e1c29);
+  color: var(--text, #e9f0f5);
+  font-family: var(--font-mono, "IBM Plex Mono", ui-monospace, monospace);
+  font-size: 12.5px;
+}
+
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-field input:disabled {
+  opacity: 0.65;
+}
+
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-toggle:focus-visible,
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-submit:focus-visible,
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-choice input:focus-visible,
+.kbot-ops__unresolved .kbot-ops__unresolved-resolve-field input:focus-visible {
+  outline: 2px solid var(--focus-ring, var(--seafoam, #a8d8d1));
+  outline-offset: 2px;
+}
+
 @media (max-width: 640px) {
   .kbot-ops__unresolved .kbot-ops__unresolved-refresh,
-  .kbot-ops__unresolved .kbot-ops__row-result button {
+  .kbot-ops__unresolved .kbot-ops__row-result button,
+  .kbot-ops__unresolved .kbot-ops__unresolved-resolve-toggle,
+  .kbot-ops__unresolved .kbot-ops__unresolved-resolve-submit,
+  .kbot-ops__unresolved .kbot-ops__unresolved-resolve-choice,
+  .kbot-ops__unresolved .kbot-ops__unresolved-resolve-field input {
     min-height: 44px;
   }
 }
