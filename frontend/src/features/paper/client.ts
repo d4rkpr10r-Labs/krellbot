@@ -105,10 +105,35 @@ export type PaperStatusSelect = {
   pair: string;
 };
 
+/**
+ * The configured limits served by ``GET /api/v1/paper/details`` for one
+ * paper-mode armed record. ``risk_cap_pct`` is a percent, not a currency
+ * amount; ``resting_stop`` is the durable stop on this pair. Each value is
+ * the server's Decimal string, or ``null`` when the server (or this adapter)
+ * could not read a finite decimal — never a repaired or guessed number.
+ * The projection fields exist only when the backend reports ``armed: true``.
+ */
+export type PaperDetails = {
+  schema_version: string;
+  armed: boolean;
+  venue?: string;
+  pair?: string;
+  pack_id?: string;
+  starting_cash?: string | null;
+  risk_cap_pct?: string | null;
+  resting_stop?: string | null;
+};
+
+/** Reads one armed record's configured limits, selected by venue and pair. */
+export type PaperDetailsClient = {
+  getDetails(select?: PaperStatusSelect): Promise<PaperDetails>;
+};
+
 export type PaperClient = {
   getStatus(select?: PaperStatusSelect): Promise<PaperStatus>;
   getHealth?(select?: PaperStatusSelect): Promise<PaperHealth>;
   getPosition?(select?: PaperStatusSelect): Promise<PaperPosition>;
+  getDetails?(select?: PaperStatusSelect): Promise<PaperDetails>;
   getChart?(): Promise<PaperChart>;
   pauseEntries(venue: string, pair: string): Promise<PaperCommandResult>;
   resumeEntries(venue: string, pair: string): Promise<PaperCommandResult>;
@@ -194,6 +219,8 @@ export type PaperArmedView = {
 
 export type PaperArmedClient = {
   listArmed(): Promise<PaperArmedView>;
+  /** Optional: a list-only client shows each row's risk cap as unavailable. */
+  getDetails?(select?: PaperStatusSelect): Promise<PaperDetails>;
 };
 
 /** One armed fleet row from ``GET /api/v1/paper/fleet``. */
@@ -881,6 +908,63 @@ async function getPaperPosition(select?: PaperStatusSelect): Promise<PaperPositi
   return adaptPosition(raw);
 }
 
+/** A plain finite decimal string, the only shape the details route serves. */
+const DETAILS_DECIMAL = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/;
+
+function detailsDecimal(raw: unknown): string | null {
+  return typeof raw === "string" && DETAILS_DECIMAL.test(raw) ? raw : null;
+}
+
+/**
+ * Decode the ``GET /api/v1/paper/details`` body. Values are quoted as the
+ * server sent them; anything that is not a plain decimal string becomes
+ * ``null`` so the workstation says 'unavailable' rather than a repaired
+ * number. An armed body without its market identity is refused.
+ */
+function adaptDetails(raw: Record<string, unknown>): PaperDetails {
+  const out: PaperDetails = {
+    schema_version: typeof raw.schema_version === "string" ? raw.schema_version : "1",
+    armed: raw.armed === true,
+  };
+  if (!out.armed) {
+    return out;
+  }
+  if (typeof raw.venue !== "string" || typeof raw.pair !== "string") {
+    throw new Error("paper details body missing market identity");
+  }
+  out.venue = raw.venue;
+  out.pair = raw.pair;
+  if (typeof raw.pack_id === "string") out.pack_id = raw.pack_id;
+  out.starting_cash = detailsDecimal(raw.starting_cash);
+  out.risk_cap_pct = detailsDecimal(raw.risk_cap_pct);
+  out.resting_stop = detailsDecimal(raw.resting_stop);
+  return out;
+}
+
+/**
+ * GET ``/api/v1/paper/details?venue=&pair=``: one armed record's risk cap
+ * and the stop resting on its pair. Same authenticated GET envelope as the
+ * other paper reads; no retry.
+ */
+async function getPaperDetails(select?: PaperStatusSelect): Promise<PaperDetails> {
+  const query =
+    select === undefined
+      ? ""
+      : `?${new URLSearchParams({ venue: select.venue, pair: select.pair }).toString()}`;
+  const response = await fetch(`/api/v1/paper/details${query}`, {
+    method: "GET",
+    credentials: "include",
+    headers: {
+      "X-Krellbot-CSRF": getCsrf(),
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`paper details failed: ${response.status}`);
+  }
+  const raw = (await response.json()) as Record<string, unknown>;
+  return adaptDetails(raw);
+}
+
 function adaptChartPoint(
   raw: unknown,
   valueKey: "value" | "qty" | "price",
@@ -986,6 +1070,7 @@ export function createHttpClient(): PaperClient &
   PaperRunsClient &
   PaperArmedClient &
   PaperChartClient &
+  PaperDetailsClient &
   FleetArmedClient &
   ForwardPaperLedgerClient &
   Required<Pick<PaperClient, "raiseStop">> {
@@ -1009,6 +1094,9 @@ export function createHttpClient(): PaperClient &
     },
     getPosition(select?: PaperStatusSelect): Promise<PaperPosition> {
       return getPaperPosition(select);
+    },
+    getDetails(select?: PaperStatusSelect): Promise<PaperDetails> {
+      return getPaperDetails(select);
     },
     getChart(): Promise<PaperChart> {
       return getPaperChart();
