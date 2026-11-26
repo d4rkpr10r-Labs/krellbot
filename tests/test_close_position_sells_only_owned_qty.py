@@ -18,6 +18,8 @@ paper and live:
 * the kill switch alone does not stop it, and a repeat is refused with no
   resend;
 * a read-only Tailscale session cannot send it;
+* the daily-loss gate (M28.31) prices a paper close's exit, so an arm with a
+  limit does not read ``loss_limit_unavailable`` after it;
 * an arm that was never closed keeps its exact config bytes.
 
 Paper runs on the paper venue; live on Kraken and Coinbase adapters over fake
@@ -49,6 +51,7 @@ from krellbot.application.paper import PaperService
 from krellbot.config import ArmedPack, Config, load_config, save_config
 from krellbot.execution.obligations import read_obligations
 from krellbot.pack.model import Candle
+from krellbot.run import daily_loss
 from krellbot.run.lock import TickLock
 from krellbot.run.reconcile import OwnershipIdentity, project_ownership
 from krellbot.storage.database import OperationalStore
@@ -1318,7 +1321,6 @@ def test_a_read_only_tailscale_session_cannot_close_a_position(home, tmp_path, m
 
 
 def test_a_paper_close_is_priced_by_the_daily_loss_gate(home):
-    daily_loss = pytest.importorskip("krellbot.run.daily_loss", reason="the daily-loss gate (M28.31) is not merged")
     market = _PaperMarket(home)
     config = load_config(home)
     config.armed[0].daily_loss_limit_pct = Decimal(50)

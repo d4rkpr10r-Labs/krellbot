@@ -15,7 +15,11 @@
     5. Acts on the latest closed bar only. Missed bars are coalesced by
        feeding every candle up to and including the latest into evaluate.run
        so indicator state includes them.
-    6. Entry / exit / raise_stop per the engine rules.
+    6. Entry / exit / raise_stop per the engine rules. Before the entry
+       decision the arm's equity is measured and persisted with the UTC day's
+       opening value (``daily_loss``); an arm with a daily loss limit refuses
+       entries with ``daily_loss_limit`` or ``loss_limit_unavailable``. Exits
+       and stops are not gated by it.
     7. Journal one tick record per pack per bar, including refusals.
     8. If entries are blocked by the license gate, print the lapsed message.
 
@@ -73,6 +77,7 @@ from krellbot.storage.outbox import (
 from krellbot.venues.base import OrderOutcome, OrderRef, PairRules, ProtectiveStopRejectedError, VenueRejectedError
 from krellbot.venues.paper import SLIPPAGE_BPS
 
+from . import daily_loss as kb_daily_loss
 from .lock import TickLock
 
 # Tick ``intent_refused`` code when journal history for an arm cannot be attributed.
@@ -624,6 +629,11 @@ def tick(
         # C4: per-pack refusal on StoreError during a venue send.
         pack_intent_refused: dict[str, str] = {}
         any_refused = False
+        # Daily-loss gate: this venue's per-arm equity states (None when the
+        # file cannot be read: an arm with a limit then holds entries and the
+        # file is left as it is), and this tick's updates to them.
+        loss_states = kb_daily_loss.read_states(home, venue)
+        loss_updates: dict[str, dict] = {}
 
         for armed in armed_for_venue:
             pack = armed_pack_dict(home, armed)
@@ -886,6 +896,22 @@ def tick(
             # marker, never with ``entries_paused``: on live that flag is the
             # restore fence's mark, which would halt the whole venue's tick.
             entries_suppressed = armed.entries_paused or kill_engaged or armed.closed_by_operator_at is not None
+            # The daily-loss gate holds new entries only: it is checked last,
+            # below, and the exit and stop paths never read it.
+            loss_refusal = _daily_loss_refusal(
+                home,
+                armed,
+                identity,
+                ownership=ownership,
+                states=loss_states,
+                updates=loss_updates,
+                fills=snap.recent_fills or [],
+                candles=candles,
+                stop_fill_ids=stop_fill_ids,
+                stop_fill_qty=stop_fill_qty,
+                venue=venue,
+                now=now,
+            )
             # Unresolved intents on this venue and mode (or of unknown scope),
             # or an unreadable store, hold new entries. Exits and protection
             # are not gated here.
@@ -896,7 +922,7 @@ def tick(
                 rules = venue_obj.rules(armed.pair)
             except InstrumentMetadataError as exc:
                 metadata_refusal = exc.code
-            if (
+            entry_ready = (
                 not blocked
                 and not entries_suppressed
                 and not reconcile_blocked
@@ -906,7 +932,14 @@ def tick(
                 and owned == Decimal(0)
                 and target.stop_price is not None
                 and rules is not None
-            ):
+            )
+            if entry_ready and loss_refusal is not None:
+                # Recorded only for an entry that would otherwise be placed.
+                # Nothing below is sent for it: an entry needs owned == 0, and
+                # the exit and raise-stop branches need owned > 0.
+                pack_intent_refused.setdefault(armed.pack_id, loss_refusal)
+                print(f"entries held: {loss_refusal}", flush=True)
+            if entry_ready and loss_refusal is None:
                 entry_coid_for_signal = coid_for(
                     pack_id=armed.pack_id,
                     pack_version=armed.pack_version,
@@ -1126,6 +1159,14 @@ def tick(
                     print(f"intent refused: {exc.code}", flush=True)
             if on_pack_completed is not None:
                 on_pack_completed(armed.pack_id, armed.pair)
+
+        if loss_states is not None and loss_updates:
+            try:
+                kb_daily_loss.write_states(home, venue, {**loss_states, **loss_updates})
+            except OSError as exc:
+                # The next tick measures again; an arm whose day open was not
+                # saved records it then.
+                print(f"daily loss state not saved: {type(exc).__name__}", flush=True)
 
         config = kb_config.load_config(home)
         for armed in config.armed:
@@ -2061,6 +2102,54 @@ def _intent_identity(armed: kb_config.ArmedPack, bar_ts: int) -> dict:
 
 def _ownership_identity(armed: kb_config.ArmedPack, venue: str) -> OwnershipIdentity:
     return OwnershipIdentity(pack_id=armed.pack_id, venue=venue, pair=armed.pair, mode=armed.mode)
+
+
+def _daily_loss_refusal(
+    home: Path,
+    armed: kb_config.ArmedPack,
+    identity: OwnershipIdentity,
+    *,
+    ownership,
+    states: dict[str, dict] | None,
+    updates: dict[str, dict],
+    fills: list,
+    candles: list,
+    stop_fill_ids: list[str],
+    stop_fill_qty: Decimal,
+    venue: str,
+    now: float,
+) -> str | None:
+    """Measure the arm's equity into ``updates``; return the daily-loss entry refusal, if any.
+
+    Runs for every arm that acts on a bar, with or without a limit, so each
+    UTC day's opening value is recorded; only an arm with a limit is held.
+    A measurement that fails holds such an arm (``loss_limit_unavailable``)
+    and never affects one without a limit. Never sends anything.
+    """
+    key = kb_daily_loss.arm_key(identity)
+    previous = (states or {}).get(key)
+    try:
+        measured = kb_daily_loss.measure(
+            home,
+            identity,
+            ownership=ownership,
+            starting_cash=armed.starting_cash,
+            fills=fills,
+            candles=candles,
+            cached=kb_daily_loss.cached_cash_flows(previous),
+            fee_bps=_fee_bps_for_venue(venue),
+            hold_coid=lambda fill_id: _unlinked_sell_coid(identity, fill_id),
+            stop_fill_ids=stop_fill_ids,
+            stop_fill_qty=stop_fill_qty,
+        )
+    except (StoreError, OSError, ArithmeticError, ValueError, TypeError):
+        measured = kb_daily_loss.Measure(None, "equity_unreadable")
+    state = kb_daily_loss.observe(previous, measured, now=now)
+    updates[key] = state
+    if states is None:
+        return kb_daily_loss.CODE_LOSS_LIMIT_UNAVAILABLE if armed.daily_loss_limit_pct is not None else None
+    code, _reason = kb_daily_loss.assess(armed.daily_loss_limit_pct, armed.starting_cash, state, now=now)
+    return code
 
 
 def _stop_fills_for(home: Path, identity: OwnershipIdentity, fills: list) -> tuple[list[str], Decimal]:

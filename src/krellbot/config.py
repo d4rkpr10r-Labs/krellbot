@@ -27,6 +27,10 @@ An `ArmedPack` record has:
         Absent when None, so an arm never closed keeps its config bytes. A
         stored value that is not an integer loads as 0, which still holds
         entries.)
+    daily_loss_limit_pct: Decimal | None (optional daily loss limit, a
+        percent of starting_cash; off when None, and then not written, so an
+        arm without it keeps its config bytes. A stored value that is not a
+        number loads as NaN, which the tick treats as unusable.)
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from krellbot import paths
@@ -128,6 +132,7 @@ class ArmedPack:
     pending_version: str | None = None
     entries_paused: bool = False
     closed_by_operator_at: int | None = None
+    daily_loss_limit_pct: Decimal | None = None
 
 
 @dataclass
@@ -178,6 +183,7 @@ def load_config(home: Path) -> Config:
                         ),
                         entries_paused=bool(entry.get("entries_paused", False)),
                         closed_by_operator_at=_stored_closed_at(entry),
+                        daily_loss_limit_pct=_stored_loss_limit(entry),
                     )
                 )
             except (KeyError, ValueError, TypeError):
@@ -211,6 +217,11 @@ def _serialize_armed(a: ArmedPack) -> dict:
     # Absent when unset, so an arm that was never closed keeps its exact bytes.
     if a.closed_by_operator_at is None:
         del out["closed_by_operator_at"]
+    # Off is absent, so an arm that never had a limit keeps its exact bytes.
+    if a.daily_loss_limit_pct is None:
+        del out["daily_loss_limit_pct"]
+    else:
+        out["daily_loss_limit_pct"] = str(a.daily_loss_limit_pct)
     return out
 
 
@@ -227,6 +238,45 @@ def _stored_closed_at(entry: dict) -> int | None:
 def entries_held(a: ArmedPack) -> bool:
     """True while the operator holds this arm's new entries: a pause, or a close not yet resumed."""
     return a.entries_paused or a.closed_by_operator_at is not None
+
+
+def _stored_loss_limit(entry: dict) -> Decimal | None:
+    """The stored daily loss limit; NaN when present but not a number, so it fails closed."""
+    raw = entry.get("daily_loss_limit_pct")
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
+        return Decimal("NaN")
+    try:
+        return Decimal(str(raw))
+    except InvalidOperation:
+        return Decimal("NaN")
+
+
+def set_daily_loss_limit(home: Path, *, venue: str, pair: str, pct: Decimal | None) -> str:
+    """Set (or clear, with ``None``) the daily loss limit of the arm on ``venue`` ``pair``.
+
+    Serialized with the stop/pause/resume commands. Returns ``changed``,
+    ``unchanged``, ``not_armed``, ``starting_cash_unknown`` (a limit needs a
+    starting cash to be a percent of) or ``busy``. Validating ``pct`` is the
+    caller's job. Nothing is written unless the result is ``changed``.
+    """
+    with _paper_command_transaction(home) as acquired:
+        if not acquired:
+            return "busy"
+        config = load_config(home)
+        armed = find_armed(config, venue, pair)
+        if armed is None:
+            return "not_armed"
+        cash = armed.starting_cash
+        if pct is not None and (cash is None or not cash.is_finite() or cash <= 0):
+            return "starting_cash_unknown"
+        current = armed.daily_loss_limit_pct
+        if current is pct or (current is not None and pct is not None and current == pct):
+            return "unchanged"
+        armed.daily_loss_limit_pct = pct
+        save_config(home, config)
+        return "changed"
 
 
 def find_armed(config: Config, venue: str, pair: str) -> ArmedPack | None:
