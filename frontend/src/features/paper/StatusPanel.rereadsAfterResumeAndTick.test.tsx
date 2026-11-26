@@ -225,4 +225,56 @@ describe("Run re-reads paper status after Resume and an out-of-band tick", () =>
     expect(getStatus.mock.calls.length).toBe(statusReads + 1);
     expect(getPosition.mock.calls.length).toBe(positionReads + 1);
   });
+
+  it("an automatic re-read never swallows the operator's own Refresh: the click gets its own read", async () => {
+    const server: PaperServer = {
+      entriesPaused: false,
+      freeCash: "1000",
+      holdings: [],
+    };
+    const { client, getStatus } = fakePaperClient(server);
+    const view = render(<StatusPanel client={client} refreshKey={0} />);
+    await waitFor(() => {
+      expect(screen.getByTestId("paper-position").textContent).toBe(
+        PRE_TICK_SENTENCE,
+      );
+    });
+
+    // The automatic read (a refreshKey bump) is still in flight when the
+    // operator clicks Refresh, and the operator's read then fails.
+    let finishAutoRead: (() => void) | undefined;
+    const baseline = getStatus.getMockImplementation();
+    getStatus
+      .mockImplementationOnce(
+        () =>
+          new Promise<PaperStatus>((resolve) => {
+            finishAutoRead = () => {
+              void baseline?.().then(resolve);
+            };
+          }),
+      )
+      .mockImplementationOnce(async () => {
+        throw new TypeError("Failed to fetch");
+      });
+    const statusReads = getStatus.mock.calls.length;
+    view.rerender(<StatusPanel client={client} refreshKey={1} />);
+    await waitFor(() => {
+      expect(getStatus.mock.calls.length).toBe(statusReads + 1);
+    });
+    fireEvent.click(
+      within(paperPanel()).getByRole("button", { name: "Refresh status" }),
+    );
+    await act(async () => {
+      finishAutoRead?.();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(getStatus.mock.calls.length).toBe(statusReads + 2);
+      const alerts = within(paperPanel())
+        .getAllByRole("alert")
+        .map((node) => node.textContent ?? "");
+      expect(alerts.some((text) => /status refresh failed/i.test(text))).toBe(true);
+    });
+  });
 });

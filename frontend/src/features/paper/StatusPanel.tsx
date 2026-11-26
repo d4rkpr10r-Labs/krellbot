@@ -1094,11 +1094,21 @@ export function StatusPanel({
       detailsEpochRef.current += 1;
     };
   }, [client, detailsReadable, state.status]);
-  const refreshStatus = async (): Promise<void> => {
+  // An automatic re-read (a `refreshKey` bump) must never swallow the
+  // operator's own Refresh: a click that lands while one is in flight runs
+  // its own read as soon as that one ends. A second click during a manual
+  // read or a command is still skipped, as before.
+  const autoReadInFlightRef = useRef(false);
+  const manualReadQueuedRef = useRef(false);
+  const refreshStatus = async (source: "manual" | "auto" = "manual"): Promise<void> => {
     if (inFlightRef.current) {
+      if (source === "manual" && autoReadInFlightRef.current) {
+        manualReadQueuedRef.current = true;
+      }
       return;
     }
     inFlightRef.current = true;
+    autoReadInFlightRef.current = source === "auto";
     const epoch = ++epochRef.current;
     try {
       const next = await client.getStatus(statusSelect);
@@ -1120,6 +1130,11 @@ export function StatusPanel({
       });
     } finally {
       inFlightRef.current = false;
+      autoReadInFlightRef.current = false;
+      if (manualReadQueuedRef.current) {
+        manualReadQueuedRef.current = false;
+        void refreshStatus("manual");
+      }
     }
   };
 
@@ -1135,7 +1150,7 @@ export function StatusPanel({
       return;
     }
     lastRefreshKeyRef.current = refreshKey;
-    void refreshStatus();
+    void refreshStatus("auto");
   }, [refreshKey]);
 
   const runCommand = async (
