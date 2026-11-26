@@ -126,12 +126,6 @@ function engagedAtText(engagedAt: number | null): string | null {
   );
 }
 
-function modeLabel(live: LiveStatus): string {
-  // Paper is only honest when the kill switch is released AND nothing is
-  // authorized for live; any live authorization or an engaged switch is Live.
-  return live.kill_switch.engaged || live.authorized.length > 0 ? "Live" : "Paper";
-}
-
 function ordersText(live: LiveStatus): string {
   const { kill_switch: kill, authorized } = live;
   if (kill.engaged) {
@@ -170,7 +164,12 @@ export function StatusStrip({
 
 function StatusStripBody({ live }: { live: LiveStatus | null }): JSX.Element {
   const engaged = live?.kill_switch.engaged === true;
-  const mode = live ? modeLabel(live) : "Paper";
+  // Older snapshots can include stored grants without reporting release policy.
+  // Keep those permissions separate from the engine's ability to send an order.
+  const hasPolicy = live?.release_policy === "paper_only" || live?.release_policy === "live_allowed";
+  const liveEnabled = live?.live_enabled === true && live.release_policy !== "paper_only";
+  const grantOnly = !hasPolicy && !liveEnabled && (live?.authorized.length ?? 0) > 0;
+  const mode = liveEnabled ? "Live enabled" : "Paper";
   const engagedAt = engaged ? engagedAtText(live?.kill_switch.engaged_at ?? null) : null;
   const view = live;
   return (
@@ -186,9 +185,17 @@ function StatusStripBody({ live }: { live: LiveStatus | null }): JSX.Element {
         }
         aria-hidden="true"
       />
-      <span className="kbot-status__mode" aria-label={`Mode ${mode}`}>
-        {mode}
-      </span>
+      {grantOnly ? (
+        <>
+          <span>Stored authorization: <strong className="kbot-status__mode">Live</strong></span>
+          <span>Trading mode unconfirmed</span>
+        </>
+      ) : (
+        <span>
+          {hasPolicy || liveEnabled ? "Trading capability: " : "Preview: "}
+          <strong className="kbot-status__mode" aria-label={`Mode ${mode}`}>{mode}</strong>
+        </span>
+      )}
       <span className="kbot-status__divider" aria-hidden="true">·</span>
       {view === null ? (
         <span className="kbot-status__orders" data-testid="live-orders-status">

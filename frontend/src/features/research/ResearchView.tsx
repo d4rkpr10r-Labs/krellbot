@@ -753,8 +753,8 @@ export function ResearchView({
             Strategy source
           </h2>
           <p className="kbot-research__panel-note">
-            A saved strategy revision, or a pack file on disk when no revision
-            is selected.
+            Use the saved revision shown here, or enter a local pack path when
+              no revision is selected.
           </p>
           <label className="kbot-research__field" htmlFor="kbot-research-pack">
             <span className="kbot-research__field-label">Pack path</span>
@@ -798,7 +798,8 @@ export function ResearchView({
             Data source
           </h2>
           <p className="kbot-research__panel-note">
-            Path to a local candle CSV the engine will read for this run.
+            Enter the path to a candle CSV on the workstation computer. Use data
+              for the same market and interval as your strategy.
           </p>
           <label className="kbot-research__field" htmlFor="kbot-research-dataset">
             <span className="kbot-research__field-label">Dataset path</span>
@@ -933,7 +934,9 @@ export function ResearchView({
             Costs
           </h2>
           <p className="kbot-research__panel-note">
-            Fee assumption applied by the engine, in basis points per side.
+            Set the fee on each buy and sell. For example, 40 basis points is
+              0.40% per side. The backtest also models 5 basis points of slippage
+              on each fill.
           </p>
           <label className="kbot-research__field" htmlFor="kbot-research-fee-bps">
             <span className="kbot-research__field-label">Fee basis points</span>

@@ -640,6 +640,11 @@ export function RehearsalPanel({ client }: RehearsalPanelProps): JSX.Element {
               data-testid="rehearsal-commands-panel"
             >
               <h3 className="kbot-rehearsal__panel-title">Rehearsal commands</h3>
+              <p>
+                Start runs a separate sample strategy on synthetic candles. Pause
+                blocks new entries. Stop ends further evaluations and keeps the
+                simulated holdings and fills. A stopped rehearsal cannot restart.
+              </p>
               <div className="kbot-rehearsal__actions">
                 <button
                   type="button"

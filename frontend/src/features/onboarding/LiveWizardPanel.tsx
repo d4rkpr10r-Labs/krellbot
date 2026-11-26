@@ -13,14 +13,14 @@ const STEPS: ReadonlyArray<{ id: WizardStep; label: string }> = [
   { id: "live", label: "Live state" },
 ];
 
-const PANEL_TITLE = "Live-ready path";
+const PANEL_TITLE = "Exchange keys and trading permissions";
 const HELPER =
-  "Local path toward live: trust posture, trade-only key probe, then honest paper-only release versus live grant. No license ask. Keys stay on this machine.";
+  "Check key storage on this computer, test a Kraken key, or review an existing trading authorization.";
 
 const WELCOME_TRUTHS: ReadonlyArray<string> = [
   "The engine is free and open-source.",
   "Exchange keys are stored locally in the OS keychain and are not sent to krellbot.dev.",
-  "Official packs are optional and recommended; this path never asks for a license token.",
+  "You can run a paper strategy without an exchange account or a paid pack.",
 ];
 
 const KEY_PERM_REQUIREMENT =
@@ -41,7 +41,7 @@ function describeGrant(view: LiveWizardHonesty): string {
     view.live_grant.expires_at != null
       ? new Date(view.live_grant.expires_at * 1000).toISOString()
       : "unknown expiry";
-  return `Grant on file: ${grant.venue} ${grant.pair} until ${until}. A grant is not live order send.`;
+  return `Grant on file: ${grant.venue} ${grant.pair} until ${until}. This records permission only. It cannot start a strategy or place an order.`;
 }
 
 export function LiveWizardPanel({
@@ -124,7 +124,7 @@ export function LiveWizardPanel({
         >
           <h4 className="kbot-live-wizard__panel-title">Welcome</h4>
           <p className="kbot-live-wizard__panel-copy">
-            Read-only orientation. Nothing posts a preference from this step.
+            Paper trading uses a simulated balance. Connecting an exchange key is optional.
           </p>
           <ul className="kbot-live-wizard__list">
             {WELCOME_TRUTHS.map((line) => (
@@ -135,7 +135,7 @@ export function LiveWizardPanel({
             className="kbot-live-wizard__panel-copy"
             data-testid="live-wizard-no-license"
           >
-            No license token is collected on this path.
+            No license token is collected when you check an exchange key.
           </p>
         </div>
       ) : null}
@@ -145,14 +145,13 @@ export function LiveWizardPanel({
           className="kbot-live-wizard__panel"
           data-testid="live-wizard-security"
         >
-          <h4 className="kbot-live-wizard__panel-title">Security posture</h4>
+          <h4 className="kbot-live-wizard__panel-title">Local security checks</h4>
           <p className="kbot-live-wizard__panel-copy">
-            Local trust snapshot from this machine. No venue probe and no
-            credential read on this step.
+            Check whether the keychain can store keys and who can read the Krellbot data folder.
           </p>
           {loading ? (
             <p className="kbot-live-wizard__loading" data-testid="live-wizard-loading">
-              Reading trust snapshot…
+              Checking local storage…
             </p>
           ) : null}
           {error ? (
@@ -171,8 +170,8 @@ export function LiveWizardPanel({
                 data-testid="live-wizard-posture"
               >
                 {trust.posture_ok
-                  ? "Aggregate posture looks private on this machine."
-                  : `${trust.posture_warning ?? "Posture issue detected"}. Run krellbot doctor.`}
+                  ? "A persistent keychain is available and the data folder is private to your user."
+                  : `${trust.posture_warning ?? "Could not verify local key storage"}. Run krellbot doctor.`}
               </p>
               <ul className="kbot-live-wizard__rows">
                 <li className="kbot-live-wizard__row">
@@ -186,7 +185,7 @@ export function LiveWizardPanel({
                   </span>
                 </li>
                 <li className="kbot-live-wizard__row">
-                  <span className="kbot-live-wizard__row-label">Home</span>
+                  <span className="kbot-live-wizard__row-label">Data folder</span>
                   <span
                     className="kbot-live-wizard__row-value"
                     data-testid="live-wizard-home"
@@ -195,7 +194,7 @@ export function LiveWizardPanel({
                   </span>
                 </li>
                 <li className="kbot-live-wizard__row">
-                  <span className="kbot-live-wizard__row-label">Home mode</span>
+                  <span className="kbot-live-wizard__row-label">Folder permissions</span>
                   <span
                     className="kbot-live-wizard__row-value"
                     data-testid="live-wizard-home-mode"
@@ -205,7 +204,7 @@ export function LiveWizardPanel({
                   </span>
                 </li>
                 <li className="kbot-live-wizard__row">
-                  <span className="kbot-live-wizard__row-label">Bind</span>
+                  <span className="kbot-live-wizard__row-label">Workstation address</span>
                   <span
                     className="kbot-live-wizard__row-value"
                     data-testid="live-wizard-bind"
@@ -244,8 +243,7 @@ export function LiveWizardPanel({
         >
           <h4 className="kbot-live-wizard__panel-title">Exchange</h4>
           <p className="kbot-live-wizard__panel-copy">
-            One credentialed trade-only probe-and-store. Status is stored-key
-            history, never a live connection claim. No license field.
+            Krellbot sends an authenticated permission check to Kraken. It saves the key in your OS keychain only if the check passes. A saved key tells you the check passed when you added it.
           </p>
           <KeysOnboardingPanel
             client={keysClient}
@@ -257,11 +255,9 @@ export function LiveWizardPanel({
 
       {step === "live" ? (
         <div className="kbot-live-wizard__panel" data-testid="live-wizard-live">
-          <h4 className="kbot-live-wizard__panel-title">Paper-only vs live grant</h4>
+          <h4 className="kbot-live-wizard__panel-title">Live trading permissions</h4>
           <p className="kbot-live-wizard__panel-copy">
-            These are separate rails. A stored key or a grant file does not
-            make this workstation live-ready while the paper-only release is
-            active.
+            A grant records permission for one exchange and pair. The paper-only release blocks live orders even when a key and a grant are both present.
           </p>
           {loading ? (
             <p className="kbot-live-wizard__loading">Reading live state…</p>
@@ -279,7 +275,7 @@ export function LiveWizardPanel({
                 {view.paper_only_release
                   ? view.release_policy_message ||
                     "Live order send is disabled in this paper-only release."
-                  : "Release policy allows live (owner flip)."}
+                  : "This build permits live trading subject to its other checks."}
               </p>
               <p
                 className="kbot-live-wizard__state-chip"
@@ -291,13 +287,13 @@ export function LiveWizardPanel({
                 className="kbot-live-wizard__state-chip"
                 data-testid="live-wizard-live-ready"
               >
-                Live-ready claim: no
+                This screen cannot arm a strategy for live trading.
               </p>
               <p
                 className="kbot-live-wizard__state-chip"
                 data-testid="live-wizard-keys-local"
               >
-                Keys leave this machine:{" "}
+                Keys sent to krellbot.dev:{" "}
                 {view.keys_leave_machine ? "yes" : "no"}
               </p>
             </div>
