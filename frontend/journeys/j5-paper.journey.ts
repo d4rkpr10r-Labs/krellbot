@@ -67,10 +67,11 @@ test("J5.3 As paper ticks run, the status shows position, cash, resting stop and
   const stops=state.open_orders.filter((o: Record<string,unknown>)=>o.stop_price!==undefined);
   expect(stops.length).toBeGreaterThan(0);
   // A blank "New resting stop" input is NOT disclosure of the current stop.
-  const displayed=(await page.getByTestId("paper-status-panel").innerText());
-  // Journey gap: https://github.com/d4rk-pri0r/krellbot/issues/100
-  test.fail(true, "https://github.com/d4rk-pri0r/krellbot/issues/100");
-  expect(displayed,"current resting stop must be shown, not merely editable").toContain(String(stops[0].stop_price));
+  const displayed=page.getByTestId("paper-status-panel").getByTestId("paper-resting-stop");
+  await expect(displayed,"current resting stop must be shown, not merely editable").toHaveText(/^Resting stop \d/);
+  // Compare by value: run/ keeps the stop quantized ("47.5000"); the details route serves it canonical ("47.5").
+  const shown=/^Resting stop (\d+(?:\.\d+)?)\b/.exec(await displayed.innerText())![1];
+  expect(Number(shown),"current resting stop must be shown at its persisted value").toBe(Number(stops[0].stop_price));
 });
 
 test("J5.4 The status shows when it last updated. If a read fails or the data goes stale, it says so instead of showing old numbers as current", async ({journey}) => {
