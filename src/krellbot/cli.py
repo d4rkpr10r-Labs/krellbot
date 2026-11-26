@@ -1580,9 +1580,11 @@ def cmd_tick(args, *, fetch=None, transport=None):
     With no ``--venue``, ticks every venue that has armed records in sorted
     order. The per-venue body is delegated to ``_tick_one_venue`` so the
     multi-venue and single-venue paths share one implementation.
-    """
-    from krellbot.config import load_config
 
+    After the tick returns, opted-in alert notifications are delivered
+    (``_deliver_alerts_after_tick``), so the scheduled tick reaches the
+    operator without a workstation tab open. The exit code is the tick's.
+    """
     if fetch is None:
         fetch = _default_fetch
     if transport is None:
@@ -1603,13 +1605,49 @@ def cmd_tick(args, *, fetch=None, transport=None):
             continue
         print(f"Unknown argument: {a}", file=sys.stderr)
         return 2
+    if venue is None and offline is not None:
+        print("--venue is required with --offline-candles", file=sys.stderr)
+        return 2
 
     home = kb_paths.home()
+    rc = _tick_venues(home, venue=venue, offline=offline, fetch=fetch, transport=transport)
+    _deliver_alerts_after_tick(home)
+    return rc
+
+
+def _deliver_alerts_after_tick(home) -> None:
+    """Send opted-in alert notifications once the tick has finished.
+
+    The workstation sends them only while a tab polls Operations; this lets
+    the scheduled tick send them too. Both go through
+    ``notifications.maybe_notify`` and its shared, locked occurrence store,
+    so each occurrence is sent once whichever process sees it first. With
+    no channel enabled, alerts are not even collected. Collecting is
+    read-only. Nothing here can fail the tick or change its exit code: a
+    notifier is tried at most once per channel per tick and its failure is
+    recorded for ``GET /api/v1/notifications/delivery``; any other failure
+    is dropped and the next tick or Operations read tries again.
+    """
+    from krellbot import notifications as kb_notifications
+
+    try:
+        if not kb_notifications.delivery_enabled(home):
+            return
+        from krellbot.application import alerts as kb_alerts
+        from krellbot.run import _now_seconds as _run_now_seconds
+
+        now = int(_run_now_seconds())
+        kb_notifications.maybe_notify(home, kb_alerts.collect(home, now=now), now=now)
+    except Exception:
+        # Delivery never fails the tick.
+        return
+
+
+def _tick_venues(home, *, venue, offline, fetch, transport) -> int:
+    """Tick ``venue``, or every armed venue when it is None."""
+    from krellbot.config import load_config
 
     if venue is None:
-        if offline is not None:
-            print("--venue is required with --offline-candles", file=sys.stderr)
-            return 2
         config = load_config(home)
         venues = sorted({a.venue for a in config.armed if a.venue})
         if not venues:
