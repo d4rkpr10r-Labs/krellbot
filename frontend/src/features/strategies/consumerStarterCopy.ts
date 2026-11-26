@@ -42,6 +42,65 @@ export const CONSUMER_STARTER_CARDS: Readonly<
   },
 };
 
+export type StruggleCopy = {
+  id: string;
+  title: string;
+  /** Market conditions where this shape tends to do poorly. No numbers. */
+  struggle: string;
+};
+
+/** The three home starters in card order, then the built-in modes. */
+export const STRUGGLE_COPY_ORDER: ReadonlyArray<string> = [
+  ...CONSUMER_STARTER_CARD_ORDER,
+  "mode-dca",
+  "mode-grid",
+  "mode-rebalance",
+];
+
+/**
+ * When each starter and built-in mode tends to struggle, read from what its
+ * pack's rules do (entry/exit, stop, long-only, buys only while flat). Plain
+ * conditions, never a performance figure or a forecast.
+ */
+export const STRUGGLE_COPY: Readonly<Record<string, StruggleCopy>> = {
+  "starter-dual-ma-crossover": {
+    id: "starter-dual-ma-crossover",
+    title: "Dual moving average",
+    struggle:
+      "Choppy, sideways markets. The averages keep crossing, so it buys late, sells late and pays fees on each flip.",
+  },
+  "starter-mean-reversion-band": {
+    id: "starter-mean-reversion-band",
+    title: "Mean reversion",
+    struggle:
+      "Steady declines. Price can keep sliding below its average, so a dip it buys may fall further until the stop sells.",
+  },
+  "starter-range-breakout": {
+    id: "starter-range-breakout",
+    title: "Range breakout",
+    struggle:
+      "False breakouts. Price pokes above the recent range and then falls back, so it buys near the top and exits lower.",
+  },
+  "mode-dca": {
+    id: "mode-dca",
+    title: "DCA",
+    struggle:
+      "Long declines. It buys while flat and then holds without adding more, so a fall runs to the stop before it buys again.",
+  },
+  "mode-grid": {
+    id: "mode-grid",
+    title: "Grid",
+    struggle:
+      "Strong trends. In a steady fall the lows it buys keep falling until the stop sells; in a steady rise it may never buy.",
+  },
+  "mode-rebalance": {
+    id: "mode-rebalance",
+    title: "Rebalance",
+    struggle:
+      "Sideways markets near its average. Price crosses back and forth, so it buys and sells often and pays fees each time.",
+  },
+};
+
 const EDUCATIONAL_SUFFIX = /\s*\(educational example\)\s*$/i;
 const EDUCATIONAL_PREFIX = /^Educational example\.\s*/i;
 
