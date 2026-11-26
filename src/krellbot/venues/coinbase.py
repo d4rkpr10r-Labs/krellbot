@@ -28,10 +28,12 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 
 from krellbot import release_policy, sanitize
 from krellbot.venues.base import (
+    UNKNOWN_OUTCOME,
     Balance,
     Fill,
     KeyPerms,
     OpenOrder,
+    OrderOutcome,
     OrderRef,
     PairRules,
     ProtectiveStopRejectedError,
@@ -44,6 +46,10 @@ BASE_URL = f"https://{API_HOST}"
 DEFAULT_LOT_DECIMALS = 8
 DEFAULT_PRICE_DECIMALS = 5
 STOP_BUFFER = Decimal("0.005")  # limit = stop * (1 - 0.5%)
+# Documented order statuses. A working order can still execute; a final one
+# cannot. Any other status (UNKNOWN_ORDER_STATUS, a new one) proves nothing.
+_WORKING_ORDER_STATUSES = frozenset({"PENDING", "QUEUED", "OPEN", "CANCEL_QUEUED"})
+_FINAL_ORDER_STATUSES = frozenset({"FILLED", "CANCELLED", "EXPIRED", "FAILED"})
 
 
 class CoinbaseDocumentedOutcome:
@@ -511,6 +517,43 @@ class CoinbaseVenue:
             stop_price=ref.stop_price,
         )
 
+    def order_outcome(self, coid: str, *, pair: str) -> OrderOutcome:
+        """Report what Coinbase's own record of ``coid``'s order says executed.
+
+        Finds the order by exact ``client_order_id`` through the bounded
+        order-history lookup that stops ``place_entry_with_stop`` from
+        resending a coid (``_find_order``), so the coid's ``<coid>_stop`` or
+        any other order never stands in for it. Reads the executed size
+        (``filled_size``), never the requested ``base_size``. Still working:
+        ``open`` with nothing executed, else ``partial``. Filled, cancelled,
+        expired or failed: ``filled`` at the executed size, or ``absent`` when
+        the record shows nothing executed, as for an IOC that found no
+        liquidity. No match in the five bounded pages (a rejected entry is
+        never recorded), an unreadable executed size or status, or ``FILLED``
+        with nothing executed is ``unknown``: the history is not a complete
+        record, so the caller keeps its hold. Never sends an order.
+        """
+        product = pair or self._product_id
+        if not product:
+            return UNKNOWN_OUTCOME
+        raw = self._find_order_record(coid, product)
+        if raw is None:
+            return UNKNOWN_OUTCOME
+        executed = _executed_qty(raw)
+        if executed is None:
+            return UNKNOWN_OUTCOME
+        status = str(raw.get("status") or "").upper()
+        if status in _WORKING_ORDER_STATUSES:
+            if executed > 0:
+                return OrderOutcome(status="partial", filled_qty=executed, authoritative=True)
+            return OrderOutcome(status="open", authoritative=True)
+        if status in _FINAL_ORDER_STATUSES:
+            if executed > 0:
+                return OrderOutcome(status="filled", filled_qty=executed, authoritative=True)
+            if status != "FILLED":
+                return OrderOutcome(status="absent", authoritative=True)
+        return UNKNOWN_OUTCOME
+
     def check_key(self) -> KeyPerms:
         perms = self._get("/api/v3/brokerage/key_permissions")
         # Coinbase returns one object per scope (view, trade, transfer). If
@@ -558,6 +601,11 @@ class CoinbaseVenue:
         return self._transport.get(f"{BASE_URL}{path}", {})
 
     def _find_order(self, coid: str, pair: str) -> OrderRef | None:
+        raw = self._find_order_record(coid, pair)
+        return _ref_from_coinbase(raw, coid) if raw is not None else None
+
+    def _find_order_record(self, coid: str, pair: str) -> dict | None:
+        """The order row whose ``client_order_id`` is ``coid``, from at most five pages."""
         cursor = ""
         for _page in range(5):
             path = f"/api/v3/brokerage/orders/historical/batch?product_ids={pair}"
@@ -570,7 +618,7 @@ class CoinbaseVenue:
             if isinstance(orders, list):
                 for raw in orders:
                     if isinstance(raw, dict) and str(raw.get("client_order_id") or "") == coid:
-                        return _ref_from_coinbase(raw, coid)
+                        return raw
             if payload.get("has_next") is not True:
                 return None
             cursor = str(payload.get("cursor") or "")
@@ -662,6 +710,14 @@ def _optional_decimal(raw: Any) -> Decimal | None:
         return Decimal(str(raw))
     except (ValueError, ArithmeticError, TypeError):
         return None
+
+
+def _executed_qty(raw: dict) -> Decimal | None:
+    """The order's executed size (``filled_size``), or None when unreadable."""
+    executed = _optional_decimal(raw.get("filled_size"))
+    if executed is None or not executed.is_finite() or executed < 0:
+        return None
+    return executed
 
 
 def _entry_filled_qty(resp: Any, *, requested: Decimal) -> Decimal | None:
