@@ -3,7 +3,8 @@
  *
  * The bootstrap meta is single-use. Cold open used to redeem it only
  * inside WorkstationShell, so the wizard's starter and paper calls
- * were refused. Callers share one in-flight redeem.
+ * were refused. Callers share one in-flight redeem. A failed start can
+ * be retried without a reload (KQ-04).
  */
 import { recoverCsrf, redeemBootstrap } from "./session";
 
@@ -65,4 +66,62 @@ export function ensureLoopbackSession(): Promise<boolean> {
     return inflight;
   }
   return track(recoverOnly());
+}
+
+/**
+ * The bootstrap token a fresh read of the shell still carries. The server
+ * serves it only until one redeem succeeds, so a start that failed before
+ * redeeming can try again. Same-origin read, no redirects.
+ */
+async function unusedShellToken(): Promise<string | null> {
+  try {
+    const response = await fetch("/", {
+      method: "GET",
+      credentials: "include",
+      cache: "no-store",
+      redirect: "error",
+    });
+    const type = response.headers.get("Content-Type")?.split(";", 1)[0]?.trim().toLowerCase();
+    if (response.status !== 200 || type !== "text/html") {
+      return null;
+    }
+    // An inert parse: nothing is mounted, run or navigated.
+    const parsed = new DOMParser().parseFromString(await response.text(), "text/html");
+    const metas = parsed.querySelectorAll(`meta[name="${BOOTSTRAP_META}"]`);
+    if (metas.length !== 1) {
+      return null;
+    }
+    const token = metas[0]?.getAttribute("content")?.trim() ?? "";
+    return token.length > 0 ? token : null;
+  } catch {
+    return null;
+  }
+}
+
+async function retryOnce(): Promise<boolean> {
+  if (await recoverOnly()) {
+    return true;
+  }
+  const token = await unusedShellToken();
+  if (token === null) {
+    return false;
+  }
+  return redeemToken(token);
+}
+
+/**
+ * Try the session again after `ensureLoopbackSession` resolved false.
+ * Shares an in-flight attempt. Otherwise it re-reads an existing
+ * session's CSRF, then redeems the shell's still-unused bootstrap token.
+ * It never sends a command; callers send theirs only after `true`.
+ */
+export function retryLoopbackSession(): Promise<boolean> {
+  const token = consumeBootstrapToken();
+  if (token) {
+    return track(redeemToken(token));
+  }
+  if (inflight) {
+    return inflight;
+  }
+  return track(retryOnce());
 }

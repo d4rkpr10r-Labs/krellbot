@@ -1088,16 +1088,81 @@ def cmd_stop(args):
 class CandleFetchError(RuntimeError):
     """Raised when the public candle fetch fails during tick.
 
-    The wrapped type name is the only thing the engine surfaces to the
-    operator — the original exception's message and any secret it carried
-    are not echoed. Tests inject `fetch` so the real HTTP functions are
-    never called.
+    The wrapped type name and the closed ``failure_code`` (derived from the
+    chained exception's class and HTTP status) are the only things the
+    engine surfaces to the operator — the original exception's message and
+    any secret it carried are not echoed. Tests inject `fetch` so the real
+    HTTP functions are never called.
     """
 
     def __init__(self, exc_type_name: str, *, pair: str | None = None):
         self.exc_type_name = exc_type_name
         self.pair = pair
         super().__init__(exc_type_name)
+
+    @property
+    def failure_code(self) -> str:
+        """The closed feed failure code derived from the chained exception."""
+        return feed_failure_code(self)
+
+
+# Closed set served by `/api/v1/paper/health`. Mirrored in api/app.py.
+FEED_FAILURE_CODES = frozenset(
+    {"timeout", "dns_or_network", "tls", "region_or_permission", "rate_limited", "venue_error"}
+)
+
+
+def _classify_one_fetch_failure(exc: BaseException) -> str | None:
+    """Classify a single exception by its class and HTTP status, or None."""
+    import socket
+    import ssl
+    import urllib.error
+
+    if isinstance(exc, urllib.error.HTTPError):
+        status = exc.code if type(exc.code) is int else None
+        if status == 429:
+            return "rate_limited"
+        if status in (403, 451):
+            return "region_or_permission"
+        return "venue_error"
+    if isinstance(exc, urllib.error.URLError):
+        # urllib wraps the socket failure in `.reason` instead of chaining it.
+        if isinstance(exc.reason, ssl.SSLError):
+            return "tls"
+        if isinstance(exc.reason, TimeoutError):
+            return "timeout"
+        return "dns_or_network"
+    if isinstance(exc, ssl.SSLError):
+        return "tls"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, (socket.gaierror, socket.herror, ConnectionError)):
+        return "dns_or_network"
+    return None
+
+
+def feed_failure_code(exc: BaseException) -> str:
+    """Derive a closed failure code for a failed candle fetch.
+
+    Walks the exception chain the way a traceback does (``__cause__``, else
+    an unsuppressed ``__context__``) and returns the first classification by
+    exception class or HTTP status. Messages are never read. Anything
+    unclassified is ``venue_error``.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(seen) < 16:
+        seen.add(id(current))
+        code = _classify_one_fetch_failure(current)
+        if code is not None:
+            return code
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+    return "venue_error"
 
 
 LIVE_TICK_REFUSED = "live is off; set KRELLBOT_ENABLE_LIVE=1 to tick a live pack"
@@ -1459,10 +1524,29 @@ def _build_live_venue_for_offline(armed, *, transport):
     return venue_obj
 
 
-def _record_fetch_error(*, venue: str, armed, exc_type_name: str, reason: str = "fetch_error") -> None:
-    """Append a `reason: fetch_error` tick record before exit 1."""
+def _record_fetch_error(
+    *,
+    venue: str,
+    armed,
+    exc_type_name: str,
+    reason: str = "fetch_error",
+    failure_code: str | None = None,
+) -> None:
+    """Append a `reason: fetch_error` tick record before exit 1.
+
+    Only the market whose fetch failed carries the closed ``failure_code``;
+    markets left unchecked by the abort (``check_incomplete``) do not.
+    """
     from krellbot import journal as kb_journal
 
+    detail = {
+        "reason": reason,
+        "mode": armed.mode,
+        "exception": exc_type_name,
+        "pair": armed.pair,
+    }
+    if reason == "fetch_error" and failure_code in FEED_FAILURE_CODES:
+        detail["failure_code"] = failure_code
     try:
         kb_journal.append(
             {
@@ -1471,12 +1555,7 @@ def _record_fetch_error(*, venue: str, armed, exc_type_name: str, reason: str = 
                 "venue": venue,
                 "pack": armed.pack_id,
                 "bar_ts": 0,
-                "detail": {
-                    "reason": reason,
-                    "mode": armed.mode,
-                    "exception": exc_type_name,
-                    "pair": armed.pair,
-                },
+                "detail": detail,
             }
         )
     except (OSError, ValueError):
@@ -1639,11 +1718,18 @@ def _tick_one_venue(
         )
     except CandleFetchError as exc:
         print(exc.exc_type_name, flush=True)
+        failure_code = exc.failure_code
         for affected in armed_list:
             if (affected.pack_id, affected.pair) in completed:
                 continue
             reason = "fetch_error" if exc.pair is None or affected.pair == exc.pair else "check_incomplete"
-            _record_fetch_error(venue=venue, armed=affected, exc_type_name=exc.exc_type_name, reason=reason)
+            _record_fetch_error(
+                venue=venue,
+                armed=affected,
+                exc_type_name=exc.exc_type_name,
+                reason=reason,
+                failure_code=failure_code,
+            )
         return 1
 
 

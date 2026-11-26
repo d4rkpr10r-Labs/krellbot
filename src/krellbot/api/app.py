@@ -599,6 +599,18 @@ def _read_journal_records(home: Path) -> list[dict]:
     return records
 
 
+# Closed feed failure codes the tick journals (cli.FEED_FAILURE_CODES).
+_FEED_FAILURE_CODES = frozenset(
+    {"timeout", "dns_or_network", "tls", "region_or_permission", "rate_limited", "venue_error"}
+)
+
+
+def _feed_failure_code(detail: dict) -> str | None:
+    """Return the stored feed failure code if it is in the closed set."""
+    value = detail.get("failure_code")
+    return value if isinstance(value, str) and value in _FEED_FAILURE_CODES else None
+
+
 def _tick_refusal_code(record: dict) -> str | None:
     """Return the refusal code a tick record carries, else ``None``.
 
@@ -3193,6 +3205,7 @@ def create_app(
                 "pair": armed.pair,
                 "pack_id": armed.pack_id,
                 "state": state,
+                "failure_code": _feed_failure_code(detail) if state == "feed_error" else None,
                 "last_check": int(latest["ts"]) if latest else None,
                 "last_success": int(successful[-1]["ts"]) if successful else None,
                 "scheduler_installed": scheduler["installed"],
