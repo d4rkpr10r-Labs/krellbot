@@ -222,7 +222,7 @@ test("packs one-click install: free pack lands in library with bucket and versio
   await page.getByTestId("pack-catalogue-install-free-dual-ma").click();
   await expect(
     page.getByTestId("pack-catalogue-install-status-free-dual-ma"),
-  ).toContainText(/Installed · download_pending · 1\.0\.0/);
+  ).toContainText(/Not installed · 1\.0\.0 · pack file not downloaded/);
 
   await expect(page.getByTestId("pack-library-row-free-dual-ma")).toBeVisible();
   await expect(page.getByTestId("pack-library-bucket-free-dual-ma")).toContainText(
