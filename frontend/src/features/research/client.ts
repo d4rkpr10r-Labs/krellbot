@@ -1,8 +1,19 @@
 import { getCsrf } from "../../session";
 
+/**
+ * How the backtest engine charges fees: the same taker fee on every buy and
+ * every sell fill. The costs side-car names it as `fee_model`.
+ */
+export const RESEARCH_FEE_MODEL_LABEL = "taker, per side";
+
+/** Basis points of slippage the engine applies when a run names none. */
+export const RESEARCH_DEFAULT_SLIPPAGE_BPS = 5;
+
 export type RunRequest = {
   datasetPath: string;
   feeBps: number;
+  /** Omitted: the engine default (`RESEARCH_DEFAULT_SLIPPAGE_BPS`). */
+  slippageBps?: number;
   fromMs: number;
   toMs: number;
   packPath?: string;
@@ -41,6 +52,31 @@ export type ResearchFills = {
   fills: Record<string, FillLeg[]>;
 };
 
+/**
+ * The research costs side-car served at `GET /api/v1/jobs/{id}/costs`.
+ * Money and returns are exact Decimal text; `null` means the engine could
+ * not compute that figure (for example a rerun outside its numeric range,
+ * or fills that did not reconcile with the ledger).
+ */
+export type ResearchCosts = {
+  fee_model: string;
+  fee_bps: number;
+  slippage_bps: number;
+  slippage_mult: number;
+  starting_cash: string | null;
+  fill_count: number | null;
+  total_fees: string | null;
+  net_return_pct: string | null;
+  gross_return_pct: string | null;
+  stressed: {
+    factor: number;
+    fee_bps: number;
+    slippage_bps: number;
+    slippage_mult: number;
+    return_pct: string | null;
+  };
+};
+
 export type ResearchClient = {
   submitRun(request: RunRequest): Promise<ResearchJobSummary>;
   cancelJob(jobId: string): Promise<void>;
@@ -49,7 +85,94 @@ export type ResearchClient = {
   getResultDownload(jobId: string): Promise<Response>;
   /** Null when the run recorded no fills (404) or the body is malformed. */
   getFills?(jobId: string): Promise<ResearchFills | null>;
+  /** `null` when the job has no cost side-car (404) or it is malformed. */
+  getCosts?(jobId: string): Promise<ResearchCosts | null>;
 };
+
+const DECIMAL_TEXT = /^-?\d+(\.\d+)?$/;
+
+function readFiniteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** Decimal text or `null`; anything else is malformed (`undefined`). */
+function readDecimalText(value: unknown): string | null | undefined {
+  if (value === null) {
+    return null;
+  }
+  return typeof value === "string" && DECIMAL_TEXT.test(value)
+    ? value
+    : undefined;
+}
+
+/**
+ * Validate a costs side-car body. A missing or wrong-typed field makes the
+ * whole block unavailable rather than showing an invented number.
+ */
+export function readResearchCosts(raw: unknown): ResearchCosts | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const obj = raw as Record<string, unknown>;
+  const stressedRaw = obj.stressed;
+  if (
+    stressedRaw === null ||
+    typeof stressedRaw !== "object" ||
+    Array.isArray(stressedRaw)
+  ) {
+    return null;
+  }
+  const stressedObj = stressedRaw as Record<string, unknown>;
+  const feeBps = readFiniteNumber(obj.fee_bps);
+  const slippageBps = readFiniteNumber(obj.slippage_bps);
+  const slippageMult = readFiniteNumber(obj.slippage_mult);
+  const fillCount = obj.fill_count === null ? null : readFiniteNumber(obj.fill_count);
+  const factor = readFiniteNumber(stressedObj.factor);
+  const stressedFeeBps = readFiniteNumber(stressedObj.fee_bps);
+  const stressedSlippageBps = readFiniteNumber(stressedObj.slippage_bps);
+  const stressedSlippageMult = readFiniteNumber(stressedObj.slippage_mult);
+  const startingCash = readDecimalText(obj.starting_cash);
+  const totalFees = readDecimalText(obj.total_fees);
+  const netReturn = readDecimalText(obj.net_return_pct);
+  const grossReturn = readDecimalText(obj.gross_return_pct);
+  const stressedReturn = readDecimalText(stressedObj.return_pct);
+  if (
+    typeof obj.fee_model !== "string" ||
+    feeBps === null ||
+    slippageBps === null ||
+    slippageMult === null ||
+    (fillCount === null && obj.fill_count !== null) ||
+    factor === null ||
+    stressedFeeBps === null ||
+    stressedSlippageBps === null ||
+    stressedSlippageMult === null ||
+    startingCash === undefined ||
+    totalFees === undefined ||
+    netReturn === undefined ||
+    grossReturn === undefined ||
+    stressedReturn === undefined
+  ) {
+    return null;
+  }
+  return {
+    fee_model: obj.fee_model,
+    fee_bps: feeBps,
+    slippage_bps: slippageBps,
+    slippage_mult: slippageMult,
+    starting_cash: startingCash,
+    fill_count: fillCount,
+    total_fees: totalFees,
+    net_return_pct: netReturn,
+    gross_return_pct: grossReturn,
+    stressed: {
+      factor,
+      fee_bps: stressedFeeBps,
+      slippage_bps: stressedSlippageBps,
+      slippage_mult: stressedSlippageMult,
+      return_pct: stressedReturn,
+    },
+  };
+}
 
 function readFillLeg(raw: unknown): FillLeg | null {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
@@ -177,6 +300,9 @@ export function createHttpClient(): ResearchClient {
         from_ms: request.fromMs,
         to_ms: request.toMs,
       };
+      if (typeof request.slippageBps === "number") {
+        body.slippage_bps = request.slippageBps;
+      }
       if (request.packPath) {
         body.pack_path = request.packPath;
       }
@@ -253,6 +379,12 @@ export function createHttpClient(): ResearchClient {
         snap.error = error;
       }
       return snap;
+    },
+    async getCosts(jobId: string): Promise<ResearchCosts | null> {
+      const raw = await getJson(
+        `/api/v1/jobs/${encodeURIComponent(jobId)}/costs`,
+      );
+      return readResearchCosts(raw);
     },
     async getResultDownload(jobId: string): Promise<Response> {
       const response = await fetch(

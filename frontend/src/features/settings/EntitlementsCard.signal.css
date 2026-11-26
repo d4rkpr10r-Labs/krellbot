@@ -1,0 +1,55 @@
+/*
+ * Settings → Trust & billing: what a license gates (M28.14).
+ * Contract: KRELL-SIGNAL-20261010. Tokens only.
+ */
+
+.kbot-entitlements__facts {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.kbot-entitlements__facts p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text, #e9f0f5);
+  overflow-wrap: anywhere;
+}
+
+.kbot-entitlements__groups {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.kbot-entitlements__group {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.kbot-entitlements__group-title {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted, #abc4d8);
+}
+
+.kbot-entitlements__list {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+  max-width: 52rem;
+}
+
+.kbot-entitlements__list li {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--muted, #abc4d8);
+}

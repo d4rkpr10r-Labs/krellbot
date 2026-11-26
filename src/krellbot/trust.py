@@ -14,10 +14,15 @@ Everything in the returned dict is presentation-only:
   0o700 (or unreadable — that is itself a posture issue we cannot hide).
 - bind: the loopback interface only.
 - live_arm_ui_allowed / trade_only_required: safety rails.
+- credential_source: per venue, which source ``secrets.get`` uses
+  (``keychain``, ``env_override``, or ``keyfile_fallback`` when a
+  plaintext key file backs up the keychain), derived from environment
+  variable presence only.
 
 This module never reads, writes, or imports any venue credential. The
 keychain backend identity is exposed as a *name* (class path) and a
-boolean; if the backend is null/fake/fail, keychain_ok is False.
+boolean; if the backend is null/fake/fail, keychain_ok is False. It
+never returns an environment variable's value or a key file path.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ import sys
 from pathlib import Path
 
 from krellbot.doctor import _keychain_backend
+from krellbot.secrets import VENUES as _CREDENTIAL_VENUES
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -50,6 +56,31 @@ def _home_mode_or_none(home: Path) -> str | None:
     except OSError:
         return None
     return oct(stat.S_IMODE(st.st_mode))
+
+
+def _credential_source(venue: str) -> str:
+    """Name where ``secrets.get(venue)`` takes credentials from.
+
+    Mirrors the precedence in ``secrets.get`` without reading a credential,
+    a keyring entry or a key file:
+
+    - ``env_override``: ``KRELLBOT_<VEN>_KEY`` or ``_SECRET`` is present.
+      ``secrets.get`` then uses the pair, or refuses a lone half, and never
+      consults the keychain.
+    - ``keyfile_fallback``: ``KRELLBOT_<VEN>_KEYFILE`` is set and non-empty
+      (``secrets.get`` ignores an empty one). The keychain is still read
+      first; the plaintext file is used only when it has no entry.
+    - ``keychain``: neither is set; only the OS keychain is consulted.
+
+    Only presence is tested. No value is kept or returned.
+    """
+
+    ven = venue.upper()
+    if f"KRELLBOT_{ven}_KEY" in os.environ or f"KRELLBOT_{ven}_SECRET" in os.environ:
+        return "env_override"
+    if os.environ.get(f"KRELLBOT_{ven}_KEYFILE"):
+        return "keyfile_fallback"
+    return "keychain"
 
 
 def trust_snapshot(home: Path) -> dict[str, object]:
@@ -95,6 +126,7 @@ def trust_snapshot(home: Path) -> dict[str, object]:
         "bind": "127.0.0.1",
         "live_arm_ui_allowed": False,
         "trade_only_required": True,
+        "credential_source": {venue: _credential_source(venue) for venue in sorted(_CREDENTIAL_VENUES)},
     }
 
 
