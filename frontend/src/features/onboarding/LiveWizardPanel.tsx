@@ -135,7 +135,7 @@ export function LiveWizardPanel({
             className="kbot-live-wizard__panel-copy"
             data-testid="live-wizard-no-license"
           >
-            No license token is needed to check an exchange key.
+            No license token is collected when you check an exchange key.
           </p>
         </div>
       ) : null}
