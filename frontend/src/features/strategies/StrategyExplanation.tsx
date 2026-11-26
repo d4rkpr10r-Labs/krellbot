@@ -183,6 +183,15 @@ export function StrategyExplanation({
           >
             {explanation.stop.text}
           </p>
+          {explanation.stop.semantics !== undefined &&
+          explanation.stop.semantics.length > 0 ? (
+            <p
+              className="kbot-feature__strategy-explanation-detail"
+              data-testid="strategy-explanation-stop-semantics"
+            >
+              {explanation.stop.semantics.join(" ")}
+            </p>
+          ) : null}
 
           <p
             className="kbot-feature__strategy-explanation-performance"
