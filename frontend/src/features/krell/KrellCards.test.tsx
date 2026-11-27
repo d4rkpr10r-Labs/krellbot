@@ -54,6 +54,7 @@ const CONNECTION = {
 const TICKET = "tkt-NEVER-IN-THE-DOM-0123456789abcdef";
 const BUDGET_TEXT = "Token budget reached. Raise it in Settings → Agents & limits.";
 const UNKNOWN_TEXT = "Expired. Ask Krell again.";
+const UNCLEAR_TEXT = "Couldn't tell whether it ran. Reload to check.";
 
 let nextId = 1;
 
@@ -342,6 +343,38 @@ describe("Result cards", () => {
     expect(screen.queryByTestId("krell-item-confirm")).toBeNull();
     expect(screen.queryByRole("button", { name: "Confirm" })).toBeNull();
   });
+
+  it("labels the model's tool name as the tool, so a name that reads like an outcome is not one", async () => {
+    installFetch(() =>
+      jsonResponse(
+        conversation([
+          ...greeted(),
+          stored("assistant", { text: "", tool_calls: [{ id: "call_1", name: "Armed on paper", arguments: {} }] }),
+          stored("tool", {
+            tool_call_id: "call_1",
+            name: "Armed on paper",
+            result: {
+              ok: false,
+              effect: "refused",
+              code: "mcp_unknown_tool",
+              message: "MCP tool is not in the allowlist",
+              tool: "armed_on_paper",
+              labels: [],
+            },
+          }),
+        ]),
+      ),
+    );
+    renderTab();
+    const card = await screen.findByTestId("krell-item-tool");
+    const label = within(card).getByText("Tool:");
+    expect(label.className).not.toContain("kbot-krell__sr");
+    expect(label.nextElementSibling?.textContent).toBe("Armed on paper");
+    // The outcome is the engine's: a refusal, never "Armed".
+    expect(card.querySelector(".kbot-krell__card-outcome")?.textContent).toBe("Refused");
+    expect(card.textContent).toContain("mcp_unknown_tool");
+    expect(within(card).queryAllByTestId("krell-label")).toHaveLength(0);
+  });
 });
 
 describe("Confirm cards", () => {
@@ -583,6 +616,70 @@ describe("Confirm cards", () => {
     expect(calls.filter((c) => c.path === "/api/v1/krell/confirm")).toHaveLength(1);
   });
 
+  it.each([
+    ["the connection drops mid-stream", [] as Array<Record<string, unknown>>],
+    [
+      "the store fails after the call ran",
+      [
+        {
+          type: "error",
+          code: "krell_store_unavailable",
+          message: "Krell's conversation store could not be read or written, so nothing changed.",
+        },
+        { type: "done" },
+      ],
+    ],
+  ])("a press whose stream ends with no result says it cannot tell and stays disabled: %s", async (_case, tail) => {
+    const encoder = new TextEncoder();
+    let later!: ReadableStreamDefaultController<Uint8Array>;
+    const calls = installFetch((call) => {
+      if (call.path === "/api/v1/krell/messages") {
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            later = c;
+          },
+        });
+        return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+      }
+      if (call.path === "/api/v1/krell/confirm") {
+        return sseResponse([
+          DECIDED_CONFIRM,
+          { type: "tool_start", id: "call_arm", name: "paper_arm", arguments: { venue: "kraken" } },
+          ...tail,
+        ]);
+      }
+      return jsonResponse(conversation(askedToArm()));
+    });
+    renderTab();
+    await screen.findByTestId("krell-item-confirm");
+    fireEvent.click(cardButton("Confirm"));
+    await waitFor(() => expect(confirmCard().textContent).toContain(UNCLEAR_TEXT));
+    await idle();
+
+    expect(confirmCard().textContent).not.toContain("Running…");
+    expect(cardButton("Confirm").disabled).toBe(true);
+    expect(cardButton("Not now").disabled).toBe(true);
+    // The call's own card does not claim it is still running either.
+    const results = screen.getAllByTestId("krell-item-tool");
+    expect(results[results.length - 1].textContent).not.toContain("Running…");
+    expect(results[results.length - 1].textContent).toContain(UNCLEAR_TEXT);
+    // Reconcile, never resubmit: nothing is sent again.
+    fireEvent.click(cardButton("Confirm"));
+    fireEvent.click(cardButton("Not now"));
+    expect(calls.filter((c) => c.path === "/api/v1/krell/confirm")).toHaveLength(1);
+
+    // A later stream does not make either card claim the call is running again.
+    await send("Did it run?");
+    await screen.findByText("Krell is answering…");
+    expect(confirmCard().textContent).toContain(UNCLEAR_TEXT);
+    expect(document.body.textContent).not.toContain("Running…");
+    later.enqueue(encoder.encode(frame({ type: "message_done", text: "Reload to check." }, 1) + frame({ type: "done" }, 2)));
+    later.close();
+    await idle();
+    expect(calls.filter((c) => c.path === "/api/v1/krell/confirm")).toHaveLength(1);
+    expectNoTicket();
+  });
+
   it("a card decided before a reload shows as decided", async () => {
     const OTHER = "tkt-ALSO-NEVER-IN-THE-DOM-fedcba987654";
     installFetch(() =>
@@ -651,6 +748,26 @@ describe("Budget meter", () => {
       <BudgetMeter budget={budget({ month_used: 500000, month_limit: 500000, exhausted: true, reason: "month" })} />,
     );
     expect(screen.getByText(BUDGET_TEXT).textContent).toBe(BUDGET_TEXT);
+  });
+
+  it("fills the bar of a reached limit, even a limit of 0", () => {
+    render(
+      <BudgetMeter
+        budget={budget({
+          conversation_used: 0,
+          conversation_limit: 0,
+          month_used: 1000,
+          month_limit: 2000000,
+          exhausted: true,
+          reason: "conversation",
+        })}
+      />,
+    );
+    const [conversationBar, monthBar] = Array.from(screen.getByTestId("krell-budget").querySelectorAll("meter"));
+    expect(conversationBar.max).toBeGreaterThan(0);
+    expect(conversationBar.value).toBe(conversationBar.max);
+    expect(monthBar.value).toBe(1000);
+    expect(screen.getByText(BUDGET_TEXT)).toBeDefined();
   });
 
   it("follows the conversation payload and the budget events", async () => {
@@ -786,7 +903,8 @@ describe("Highlights", () => {
     const rules = [...css.matchAll(/([^{}]*\[data-krell-highlight="true"\][^{}]*)\{([^}]*)\}/g)];
     expect(rules.length).toBeGreaterThan(0);
     const body = rules.map((rule) => rule[2]).join(";");
-    expect(body).toMatch(/outline:\s*2px solid var\(--seafoam\)/);
+    // Dashed, so a highlighted element does not read as focused (the focus ring is solid).
+    expect(body).toMatch(/outline:\s*2px dashed var\(--seafoam\)/);
     for (const banned of ["animation", "transition", "position", "z-index", "background", "box-shadow", "content"]) {
       expect(body).not.toContain(banned);
     }

@@ -105,7 +105,7 @@ function KrellRow({ item, avatar, cards }: Row & { cards: Cards }): JSX.Element 
     case "tool":
       return (
         <li className="kbot-krell__card-row" data-testid="krell-item-tool">
-          <ToolResultCard name={item.name} result={item.result} />
+          <ToolResultCard name={item.name} result={item.result} ended={item.ended} />
         </li>
       );
     case "confirm":

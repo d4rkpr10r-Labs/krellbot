@@ -270,6 +270,11 @@
   font-weight: 700;
 }
 
+.kbot-krell__card-label {
+  color: var(--muted);
+  font-weight: 600;
+}
+
 .kbot-krell__card-tool,
 .kbot-krell__code,
 .kbot-krell__facts dd {
@@ -400,9 +405,10 @@
 }
 
 /* Krell's highlight (useKrellHighlight), for 4 s: an outline only. No
- * motion, and nothing is laid over the element or its controls. */
+ * motion, and nothing is laid over the element or its controls. Dashed, so
+ * it does not read as the solid focus ring. */
 [data-krell-highlight="true"] {
-  outline: 2px solid var(--seafoam);
+  outline: 2px dashed var(--seafoam);
   outline-offset: 3px;
 }
 

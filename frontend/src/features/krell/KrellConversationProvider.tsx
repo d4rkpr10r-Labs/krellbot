@@ -49,10 +49,11 @@ export type KrellItem =
   | { key: string; kind: "notice"; text: string }
   /** `callId`: the confirm card whose press this error answered. */
   | { key: string; kind: "error"; code: string; text: string; callId?: string }
-  | { key: string; kind: "tool"; callId: string; name: string; result: KrellToolResult | null }
+  /** `ended`: the stream that started the call has ended (with no result, it may or may not have run). */
+  | { key: string; kind: "tool"; callId: string; name: string; result: KrellToolResult | null; ended?: boolean }
   | { key: string; kind: "confirm"; callId: string; tool: string; confirm: Record<string, unknown> }
-  /** `callId`: the confirm card decided on ("" when it cannot be told). */
-  | { key: string; kind: "decision"; callId: string; decision: KrellDecision; tool: string };
+  /** `callId`: the confirm card decided on ("" when it cannot be told). `ended`: its stream has ended. */
+  | { key: string; kind: "decision"; callId: string; decision: KrellDecision; tool: string; ended?: boolean };
 
 export type KrellStatus = "idle" | "loading" | "ready" | "failed";
 
@@ -161,7 +162,7 @@ function itemsFromHistory(messages: KrellStoredMessage[]): KrellItem[] {
       } else if (p.kind === "confirm_decision") {
         const tool = str(p.tool);
         const callId = str(p.call_id) || cardOf.get(str(p.ticket_id)) || "";
-        items.push({ key, kind: "decision", callId, decision: asDecision(p.decision), tool });
+        items.push({ key, kind: "decision", callId, decision: asDecision(p.decision), tool, ended: true });
         if (isRecord(p.result)) items.push(...toolItems(`${key}-result`, callId, tool, p.result));
       }
     }
@@ -314,6 +315,16 @@ const INITIAL: State = {
   draft: "",
 };
 
+/**
+ * A stream has ended: no result can still arrive for its calls or its
+ * Confirm, so cards stop saying they are running.
+ */
+function endStream(items: KrellItem[]): KrellItem[] {
+  const open = (item: KrellItem): boolean =>
+    (item.kind === "tool" && item.result === null && !item.ended) || (item.kind === "decision" && !item.ended);
+  return items.some(open) ? items.map((item) => (open(item) ? { ...item, ended: true } : item)) : items;
+}
+
 /** What an event changes besides the display items: the budget and the highlight. */
 function sideState(state: State, event: KrellEvent): Partial<Pick<State, "budget" | "highlight">> {
   if (event.type === "budget") return { budget: toBudget(event) ?? state.budget };
@@ -340,7 +351,7 @@ function reduce(state: State, action: Action): State {
     case "load_failed":
       return { ...state, status: "failed", loadError: action.message };
     case "pending":
-      return { ...state, pending: action.value };
+      return { ...state, pending: action.value, messages: action.value ? state.messages : endStream(state.messages) };
     case "add":
       return { ...state, messages: [...state.messages, action.item] };
     case "event": {

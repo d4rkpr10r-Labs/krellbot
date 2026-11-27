@@ -14,6 +14,9 @@ const BUDGET_REACHED = "Token budget reached. Raise it in Settings → Agents & 
 
 function Usage({ label, used, limit }: { label: string; used: number; limit: number }): JSX.Element {
   const text = `${NUMBER.format(used)} of ${NUMBER.format(limit)} tokens`;
+  const max = Math.max(limit, 1);
+  // The engine's rule: a limit is reached once used >= limit, so a limit of 0 is always reached.
+  const reached = used >= limit;
   return (
     <div className="kbot-krell__budget-row">
       <span className="kbot-krell__budget-label">{label}</span>
@@ -21,8 +24,8 @@ function Usage({ label, used, limit }: { label: string; used: number; limit: num
       <meter
         className="kbot-krell__budget-bar"
         min={0}
-        max={Math.max(limit, 1)}
-        value={Math.min(used, Math.max(limit, 1))}
+        max={max}
+        value={reached ? max : used}
         aria-label={`${label}: ${text}`}
       />
     </div>

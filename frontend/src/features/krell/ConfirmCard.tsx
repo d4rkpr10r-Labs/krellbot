@@ -15,6 +15,11 @@
  *   "Expired. Ask Krell again." and disabled.
  * - Past `expires_at`: "Expired" and disabled, even before any press.
  * - While a press (or any Krell answer) runs, both buttons are disabled.
+ * - A Confirm whose stream ended with no result (the connection dropped, or
+ *   the store failed after the call ran): "Couldn't tell whether it ran.
+ *   Reload to check." and disabled, even while a later stream runs. The call
+ *   may have run, so it is never sent again from here (reconcile, never
+ *   resubmit); a reload reads what the engine stored.
  *
  * The request never holds a ticket id: the provider keeps tickets to itself
  * and sends one only in the confirm request body.
@@ -30,9 +35,13 @@ export type ConfirmOutcome =
   | { kind: "confirmed" }
   | { kind: "refused"; code: string; message: string }
   /** The engine no longer knows the ticket. */
-  | { kind: "unknown" };
+  | { kind: "unknown" }
+  /** Confirm was pressed and its stream ended with no result: the call may have run. */
+  | { kind: "unclear" };
 
 const CODE_CONFIRM_UNKNOWN = "agent_confirm_unknown";
+/** A call that started and whose stream ended with no result: it may have run. */
+export const UNCLEAR_OUTCOME = "Couldn't tell whether it ran. Reload to check.";
 const OPEN: ConfirmOutcome = { kind: "open" };
 /** The longest wait `setTimeout` takes. */
 const MAX_WAIT_MS = 2_147_483_647;
@@ -55,7 +64,8 @@ function resultOutcome(result: Record<string, unknown>): ConfirmOutcome {
 /**
  * Each confirm card's outcome, keyed by its tool call id, read from the
  * items after it: the latest decision on it, the result of a Confirm, and
- * an `agent_confirm_unknown` answer to a press.
+ * an `agent_confirm_unknown` answer to a press. A Confirm whose stream has
+ * ended (`ended`) with no result after it is unclear, not running.
  */
 export function confirmOutcomes(items: KrellItem[]): Map<string, ConfirmOutcome> {
   const outcomes = new Map<string, ConfirmOutcome>();
@@ -69,7 +79,7 @@ export function confirmOutcomes(items: KrellItem[]): Map<string, ConfirmOutcome>
         outcomes.set(item.callId, { kind: "declined" });
       } else {
         confirming.add(item.callId);
-        outcomes.set(item.callId, { kind: "running" });
+        outcomes.set(item.callId, { kind: item.ended ? "unclear" : "running" });
       }
     } else if (item.kind === "tool" && item.result !== null && confirming.has(item.callId)) {
       confirming.delete(item.callId);
@@ -171,7 +181,7 @@ export function ConfirmCard({
     setWasBusy(busy);
     if (!busy) setPressed(false);
   }
-  const settled = outcome.kind === "declined" || outcome.kind === "confirmed" || outcome.kind === "unknown";
+  const settled = ["declined", "confirmed", "unknown", "unclear"].includes(outcome.kind);
   const expired = useExpired(expiresAtMs(request), !settled);
   const disabled = settled || expired || busy || pressed || outcome.kind === "running";
   const press = (handler: () => void) => (): void => {
@@ -184,8 +194,9 @@ export function ConfirmCard({
   if (outcome.kind === "unknown") status = "Expired. Ask Krell again.";
   else if (outcome.kind === "declined") status = "Not now. Nothing ran.";
   else if (outcome.kind === "confirmed") status = "Confirmed. Krellbot ran it once, exactly as shown.";
-  else if (expired) status = "Expired";
+  else if (outcome.kind === "unclear") status = UNCLEAR_OUTCOME;
   else if (outcome.kind === "running") status = "Running…";
+  else if (expired) status = "Expired";
   else if (pressed) status = "Sending your choice…";
   else if (outcome.kind === "refused") {
     status = (

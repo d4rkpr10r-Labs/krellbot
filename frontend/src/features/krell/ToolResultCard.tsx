@@ -4,10 +4,13 @@
  * Drawn only from a tool result the engine sent, never from model text, so
  * nothing Krell writes can make an "Armed" card. The outcome comes from
  * `result.ok`, `effect`, `code` and `message`; a refusal shows its code and
- * message. The honesty pills come from `result.labels` exactly.
+ * message. The honesty pills come from `result.labels` exactly. The name is
+ * the model's text, so it sits under a visible "Tool:" label and never in
+ * the outcome slot.
  */
 import type { JSX } from "react";
 import type { KrellToolResult } from "./client";
+import { UNCLEAR_OUTCOME } from "./ConfirmCard";
 
 const LABELS = new Map([
   ["simulated", "Simulated"],
@@ -15,7 +18,7 @@ const LABELS = new Map([
   ["paper", "Paper"],
 ]);
 
-/** A successful call's outcome on its card, by the engine's tool name; any other reads "Done". */
+/** A successful call's outcome on its card, by the engine's `result.tool`; any other reads "Done". */
 const DONE = new Map([["paper_arm", "Armed on paper"]]);
 
 type Outcome = { title: string; refusal?: { code: string; message: string } };
@@ -24,10 +27,11 @@ function str(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
-function outcomeOf(name: string, result: KrellToolResult | null): Outcome {
-  if (result === null) return { title: "Running…" };
+function outcomeOf(result: KrellToolResult | null, ended: boolean): Outcome {
+  // No result once its stream has ended: the call may or may not have run.
+  if (result === null) return { title: ended ? UNCLEAR_OUTCOME : "Running…" };
   if (result.effect === "needs_confirm") return { title: "Asked before running" };
-  if (result.ok === true) return { title: DONE.get(str(result.tool, name)) ?? "Done" };
+  if (result.ok === true) return { title: DONE.get(str(result.tool)) ?? "Done" };
   return {
     title: result.effect === "refused" ? "Refused" : "Did not complete",
     refusal: { code: str(result.code, "unknown"), message: str(result.message) },
@@ -49,20 +53,22 @@ export type ToolResultCardProps = {
   name: string;
   /** The engine's result, or null while the call runs. */
   result: KrellToolResult | null;
+  /** The stream that started this call has ended: with no result, it is unclear whether it ran. */
+  ended?: boolean;
 };
 
-export function ToolResultCard({ name, result }: ToolResultCardProps): JSX.Element {
-  const outcome = outcomeOf(name, result);
+export function ToolResultCard({ name, result, ended = false }: ToolResultCardProps): JSX.Element {
+  const outcome = outcomeOf(result, ended);
   const labels = labelsOf(result);
   return (
     <div
       className={"kbot-krell__card" + (outcome.refusal ? " kbot-krell__card--refused" : "")}
-      aria-busy={result === null || undefined}
+      aria-busy={(result === null && !ended) || undefined}
     >
       <p className="kbot-krell__card-head">
-        <span className="kbot-krell__sr">Tool </span>
+        <span className="kbot-krell__card-label">Tool:</span>
         <span className="kbot-krell__card-tool">{name}</span>
-        <span className="kbot-krell__sr">: </span>
+        <span className="kbot-krell__sr">, outcome: </span>
         <span className="kbot-krell__card-outcome">{outcome.title}</span>
       </p>
       {labels.length > 0 ? (
