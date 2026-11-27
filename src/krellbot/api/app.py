@@ -7,8 +7,14 @@ import contextlib
 import hmac
 import ipaddress
 import json
+import os
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+import sysconfig
+import threading
 import time
 import urllib.error
 from collections.abc import Callable
@@ -22,6 +28,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from krellbot import config as kb_config
 from krellbot import release_policy
+from krellbot.agent import audit as agent_audit
 from krellbot.api.jobs import (
     JOB_ERROR_COSTS_UNAVAILABLE,
     JOB_ERROR_FILLS_UNAVAILABLE,
@@ -114,6 +121,17 @@ class _AppState:
     scheduler_executable: str | None = None  # defaults to sys.executable
     alert_notifier: object = None  # Notifier; tests inject FakeNotifier
     referral_transport: object = None  # referral.Transport; tests inject FakeTransport
+    ai_transport: object = None  # ai.http.HttpTransport; tests inject FakeAiTransport
+    # Sign-in flows (ai.oauth.SigninRegistry), in engine memory only; built on first use.
+    ai_signins: object = None
+    ai_signin_listener_factory: object = None  # ai.oauth.ListenerFactory; tests inject a socket-free fake
+    # Krell (M38.15), built once per app on first use: her agent tool core, the
+    # engine's confirm ledger (same clock), a () -> KrellLoop factory, and a lock
+    # so one Krell stream (or a clear) runs at a time on the shared conversation.
+    krell_core: object = None  # agent.core.AgentToolCore
+    krell_ledger: object = None  # agent.confirm.ConfirmLedger
+    krell_loop_factory: object = None  # Callable[[], agent.krell_loop.KrellLoop]
+    krell_lock: object = None  # threading.Lock
 
 
 def _app_now(s: _AppState) -> int:
@@ -431,6 +449,77 @@ def _scheduler_executable(s: _AppState) -> str:
     if s.scheduler_executable:
         return s.scheduler_executable
     return sys.executable
+
+
+def _mcp_launch() -> tuple[str, list[str]]:
+    """How an MCP client starts ``krellbot mcp`` on this computer.
+
+    A frozen build runs its own executable. A source install runs the
+    ``krellbot`` script installed beside this interpreter, so the client runs
+    the same install as the engine; else the ``krellbot`` script on PATH;
+    else this interpreter with the CLI module.
+    """
+
+    if getattr(sys, "frozen", False):
+        return sys.executable, ["mcp"]
+    script = _interpreter_krellbot_script() or shutil.which("krellbot")
+    if script:
+        return os.path.abspath(script), ["mcp"]
+    return sys.executable, ["-m", "krellbot.cli", "mcp"]
+
+
+def _interpreter_krellbot_script() -> str | None:
+    """The ``krellbot`` script in the running interpreter's scripts folder, if installed there."""
+
+    scripts = sysconfig.get_path("scripts")
+    if not scripts:
+        return None
+    script = os.path.join(scripts, "krellbot.exe" if sys.platform == "win32" else "krellbot")
+    return script if os.path.isfile(script) else None
+
+
+def _windows_quoted(value: str) -> str:
+    """``value`` always in double quotes, escaped the way Windows programs split their arguments.
+
+    ``subprocess.list2cmdline`` quotes only on whitespace, which leaves ``&``
+    and the like bare for cmd to act on. A backslash run before a quote, or at
+    the end, is doubled so it stays literal.
+    """
+
+    out: list[str] = []
+    backslashes = 0
+    for char in value:
+        if char == "\\":
+            backslashes += 1
+            continue
+        if char == '"':
+            out.append("\\" * (backslashes * 2 + 1) + '"')
+        else:
+            out.append("\\" * backslashes + char)
+        backslashes = 0
+    out.append("\\" * (backslashes * 2))
+    return '"' + "".join(out) + '"'
+
+
+def _claude_code_line(command: str, args: list[str], home: str, *, windows: bool) -> str:
+    """The ``claude mcp add`` line, quoted for this computer's shell so it survives a paste.
+
+    On Windows the command and the ``--env`` value are always double-quoted;
+    elsewhere ``shlex`` quotes only what needs it.
+    """
+
+    env = f"KRELLBOT_HOME={home}"
+    if not windows:
+        return shlex.join(["claude", "mcp", "add", "krellbot", "--env", env, "--", command, *args])
+    return " ".join(
+        [
+            "claude mcp add krellbot --env",
+            _windows_quoted(env),
+            "--",
+            _windows_quoted(command),
+            *([subprocess.list2cmdline(args)] if args else []),
+        ]
+    )
 
 
 def _stored_deployment_mode(home: Path) -> str | None:
@@ -1477,9 +1566,14 @@ def create_app(
         try:
             yield
         finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            try:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            finally:
+                # Sign-in listeners close even if the rehearsal task ended with an error.
+                if state.ai_signins is not None:
+                    state.ai_signins.close_all()  # type: ignore[attr-defined]
 
     app = FastAPI(
         title="krellbot.api",
@@ -4240,6 +4334,69 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.get("/api/v1/agents/activity")
+    async def agents_activity(request: Request) -> Response:
+        """Return recent agent tool calls (Krell and MCP clients), newest first.
+
+        Same session gate as ``GET /api/v1/paper/status`` (``_gate_get``).
+        Optional exact-match filters ``actor``, ``tool``, ``outcome`` and an
+        integer ``since`` timestamp; bad values are 400 with a typed code.
+        Rows carry only the contract fields: recorded params are never
+        returned (``pair`` is read from ``params.pair`` when present).
+        """
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+
+        q = request.query_params
+        outcome = q.get("outcome") or None
+        if outcome is not None and outcome not in agent_audit.OUTCOMES:
+            return JSONResponse(
+                {"code": "agent_activity_outcome_invalid", "detail": "outcome filter not recognised"},
+                status_code=400,
+            )
+        since_ts: int | None = None
+        since_raw = q.get("since")
+        if since_raw:
+            try:
+                since_ts = int(since_raw)
+            except ValueError:
+                return JSONResponse(
+                    {"code": "agent_activity_since_invalid", "detail": "since must be an integer timestamp"},
+                    status_code=400,
+                )
+
+        records = agent_audit.read_agent_activity(
+            s.home,
+            actor=q.get("actor") or None,
+            tool=q.get("tool") or None,
+            outcome=outcome,
+            since_ts=since_ts,
+            limit=200,
+        )
+        rows = []
+        for record in records:
+            detail = record["detail"]
+            params = detail.get("params")
+            pair = params.get("pair") if isinstance(params, dict) else None
+            venue = record.get("venue")
+            rows.append(
+                {
+                    "ts": record["ts"],
+                    "actor": detail.get("actor"),
+                    "tool": detail.get("tool"),
+                    "outcome": detail.get("outcome"),
+                    "code": detail.get("code"),
+                    "venue": venue if venue and venue != "-" else None,
+                    "pair": pair if isinstance(pair, str) and pair else None,
+                    "confirm_ticket": detail.get("confirm_ticket"),
+                    "tokens": detail.get("tokens"),
+                }
+            )
+        return JSONResponse({"rows": rows}, status_code=200, headers={"Cache-Control": "no-store"})
+
     @app.get("/api/v1/paper/armed")
     async def paper_armed(request: Request) -> Response:
         """Return the closed-shape list of every armed pack record.
@@ -4719,32 +4876,639 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
-    # ---- operator user policy (M22.2) ---------------------------------
+    # ---- AI connections (M38.12) ---------------------------------------
+    #
+    # The user's own model for Krell. Credentials go only to the OS keychain
+    # (``krellbot-ai:<id>``) and are never returned, logged or echoed; GET
+    # never reads the keychain. Ids in paths must be Krellbot-generated ids.
+    # Store calls that touch the keychain (or wait on a store write) run in a
+    # worker thread: a keychain unlock prompt must not freeze the loop.
 
-    @app.get("/api/v1/user-policy")
-    async def get_user_policy(request: Request) -> Response:
-        """Return the operator user-policy snapshot (defaults if missing)."""
+    _AI_REFUSAL_STATUS = {
+        "ai_connection_not_found": 404,
+        "ai_connections_unreadable": 409,
+        "ai_keychain_unavailable": 503,
+        "ai_signin_not_found": 404,
+        "ai_signin_listener_failed": 503,
+        "ai_signin_local_only": 403,
+    }
+
+    def _ai_json(body: dict, status_code: int = 200) -> Response:
+        return JSONResponse(
+            {"schema_version": SCHEMA_VERSION, **body},
+            status_code=status_code,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    def _ai_refused(exc) -> Response:
+        return _ai_json(
+            {"ok": False, "effect": "refused", "code": exc.code, "detail": exc.message},
+            _AI_REFUSAL_STATUS.get(exc.code, 400),
+        )
+
+    def _ai_invalid_body() -> Response:
+        from krellbot.ai.connections import ConnectionRefused
+
+        return _ai_refused(ConnectionRefused("ai_body_invalid"))
+
+    def _ai_store(s: _AppState):
+        from krellbot.ai.connections import ConnectionStore
+
+        # The tests-only FakeKeyring opt-in is the one the exchange-key routes use.
+        return ConnectionStore(s.home, allow_injected_fake_backend=s.keys_allow_fake_backend)
+
+    def _ai_not_found() -> Response:
+        return _ai_json(
+            {"ok": False, "effect": "refused", "code": "ai_connection_not_found", "detail": "not found"},
+            404,
+        )
+
+    def _ai_connection_view(conn, active_id: str | None) -> dict:
+        from krellbot.ai.connections import provider_host
+        from krellbot.ai.disclosure import egress_disclosure
+
+        return {
+            "id": conn.id,
+            "preset": conn.preset,
+            "label": conn.label,
+            "format": conn.format,
+            "base_url": conn.base_url,
+            "host": provider_host(conn.base_url),
+            "model": conn.model,
+            "auth": conn.auth,
+            "capability": conn.capability,
+            "created_at": conn.created_at,
+            "active": conn.id == active_id,
+            "disclosure": egress_disclosure(conn),
+        }
+
+    async def _ai_probe_and_record(s: _AppState, store, conn) -> Response:
+        """Probe ``conn`` off the event loop, record its capability, and answer."""
+
+        from krellbot.ai.connections import ConnectionRefused, build_adapter, check_endpoint
+        from krellbot.ai.http import UrllibTransport
+        from krellbot.ai.probe import probe
+        from krellbot.ai.providers import fetch_model_ids
+
+        transport = s.ai_transport or UrllibTransport()
+        try:
+            check_endpoint(conn)  # before the keychain is touched
+            credential = await asyncio.to_thread(store.credential_for, conn)
+            adapter = build_adapter(conn, credential, transport)
+        except ConnectionRefused as exc:
+            return _ai_refused(exc)
+        result = await asyncio.to_thread(
+            probe,
+            conn,
+            adapter,
+            list_models=lambda: fetch_model_ids(conn.format, conn.base_url, credential, transport),
+        )
+        try:
+            updated = await asyncio.to_thread(store.set_capability, conn.id, result.capability)
+            active = store.active()
+        except ConnectionRefused as exc:
+            return _ai_refused(exc)
+        return _ai_json(
+            {
+                "ok": True,
+                "effect": "changed",
+                "connection": _ai_connection_view(updated, active.id if active else None),
+                "probe": {
+                    "capability": result.capability,
+                    "models": result.models,
+                    "message": result.message,
+                    "error": result.error,
+                },
+            }
+        )
+
+    @app.get("/api/v1/ai/providers")
+    async def ai_providers(request: Request) -> Response:
+        """List the AI provider presets a connection can start from."""
+
+        from krellbot.ai.providers import PRESETS
 
         s = _state(request.app)
         denied = _gate_get(request, s)
         if denied is not None:
             return denied
-        policy = user_policy_app.load_policy(s.home)
-        return JSONResponse(
+        providers = [
             {
-                "schema_version": SCHEMA_VERSION,
+                "id": p.id,
+                "label": p.label,
+                "format": p.format,
+                "base_url": p.base_url or None,
+                "custom": p.custom,
+                "signin": p.signin,
+                "lists_models": p.lists_models,
+                "credential": "optional" if p.custom else "required",
+            }
+            for p in PRESETS.values()
+        ]
+        return _ai_json({"ok": True, "effect": "unchanged", "providers": providers})
+
+    @app.get("/api/v1/ai/connections")
+    async def ai_connections(request: Request) -> Response:
+        """List AI connections and the active one. Never returns or reads a credential."""
+
+        from krellbot.ai.connections import ConnectionRefused
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+        store = _ai_store(s)
+        try:
+            conns = store.list()
+            active = store.active()
+        except ConnectionRefused as exc:
+            return _ai_refused(exc)
+        active_id = active.id if active else None
+        return _ai_json(
+            {
                 "ok": True,
                 "effect": "unchanged",
-                "policy": policy.to_dict(),
-                "path": user_policy_app.POLICY_FILENAME,
-            },
-            status_code=200,
+                "active": active_id,
+                "connections": [_ai_connection_view(c, active_id) for c in conns],
+            }
+        )
+
+    @app.post("/api/v1/ai/connections")
+    async def ai_connections_add(request: Request) -> Response:
+        """Add a connection (key to the keychain, metadata to disk), then probe it.
+
+        Body: ``preset``, ``model``, and optionally ``credential``,
+        ``base_url`` (custom presets only) and ``label``. A custom endpoint
+        with no key is stored as ``auth: "none"``.
+        """
+
+        from krellbot.ai.connections import ConnectionRefused
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            return _ai_invalid_body()
+        if not isinstance(payload, dict):
+            return _ai_invalid_body()
+        preset = payload.get("preset")
+        model = payload.get("model")
+        optional = {name: payload.get(name) for name in ("credential", "base_url", "label")}
+        if (
+            not isinstance(preset, str)
+            or not isinstance(model, str)
+            or any(v is not None and not isinstance(v, str) for v in optional.values())
+        ):
+            return _ai_invalid_body()
+
+        store = _ai_store(s)
+        try:
+            conn = await asyncio.to_thread(store.add, preset, model=model, **optional)
+        except ConnectionRefused as exc:
+            return _ai_refused(exc)
+        return await _ai_probe_and_record(s, store, conn)
+
+    @app.delete("/api/v1/ai/connections/{conn_id}")
+    async def ai_connections_remove(conn_id: str, request: Request) -> Response:
+        """Remove a connection and delete its keychain entry."""
+
+        from krellbot.ai.connections import ConnectionRefused, is_connection_id
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        if not is_connection_id(conn_id):
+            return _ai_not_found()
+        try:
+            await asyncio.to_thread(_ai_store(s).remove, conn_id)
+        except ConnectionRefused as exc:
+            return _ai_refused(exc)
+        return _ai_json({"ok": True, "effect": "changed", "removed": conn_id})
+
+    @app.post("/api/v1/ai/connections/{conn_id}/activate")
+    async def ai_connections_activate(conn_id: str, request: Request) -> Response:
+        """Make this connection the one Krell uses."""
+
+        from krellbot.ai.connections import ConnectionRefused, is_connection_id
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        if not is_connection_id(conn_id):
+            return _ai_not_found()
+        try:
+            conn = await asyncio.to_thread(_ai_store(s).activate, conn_id)
+        except ConnectionRefused as exc:
+            return _ai_refused(exc)
+        return _ai_json(
+            {"ok": True, "effect": "changed", "active": conn.id, "connection": _ai_connection_view(conn, conn.id)}
+        )
+
+    @app.post("/api/v1/ai/connections/{conn_id}/probe")
+    async def ai_connections_probe(conn_id: str, request: Request) -> Response:
+        """Re-run the capability probe and record the result."""
+
+        from krellbot.ai.connections import ConnectionRefused, is_connection_id
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        if not is_connection_id(conn_id):
+            return _ai_not_found()
+        store = _ai_store(s)
+        try:
+            conn = store.get(conn_id)
+        except ConnectionRefused as exc:
+            return _ai_refused(exc)
+        return await _ai_probe_and_record(s, store, conn)
+
+    # ---- Sign in with OpenRouter (M38.20) ------------------------------
+    #
+    # OAuth PKCE through a one-shot listener on 127.0.0.1 (a separate socket,
+    # not a route here). The browser polls the status route; the code, the
+    # verifier and the key never pass through these routes. Starting is
+    # local-only: OpenRouter redirects to 127.0.0.1, which from a remote
+    # (tailnet) browser is that device, not this one.
+
+    def _ai_signins(s: _AppState):
+        from krellbot.ai.oauth import SigninRegistry
+
+        if s.ai_signins is None:
+            s.ai_signins = SigninRegistry()
+        return s.ai_signins
+
+    def _ai_signin_view(flow_id: str, status: dict) -> dict:
+        body: dict = {"flow_id": flow_id, "state": status["state"]}
+        if "connection_id" in status:
+            body["connection_id"] = status["connection_id"]
+        if "code" in status:
+            body["code"] = status["code"]
+            body["detail"] = status["message"]
+        return body
+
+    @app.post("/api/v1/ai/signin/openrouter")
+    async def ai_signin_openrouter(request: Request) -> Response:
+        """Start a sign-in. Body: ``model``. Returns ``flow_id`` and the ``authorize_url`` to open."""
+
+        from krellbot.ai.connections import ConnectionRefused
+        from krellbot.ai.http import UrllibTransport
+        from krellbot.ai.oauth import SigninRefused, start_openrouter_signin
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        # A server started with Tailscale access admits only tailnet sessions (see remote_scope_put);
+        # the peer check is defence in depth for a loopback-only server.
+        peer = request.client.host if request.client is not None else None
+        if tailnet_access is not None or peer not in ("127.0.0.1", "::1"):
+            return _ai_refused(SigninRefused("ai_signin_local_only"))
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            return _ai_invalid_body()
+        if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
+            return _ai_invalid_body()
+        try:
+            flow = await asyncio.to_thread(
+                start_openrouter_signin,
+                s.home,
+                model=payload["model"],
+                clock=lambda: _app_now(s),
+                transport=s.ai_transport or UrllibTransport(),
+                listener_factory=s.ai_signin_listener_factory,
+                registry=_ai_signins(s),
+                allow_injected_fake_backend=s.keys_allow_fake_backend,
+            )
+        except (ConnectionRefused, SigninRefused) as exc:
+            return _ai_refused(exc)
+        return _ai_json({"ok": True, "effect": "changed", "flow_id": flow.id, "authorize_url": flow.authorize_url})
+
+    @app.get("/api/v1/ai/signin/{flow_id}")
+    async def ai_signin_status(flow_id: str, request: Request) -> Response:
+        """A sign-in's state: ``waiting``, ``connected`` (with ``connection_id``), ``failed`` or ``expired``."""
+
+        from krellbot.ai.oauth import SigninRefused, signin_status
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+        try:
+            status = signin_status(flow_id, registry=_ai_signins(s))
+        except SigninRefused as exc:
+            return _ai_refused(exc)
+        return _ai_json({"ok": True, "effect": "unchanged", **_ai_signin_view(flow_id, status)})
+
+    @app.delete("/api/v1/ai/signin/{flow_id}")
+    async def ai_signin_cancel(flow_id: str, request: Request) -> Response:
+        """Cancel a sign-in still waiting for OpenRouter: its listener closes and it can never add a connection.
+
+        A sign-in whose callback already arrived, or that finished, is left
+        alone; the reply says ``cancelled: false`` with its current state.
+        """
+
+        from krellbot.ai.oauth import SigninRefused, cancel_signin
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        try:
+            cancelled, status = cancel_signin(flow_id, registry=_ai_signins(s))
+        except SigninRefused as exc:
+            return _ai_refused(exc)
+        return _ai_json(
+            {
+                "ok": True,
+                "effect": "changed" if cancelled else "unchanged",
+                "cancelled": cancelled,
+                **_ai_signin_view(flow_id, status),
+            }
+        )
+
+    # ---- Krell (M38.15) ---------------------------------------------------
+    #
+    # Krell's conversation loop runs in the engine (krellbot.agent.krell_loop)
+    # on the user's own model. The streaming routes are POSTs behind the full
+    # state-change gate (session, CSRF, loopback origin); the conversation GET
+    # needs the session. A confirm token reaches the agent tool core only from
+    # ``POST /api/v1/krell/confirm``: the human's button, never the model.
+    # Provider and tool calls run in a worker thread so a slow model cannot
+    # freeze the API.
+
+    _KRELL_SSE_HEADERS = {"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
+    _KRELL_END = object()
+
+    def _krell_factory(s: _AppState):
+        """Build Krell's core, ledger and loop factory once per app; return the factory."""
+
+        if s.krell_loop_factory is None:
+            from krellbot.agent.confirm import ConfirmLedger
+            from krellbot.agent.conversation_store import ConversationStore
+            from krellbot.agent.krell_loop import KrellLoop, build_krell_core
+
+            def clock() -> float:
+                # The app clock (tests inject one), read at call time; ledger and core share it.
+                return float(s.clock()) if s.clock is not None else time.time()
+
+            s.krell_ledger = ConfirmLedger(clock=clock)
+            s.krell_core = build_krell_core(s.home, clock=clock, ledger=s.krell_ledger)
+            s.krell_lock = threading.Lock()
+
+            def factory():
+                return KrellLoop(
+                    s.home,
+                    core=s.krell_core,
+                    store=ConversationStore(s.home, clock=clock),
+                    connections=_ai_store(s),
+                    clock=clock,
+                    transport=s.ai_transport,
+                    ledger=s.krell_ledger,
+                )
+
+            s.krell_loop_factory = factory
+        return s.krell_loop_factory
+
+    def _krell_json(body: dict, status_code: int = 200) -> Response:
+        return JSONResponse(
+            {"schema_version": SCHEMA_VERSION, **body},
+            status_code=status_code,
             headers={"Cache-Control": "no-store"},
         )
 
+    def _krell_refused(code: str, status_code: int) -> Response:
+        from krellbot.agent.krell_loop import MESSAGES
+
+        return _krell_json({"ok": False, "effect": "refused", "code": code, "detail": MESSAGES[code]}, status_code)
+
+    def _krell_invalid_body() -> Response:
+        from krellbot.agent.krell_loop import CODE_BODY_INVALID
+
+        return _krell_refused(CODE_BODY_INVALID, 400)
+
+    async def _krell_body(request: Request) -> dict | None:
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _krell_sse(s: _AppState, open_events: Callable) -> Response:
+        """Stream one Krell generator as SSE frames (the ``_format_sse`` style of ``/api/v1/events``).
+
+        One worker thread owns the generator from first event to close, and
+        holds ``krell_lock`` while it runs: a second Krell stream meanwhile
+        gets ``krell_busy``. If the client goes away, the worker stops after
+        its current event and closes the generator.
+        """
+
+        from krellbot.agent.krell_loop import busy_events, internal_error_events
+
+        factory = _krell_factory(s)
+        lock = s.krell_lock
+
+        async def _emit():
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue = asyncio.Queue()
+            stop = threading.Event()
+
+            def push(item: object) -> None:
+                with contextlib.suppress(RuntimeError):  # the event loop is already closed
+                    loop.call_soon_threadsafe(queue.put_nowait, item)
+
+            def work() -> None:
+                try:
+                    if not lock.acquire(blocking=False):
+                        for event in busy_events():
+                            push(event)
+                        return
+                    try:
+                        events = open_events(factory())
+                        try:
+                            for event in events:
+                                push(event)
+                                if stop.is_set():
+                                    break
+                        finally:
+                            events.close()
+                    finally:
+                        lock.release()
+                except Exception:  # noqa: BLE001 — the stream still ends with a typed error and done.
+                    for event in internal_error_events():
+                        push(event)
+                finally:
+                    push(_KRELL_END)
+
+            worker = loop.run_in_executor(None, work)
+            try:
+                count = 0
+                while True:
+                    item = await queue.get()
+                    if item is _KRELL_END:
+                        break
+                    count += 1
+                    yield _format_sse(event_id=str(count), event_name=item["type"], data_payload=item)
+                await worker
+            finally:
+                stop.set()
+
+        return StreamingResponse(_emit(), media_type="text/event-stream", headers=_KRELL_SSE_HEADERS)
+
+    @app.get("/api/v1/krell/conversation")
+    async def krell_conversation(request: Request) -> Response:
+        """The stored conversation: ``{messages, profile, budget, connection, disclosure}``. No keychain read."""
+
+        from krellbot.agent.krell_loop import CODE_STORE_UNAVAILABLE
+        from krellbot.storage.database import StoreError
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+        factory = _krell_factory(s)
+        try:
+            body = await asyncio.to_thread(lambda: factory().conversation())
+        except StoreError:
+            return _krell_refused(CODE_STORE_UNAVAILABLE, 503)
+        return _krell_json({"ok": True, "effect": "unchanged", **body})
+
+    @app.delete("/api/v1/krell/conversation")
+    async def krell_conversation_clear(request: Request) -> Response:
+        """Clear the conversation and every pending confirm ticket (usage rows stay for the month)."""
+
+        from krellbot.agent.krell_loop import CODE_BUSY, CODE_STORE_UNAVAILABLE
+        from krellbot.storage.database import StoreError
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        factory = _krell_factory(s)
+        lock = s.krell_lock
+        if not lock.acquire(blocking=False):
+            return _krell_refused(CODE_BUSY, 409)
+        try:
+            await asyncio.to_thread(lambda: factory().clear())
+        except StoreError:
+            return _krell_refused(CODE_STORE_UNAVAILABLE, 503)
+        finally:
+            lock.release()
+        return _krell_json({"ok": True, "effect": "changed"})
+
+    @app.post("/api/v1/krell/start")
+    async def krell_start(request: Request) -> Response:
+        """SSE: the egress disclosure and the opening, from the engine. No provider call."""
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        return _krell_sse(s, lambda krell: krell.start())
+
+    @app.post("/api/v1/krell/messages")
+    async def krell_messages(request: Request) -> Response:
+        """SSE: the person's message ``{text}``, then one Krell turn."""
+
+        from krellbot.agent.krell_loop import valid_message
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        payload = await _krell_body(request)
+        text = payload.get("text") if payload is not None else None
+        if not valid_message(text):
+            return _krell_invalid_body()
+        return _krell_sse(s, lambda krell: krell.send(text))
+
+    @app.post("/api/v1/krell/confirm")
+    async def krell_confirm(request: Request) -> Response:
+        """SSE: the person's Confirm or Not now ``{ticket_id, decision}`` on a confirm card.
+
+        The only route that hands a confirm token to the agent tool core. A
+        missing, empty or malformed ticket is refused here; it never becomes a
+        token (absent is ``None``, never ``""``).
+        """
+
+        from krellbot.agent.krell_loop import DECISIONS, token_or_none
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        payload = await _krell_body(request)
+        if payload is None:
+            return _krell_invalid_body()
+        token = token_or_none(payload.get("ticket_id"))
+        decision = payload.get("decision")
+        if token is None or decision not in DECISIONS:
+            return _krell_invalid_body()
+        return _krell_sse(s, lambda krell: krell.resolve_confirm(token, decision))
+
+    @app.post("/api/v1/krell/profile")
+    async def krell_profile(request: Request) -> Response:
+        """SSE: the person's mode ``{mode}`` (standard or advanced), then one Krell turn in that mode."""
+
+        from krellbot.agent.krell_loop import MODES
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        payload = await _krell_body(request)
+        mode = payload.get("mode") if payload is not None else None
+        if mode not in MODES:
+            return _krell_invalid_body()
+        return _krell_sse(s, lambda krell: krell.set_mode(mode))
+
+    # ---- operator user policy (M22.2) ---------------------------------
+
+    @app.get("/api/v1/user-policy")
+    async def get_user_policy(request: Request) -> Response:
+        """Return the operator user-policy snapshot (defaults if missing).
+
+        An invalid file reads as the fail-closed snapshot the engine enforces,
+        with ``code`` ``user_policy_invalid`` and the engine's message, so the
+        editor never shows that snapshot as the operator's choice. ``digest``
+        names the exact file bytes the snapshot came from (``absent`` for no
+        file); an editor sends it back as ``expected_digest`` when it saves.
+        """
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+        # One read of the file, so the snapshot and its digest always match.
+        read = user_policy_app.read_policy(s.home)
+        out: dict = {
+            "schema_version": SCHEMA_VERSION,
+            "ok": True,
+            "effect": "unchanged",
+            "code": user_policy_app.CODE_POLICY_INVALID if read.invalid else user_policy_app.CODE_OK,
+            "policy": read.policy.to_dict(),
+            "path": user_policy_app.POLICY_FILENAME,
+            "digest": read.digest,
+        }
+        if read.invalid:
+            out["message"] = user_policy_app.MESSAGE_INVALID
+        return JSONResponse(out, status_code=200, headers={"Cache-Control": "no-store"})
+
     @app.put("/api/v1/user-policy")
     async def put_user_policy(request: Request) -> Response:
-        """Replace the operator user-policy file; audits the change."""
+        """Replace the operator user-policy file; audits the change.
+
+        With ``expected_digest`` (the ``digest`` a GET returned), the save is
+        refused with 409 ``user_policy_changed``, and nothing is written, if
+        the file changed since that read; a successful save then also returns
+        the new file's ``digest``. Without it, the file is replaced as before.
+        """
 
         s = _state(request.app)
         denied = _gate_state_change(request, s)
@@ -4756,10 +5520,24 @@ def create_app(
             return JSONResponse({"detail": "invalid body"}, status_code=400)
         if not isinstance(payload, dict):
             return JSONResponse({"detail": "invalid body"}, status_code=400)
-        body = payload.get("policy", payload)
+        has_digest = "expected_digest" in payload
+        expected_digest = payload.get("expected_digest")
+        if has_digest and not isinstance(expected_digest, str):
+            return JSONResponse({"detail": "invalid body"}, status_code=400)
+        if "policy" in payload:
+            body = payload["policy"]
+        elif has_digest:
+            # An unwrapped policy carries the digest beside its own fields.
+            body = {key: value for key, value in payload.items() if key != "expected_digest"}
+        else:
+            body = payload
         now = _app_now(s)
-        result = user_policy_app.save_policy(s.home, body, clock=lambda: now)
-        status = 200 if result.ok else 400
+        # No await between the digest check and the write: no other request runs in between.
+        result = user_policy_app.save_policy(s.home, body, clock=lambda: now, expected_digest=expected_digest)
+        if result.code == user_policy_app.CODE_POLICY_CHANGED:
+            status = 409
+        else:
+            status = 200 if result.ok else 400
         out: dict = {
             "schema_version": SCHEMA_VERSION,
             "ok": result.ok,
@@ -4771,7 +5549,40 @@ def create_app(
         }
         if result.policy is not None:
             out["policy"] = result.policy.to_dict()
+        if has_digest and result.digest is not None:
+            out["digest"] = result.digest
         return JSONResponse(out, status_code=status, headers={"Cache-Control": "no-store"})
+
+    # ---- MCP client setup (M38.10) --------------------------------------
+
+    @app.get("/api/v1/agents/mcp-setup")
+    async def get_mcp_setup(request: Request) -> Response:
+        """How an MCP client launches ``krellbot mcp`` here, for the setup snippets.
+
+        Only the command, its args and ``KRELLBOT_HOME``; ``claude_code`` is
+        the Claude Code line built from them, quoted for this computer's shell.
+        """
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+        command, args = _mcp_launch()
+        home = str(s.home.absolute())
+        claude_code = _claude_code_line(command, args, home, windows=sys.platform == "win32")
+        return JSONResponse(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "ok": True,
+                "effect": "unchanged",
+                "command": command,
+                "args": args,
+                "env": {"KRELLBOT_HOME": home},
+                "claude_code": claude_code,
+            },
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
 
     # ---- strategy drafts (NS08a) --------------------------------------
 

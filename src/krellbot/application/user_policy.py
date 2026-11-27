@@ -22,11 +22,18 @@ decimal strings, ``None`` as null); anything else is malformed, which
 denies all three actions and locks agents out (:data:`LOCKED_AGENT_LIMITS`).
 :func:`save_policy` takes v1 or v2 payloads and always writes v2. The agent
 tool core enforces the limits (:mod:`krellbot.agent.limits`).
+
+An editor reads the policy with :func:`read_policy`, which also returns the
+file's digest, and passes it back to :func:`save_policy` as
+``expected_digest``. The save is then refused (:data:`CODE_POLICY_CHANGED`)
+if the file changed since that read, so an editor showing an old read can
+never write it back over a policy the operator changed since.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -57,12 +64,19 @@ CODE_POLICY_DENIED = "user_policy_denied"
 CODE_POLICY_INVALID = "user_policy_invalid"
 CODE_POLICY_UPDATED = "user_policy_updated"
 CODE_BAD_INPUT = "user_policy_bad_input"
+CODE_POLICY_CHANGED = "user_policy_changed"
 
 MESSAGE_DENY_PAPER_ARM = "user policy denies paper-arm"
 MESSAGE_DENY_LIVE = "user policy denies live"
 MESSAGE_DENY_KEY_EXPORT = "user policy denies key export"
 MESSAGE_INVALID = "user policy file is invalid; fail closed"
 MESSAGE_UPDATED = "user policy updated"
+MESSAGE_CHANGED = "user policy changed since it was read; read it again before saving"
+
+# The digest of a missing file, and of one that exists but cannot be read.
+# Any other digest is the sha256 hex of the file's exact bytes.
+DIGEST_ABSENT = "absent"
+DIGEST_UNREADABLE = "unreadable"
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -225,6 +239,8 @@ class PolicyDecision:
     message: str
     action: str | None = None
     policy: UserPolicy | None = None
+    # Set by a successful :func:`save_policy`: the digest of the bytes it wrote.
+    digest: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         body: dict[str, object] = {
@@ -346,10 +362,21 @@ def _parse_payload(data: object, *, v1_agents: AgentLimits = DEFAULT_AGENT_LIMIT
     )
 
 
+def _digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _encode(policy: UserPolicy) -> bytes:
+    """The exact bytes :func:`save_policy` writes for ``policy``."""
+    return (json.dumps(policy.to_dict(), sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
 @dataclass(frozen=True)
 class _LoadResult:
     policy: UserPolicy
     invalid: bool
+    # The digest of the bytes ``policy`` was read from.
+    digest: str = DIGEST_ABSENT
 
 
 def _load(home: Path) -> _LoadResult:
@@ -357,13 +384,39 @@ def _load(home: Path) -> _LoadResult:
     if not path.exists():
         return _LoadResult(DEFAULT_POLICY, False)
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return _LoadResult(_INVALID_POLICY, True)
+        raw_bytes = path.read_bytes()
+    except OSError:
+        return _LoadResult(_INVALID_POLICY, True, DIGEST_UNREADABLE)
+    digest = _digest(raw_bytes)
+    try:
+        raw = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _LoadResult(_INVALID_POLICY, True, digest)
     parsed = _parse_payload(raw)
     if parsed is None:
-        return _LoadResult(_INVALID_POLICY, True)
-    return _LoadResult(parsed, False)
+        return _LoadResult(_INVALID_POLICY, True, digest)
+    return _LoadResult(parsed, False, digest)
+
+
+@dataclass(frozen=True)
+class PolicyRead:
+    """The policy as an editor reads it: one read of the file.
+
+    ``policy`` is what the engine enforces (the fail-closed snapshot when
+    ``invalid``). ``digest`` names the exact bytes it came from
+    (:data:`DIGEST_ABSENT` for no file); pass it to :func:`save_policy` as
+    ``expected_digest``.
+    """
+
+    policy: UserPolicy
+    invalid: bool
+    digest: str
+
+
+def read_policy(home: Path) -> PolicyRead:
+    """Read the policy once, with whether the file is invalid and its digest."""
+    loaded = _load(home)
+    return PolicyRead(loaded.policy, loaded.invalid, loaded.digest)
 
 
 def load_policy(home: Path) -> UserPolicy:
@@ -440,6 +493,7 @@ def save_policy(
     policy: UserPolicy | dict[str, Any],
     *,
     clock: Any | None = None,
+    expected_digest: str | None = None,
 ) -> PolicyDecision:
     """Persist the operator policy (always as schema "2") and audit the change.
 
@@ -448,9 +502,18 @@ def save_policy(
     file is missing or malformed), because a v1 writer knows nothing about
     them. No-op writes (byte-identical payload) still return ok but do not
     append a second audit row.
+
+    With ``expected_digest`` (from :func:`read_policy`), the save is refused
+    with :data:`CODE_POLICY_CHANGED`, writing and journaling nothing, unless
+    the file still has exactly the bytes that digest names. The file is
+    checked when it is read here and again just before the write. There is
+    no lock: a write by another process in between those last two steps
+    is not detected.
     """
     home = Path(home)
     current = _load(home)
+    if expected_digest is not None and current.digest != expected_digest:
+        return PolicyDecision(CODE_POLICY_CHANGED, False, MESSAGE_CHANGED)
     if isinstance(policy, UserPolicy):
         parsed = dataclasses.replace(policy, schema_version=SCHEMA_VERSION)
     else:
@@ -466,18 +529,22 @@ def save_policy(
     # When the file was missing, before is DEFAULT; still audit the write.
     path = policy_path(home)
     home.mkdir(parents=True, exist_ok=True)
-    payload = parsed.to_dict()
-    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    encoded = _encode(parsed)
 
     previous_bytes: bytes | None
+    previous_digest = DIGEST_ABSENT
     if path.exists():
         try:
             previous_bytes = path.read_bytes()
+            previous_digest = _digest(previous_bytes)
         except OSError:
             previous_bytes = None
+            previous_digest = DIGEST_UNREADABLE
     else:
         previous_bytes = None
 
+    if expected_digest is not None and previous_digest != expected_digest:
+        return PolicyDecision(CODE_POLICY_CHANGED, False, MESSAGE_CHANGED)
     atomic_write(path, encoded, mode=0o600)
 
     changed = previous_bytes != encoded
@@ -495,6 +562,7 @@ def save_policy(
         True,
         MESSAGE_UPDATED if changed else "user policy unchanged",
         policy=parsed,
+        digest=_digest(encoded),
     )
 
 
@@ -589,12 +657,16 @@ __all__ = [
     "AGENT_LIMIT_KEYS",
     "CODE_BAD_INPUT",
     "CODE_OK",
+    "CODE_POLICY_CHANGED",
     "CODE_POLICY_DENIED",
     "CODE_POLICY_INVALID",
     "CODE_POLICY_UPDATED",
     "DEFAULT_AGENT_LIMITS",
     "DEFAULT_POLICY",
+    "DIGEST_ABSENT",
+    "DIGEST_UNREADABLE",
     "LOCKED_AGENT_LIMITS",
+    "MESSAGE_CHANGED",
     "MESSAGE_DENY_KEY_EXPORT",
     "MESSAGE_DENY_LIVE",
     "MESSAGE_DENY_PAPER_ARM",
@@ -604,11 +676,13 @@ __all__ = [
     "SCHEMA_VERSION",
     "AgentLimits",
     "PolicyDecision",
+    "PolicyRead",
     "UserPolicy",
     "check",
     "ensure_allowed",
     "load_policy",
     "plain_decimal",
     "policy_path",
+    "read_policy",
     "save_policy",
 ]

@@ -31,12 +31,14 @@ function viewTabIndexes(): number[] {
 
 describe("Navigation — roving tabindex", () => {
   it("keeps only the active view button in the tab order among view items", () => {
-    const { rerender } = render(<Navigation active="home" onChange={() => {}} />);
-    // More destinations stay mounted while collapsed (`hidden`), so nine
+    const { rerender } = render(<Navigation active="krell" onChange={() => {}} />);
+    // More destinations stay mounted while collapsed (`hidden`), so ten
     // view buttons remain in the tree; only the active page is tabbable.
-    expect(viewTabIndexes()).toEqual([0, -1, -1, -1, -1, -1, -1, -1, -1]);
+    expect(viewTabIndexes()).toEqual([0, -1, -1, -1, -1, -1, -1, -1, -1, -1]);
+    rerender(<Navigation active="home" onChange={() => {}} />);
+    expect(viewTabIndexes()).toEqual([-1, 0, -1, -1, -1, -1, -1, -1, -1, -1]);
     rerender(<Navigation active="deployments" onChange={() => {}} />);
-    expect(viewTabIndexes()).toEqual([-1, -1, -1, -1, -1, -1, -1, -1, 0]);
+    expect(viewTabIndexes()).toEqual([-1, -1, -1, -1, -1, -1, -1, -1, -1, 0]);
   });
 });
 
@@ -93,12 +95,12 @@ describe("Navigation — arrow key navigation", () => {
   it("clamps instead of wrapping at the row ends", () => {
     const onChange = vi.fn();
     const { rerender } = render(
-      <Navigation active="home" onChange={onChange} />,
+      <Navigation active="krell" onChange={onChange} />,
     );
-    tab("Workspace").focus();
-    fireEvent.keyDown(tab("Workspace"), { key: "ArrowLeft" });
+    tab("Krell").focus();
+    fireEvent.keyDown(tab("Krell"), { key: "ArrowLeft" });
     expect(onChange).not.toHaveBeenCalled();
-    expect(focusedLabel()).toBe("Workspace");
+    expect(focusedLabel()).toBe("Krell");
     rerender(<Navigation active="deployments" onChange={onChange} />);
     tab("Deploy").focus();
     fireEvent.keyDown(tab("Deploy"), { key: "ArrowRight" });
@@ -118,9 +120,9 @@ describe("Navigation — arrow key navigation", () => {
     expect(focusedLabel()).toBe("Deploy");
 
     fireEvent.keyDown(tab("Deploy"), { key: "Home" });
-    expect(onChange).toHaveBeenCalledWith("home");
-    rerender(<Navigation active="home" onChange={onChange} />);
-    expect(focusedLabel()).toBe("Workspace");
+    expect(onChange).toHaveBeenCalledWith("krell");
+    rerender(<Navigation active="krell" onChange={onChange} />);
+    expect(focusedLabel()).toBe("Krell");
   });
 
   it("steps from Workspace through primary tabs into Research", () => {

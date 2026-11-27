@@ -959,6 +959,27 @@
   }
 }
 
+/*
+ * Phones: the brand row (brand, Jobs, Ask Krell, Search) keeps real slack,
+ * about 47px at 390px and still room at 360px, so small differences in
+ * text metrics or font loading cannot wrap Search onto its own row. The
+ * ⌘K badge is a keyboard hint a touch screen cannot use; "Search" and the
+ * palette's accessible name stay, and every target stays >=44px tall.
+ */
+@media (max-width: 420px) {
+  .kbot-shell__brandbar {
+    column-gap: 6px;
+  }
+
+  .kbot-shell__head-utils > .kbot-shell__palette-hint {
+    padding: 6px 8px;
+  }
+
+  .kbot-shell__palette-keys {
+    display: none;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .kbot-jobs__scrim,
   .kbot-jobs__dialog,

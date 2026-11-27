@@ -29,6 +29,8 @@ export const SECTION_QUERY = "section";
 
 export type SettingsSection =
   | "keys"
+  | "ai"
+  | "agents"
   | "safety"
   | "trust"
   | "privacy"
@@ -37,6 +39,8 @@ export type SettingsSection =
 
 export const SETTINGS_SECTIONS: ReadonlyArray<SettingsSection> = [
   "keys",
+  "ai",
+  "agents",
   "safety",
   "trust",
   "privacy",
@@ -62,6 +66,7 @@ export function resolveSettingsSectionFromSearch(
 }
 
 const KNOWN_VIEWS: ReadonlySet<string> = new Set([
+  "krell",
   "home",
   "workstation",
   "strategies",

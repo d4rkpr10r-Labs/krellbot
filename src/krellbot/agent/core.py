@@ -24,16 +24,22 @@ result, and every call is audited:
    stored and counted in ``agent-arms.json`` under a lock
    (:mod:`krellbot.agent.arm_registry`); anything wrong undoes it, or says
    it may still be running (``agent_arm_*`` codes).
-5. Confirm tickets: :meth:`AgentToolCore._confirm_step`. A Krell call whose
+5. The tool's own pre-check (:attr:`ToolSpec.precheck`), when it has one:
+   a refusal that needs the tool's knowledge, before any ticket is issued.
+   The paper change tools refuse a live (or non-paper) target here
+   (``agent_live_change_refused``), so Krell never asks a human to confirm
+   a call that cannot run. It runs on the asking call and on the confirmed
+   call; a refusal on the confirmed call leaves the ticket unspent.
+6. Confirm tickets: :meth:`AgentToolCore._confirm_step`. A Krell call whose
    tool changes state or whose work is heavy (cost class or estimate) is
    refused with ``needs_confirm`` and a single-use ticket bound to its exact
    params (:mod:`krellbot.agent.confirm`); the same call with that ticket
    runs once (``agent_confirm_*`` codes). A core without a ledger refuses
    such Krell calls. External MCP actors never get tickets.
-6. The tool's handler.
-7. One ``kind=agent_action`` journal record (:mod:`krellbot.agent.audit`).
+7. The tool's handler.
+8. One ``kind=agent_action`` journal record (:mod:`krellbot.agent.audit`).
 
-Steps 4-6 run under one guard: an exception there becomes ``agent_tool_error``
+Steps 4-7 run under one guard: an exception there becomes ``agent_tool_error``
 (effect ``error``), and the audit step swallows its own failures, so ``call``
 never raises.
 
@@ -286,7 +292,10 @@ class ToolSpec:
 
     ``effect`` and ``cost`` drive the policy and confirm steps. ``labels`` are
     copied onto every result of the tool, refusals included. ``actors`` names
-    the actor kinds the tool is offered to.
+    the actor kinds the tool is offered to. ``precheck``, when set, runs after
+    the policy step and before the confirm step, on a copy of the params: it
+    returns a refusal result to stop the call, or ``None`` to continue. It
+    must not change state; the handler re-checks whatever it relies on.
     """
 
     name: str
@@ -297,6 +306,7 @@ class ToolSpec:
     description: str
     handler: Callable[[ToolContext, dict], dict]
     actors: frozenset[str] = frozenset({"krell", "mcp"})
+    precheck: Callable[[ToolContext, dict], dict | None] | None = None
 
 
 # ---- hard key / live markers (M22.1) ------------------------------------
@@ -451,7 +461,7 @@ class AgentToolCore:
         params: object,
         confirm_token: str | None,
     ) -> tuple[dict, str | None, bool]:
-        """Steps 1-6. Returns ``(result, confirm ticket used, handler failed)``."""
+        """Steps 1-7. Returns ``(result, confirm ticket used, handler failed)``."""
         # 1. Hard key and live markers (registration refuses such names too).
         if _is_key_tool(normalized):
             return key_read_refused(normalized).to_dict(), None, False
@@ -473,15 +483,18 @@ class AgentToolCore:
 
         ctx = ToolContext(home=self._home, actor=actor, clock=self._clock, fetch=self._fetch)
         ticket: str | None = None
-        # Steps 4-6 share one guard: an exception in a seam or a handler, or a
+        # Steps 4-7 share one guard: an exception in a seam or a handler, or a
         # non-dict result from any of them, becomes ``agent_tool_error``.
         try:
             # 4. Operator policy and agent limits.
             result = self._policy_step(ctx, spec, params)
-            # 5. Confirm tickets.
+            # 5. The tool's own pre-check, on a copy, before any ticket is issued or spent.
+            if result is None and spec.precheck is not None:
+                result = spec.precheck(ctx, dict(params))
+            # 6. Confirm tickets.
             if result is None:
                 result, ticket = self._confirm_step(ctx, spec, params, confirm_token)
-            # 6. Handler, on a copy so it cannot change what the audit records.
+            # 7. Handler, on a copy so it cannot change what the audit records.
             if result is None:
                 result = spec.handler(ctx, dict(params))
         except Exception as exc:  # noqa: BLE001 — call() never raises; only the class name is kept.
@@ -524,7 +537,7 @@ class AgentToolCore:
         params: dict,
         confirm_token: str | None,
     ) -> tuple[dict | None, str | None]:
-        """Step 5: confirm tickets (:mod:`krellbot.agent.confirm`).
+        """Step 6: confirm tickets (:mod:`krellbot.agent.confirm`).
 
         Return ``(stop, ticket_id)``. A non-``None`` ``stop`` (a
         ``needs_confirm`` or refusal result) ends the call before the
@@ -549,12 +562,13 @@ class AgentToolCore:
           file that now holds other bytes) refuse, ``ok`` lets the handler run.
 
         Expiry follows this core's clock: ``now`` is passed to the ledger.
-        The policy step runs before this one on every call, so a ticketless
-        ``paper_arm`` was already checked (and its prepared arm is dropped
-        with this call's context), and a confirmed one is checked again; a
-        refusal there never presents the ticket, which stays live. External
-        MCP actors never get or spend tickets: their client asks the human
-        before each call.
+        The policy step and the tool's pre-check run before this one on every
+        call, so a ticketless ``paper_arm`` was already checked (and its
+        prepared arm is dropped with this call's context), a live target of a
+        change tool is refused before any ticket is issued, and a confirmed
+        call is checked again; a refusal there never presents the ticket,
+        which stays live. External MCP actors never get or spend tickets:
+        their client asks the human before each call.
         """
         if ctx.actor.kind != "krell":
             return None, None
@@ -598,7 +612,7 @@ class AgentToolCore:
         failed: bool,
         confirm_ticket: str | None,
     ) -> None:
-        """Step 7: append the ``agent_action`` record (``ts`` in whole seconds).
+        """Step 8: append the ``agent_action`` record (``ts`` in whole seconds).
 
         Never raises: a failing clock falls back to wall time so the record is
         still written, and any other audit failure is dropped, as a read-only
