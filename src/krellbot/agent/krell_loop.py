@@ -20,7 +20,13 @@ Two rules hold everywhere here:
   (``krell_confirm_param_refused``). The model never sees a ticket id:
   :func:`model_view` strips every ``ticket_id`` (and the journal's
   ``confirm_ticket``) from a result before it is wrapped for the provider,
-  and known ticket ids are scrubbed from everything else that is sent.
+  a ``needs_confirm`` result's message is the loop's own awaiting-human
+  text, and known ticket ids are scrubbed from everything else that is sent.
+- **Every tool call is journaled.** The core audits the calls it receives;
+  a call the loop refuses itself (ticket- or token-shaped arguments, over
+  the per-turn cap, or from a chat-only model) gets an ``agent_action``
+  record with empty params, so a refused value never reaches the journal.
+  Krell's own ``set_profile`` and ``highlight`` are not core tools.
 - **Krell is honest.** Facts shown to the person come from the engine and
   from tool results, never from model prose: the egress disclosure and the
   opening line are emitted deterministically without a provider call, and
@@ -45,6 +51,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import math
 import re
 from collections.abc import Callable, Generator, Iterator
@@ -52,8 +59,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from krellbot import sanitize
 from krellbot.agent import budget as token_budget
 from krellbot.agent.actors import KRELL
+from krellbot.agent.audit import append_agent_record
 from krellbot.agent.confirm import CODE_CONFIRM_UNKNOWN, MESSAGE_CONFIRM_UNKNOWN, ConfirmLedger
 from krellbot.agent.conversation_store import ConversationStore, Profile, StoredMessage, StoreError
 from krellbot.agent.core import SCHEMA_VERSION, AgentToolCore
@@ -66,6 +75,8 @@ from krellbot.ai.disclosure import egress_disclosure
 from krellbot.ai.http import HttpTransport
 from krellbot.ai.types import ChatAdapter, ChatMessage, ProviderError, TextDelta, ToolCall, ToolCallDone, ToolDef, Usage
 from krellbot.application import user_policy
+
+_LOG = logging.getLogger(__name__)
 
 # ---- limits -------------------------------------------------------------
 
@@ -314,7 +325,7 @@ def _scrub(value: Any, ids: set[str]) -> Any:
         return value
     if isinstance(value, str):
         for ticket in ids:
-            value = value.replace(ticket, "[ticket]")
+            value = value.replace(ticket, "[redacted]")
         return value
     if isinstance(value, dict):
         return {_scrub(key, ids): _scrub(item, ids) for key, item in value.items()}
@@ -433,14 +444,32 @@ class _Card:
     params: dict
 
 
+def _settles(payload: dict) -> bool:
+    """True when a recorded decision closes its card: Not now, or a Confirm whose call ran.
+
+    A Confirm the core refused (say a limit lowered since the card was shown,
+    which leaves the ticket unspent) keeps the card open, so the person can
+    raise the limit and press Confirm again; the core decides whether the
+    ticket is still live.
+    """
+    if payload.get("decision") != "confirm":
+        return True
+    result = payload.get("result")
+    return isinstance(result, dict) and result.get("ok") is True
+
+
 def _find_card(history: list[StoredMessage], ticket: str) -> _Card | None:
-    """The card for ``ticket`` if this conversation showed it and no decision was recorded for it."""
+    """The card for ``ticket`` if this conversation showed it and no settling decision was recorded for it."""
     card: _Card | None = None
     for message in history:
         payload = message.payload
         if message.role == "notice" and payload.get("kind") == "confirm_decision":
             decided = payload.get("ticket_id")
-            if isinstance(decided, str) and hmac.compare_digest(decided.encode(), ticket.encode()):
+            if (
+                isinstance(decided, str)
+                and hmac.compare_digest(decided.encode(), ticket.encode())
+                and _settles(payload)
+            ):
                 return None
         if message.role != "tool":
             continue
@@ -464,9 +493,11 @@ class KrellLoop:
     """One conversation turn engine over the stored thread. Cheap to build; build one per request.
 
     ``core`` is Krell's shared tool core (:func:`build_krell_core`) and
-    ``ledger`` its confirm ledger (for Not now and for clearing). ``store`` is
-    the conversation, ``connections`` the AI connection store; ``transport``
-    is the HTTP seam for the provider adapter (``None``: the real one).
+    ``ledger`` is required and must be that core's own confirm ledger: Not now
+    discards from it and clearing empties it, so any other ledger would leave
+    the core's tickets live. ``store`` is the conversation, ``connections``
+    the AI connection store; ``transport`` is the HTTP seam for the provider
+    adapter (``None``: the real one).
     """
 
     def __init__(
@@ -477,10 +508,15 @@ class KrellLoop:
         store: ConversationStore,
         connections: ConnectionStore,
         clock: Callable[[], float],
+        ledger: ConfirmLedger,
         transport: HttpTransport | None = None,
         max_tool_calls_per_turn: int = MAX_TOOL_CALLS_PER_TURN,
-        ledger: ConfirmLedger | None = None,
     ) -> None:
+        if not isinstance(ledger, ConfirmLedger):
+            raise TypeError("KrellLoop needs the engine's ConfirmLedger")
+        # The core keeps its ledger private; the loop must hold the very same one.
+        if getattr(core, "_confirm", None) is not ledger:
+            raise ValueError("the ledger must be the one the core was built with")
         if not 1 <= max_tool_calls_per_turn <= MAX_TOOL_CALLS_PER_TURN:
             raise ValueError(f"max_tool_calls_per_turn must be 1-{MAX_TOOL_CALLS_PER_TURN}")
         for name in LOCAL_TOOLS:
@@ -540,18 +576,21 @@ class KrellLoop:
         The ledger is cleared first, so a failure to clear the store can leave
         stale cards on screen but never a live ticket behind them.
         """
-        if self._ledger is not None:
-            self._ledger.clear()
+        self._ledger.clear()
         self._store.clear()
 
     # ---- streams ----------------------------------------------------------------
 
     def _session(self, events: Iterator[dict]) -> Iterator[dict]:
+        """Every stream ends with ``done``; a failure becomes a typed error, logged by class name only."""
         try:
             yield from events
-        except StoreError:
+        except StoreError as exc:
+            _LOG.warning("Krell stream stopped: %s", type(exc).__name__)
             yield error_event(CODE_STORE_UNAVAILABLE)
-        except Exception:  # noqa: BLE001 — a stream ends with a typed error and done, never a traceback.
+        except Exception as exc:  # noqa: BLE001 — a stream ends with a typed error and done, never a traceback.
+            # The class name only: an exception's text could carry provider output or a credential.
+            _LOG.warning("Krell stream stopped: %s", type(exc).__name__)
             yield error_event(CODE_INTERNAL)
         yield {"type": "done"}
 
@@ -629,8 +668,7 @@ class KrellLoop:
             "tool": card.tool,
         }
         if decision == "decline":
-            if self._ledger is not None:
-                self._ledger.discard(token)
+            self._ledger.discard(token)
             self._store.append("notice", notice)
             yield {"type": "notice", **notice}
             yield from self._turn(model)
@@ -702,6 +740,7 @@ class KrellLoop:
                 if asked >= self._cap:
                     capped = True
                     result = _refusal(call.name, CODE_TOOL_CAP)
+                    self._journal_refusal(call.name, CODE_TOOL_CAP, ids)
                     self._store.append("tool", {"tool_call_id": call.id, "name": call.name, "result": result})
                     continue
                 asked += 1
@@ -720,13 +759,16 @@ class KrellLoop:
         yield {"type": "tool_start", "id": call.id, "name": _shown_name(name), "arguments": args}
         highlight: str | None = None
         try:
-            shaped = _confirm_shaped(args, ids)
+            # The tool name too: a name holding a ticket id would otherwise reach the core's audit.
+            shaped = _confirm_shaped(args, ids) or _confirm_shaped(name, ids)
         except RecursionError:
             shaped = True  # too deep to check is too deep to forward
         if not tools_enabled:
             result = _refusal(name, CODE_TOOLS_UNAVAILABLE)
+            self._journal_refusal(name, CODE_TOOLS_UNAVAILABLE, ids)
         elif shaped:
             result = _refusal(name, CODE_CONFIRM_PARAM_REFUSED)
+            self._journal_refusal(name, CODE_CONFIRM_PARAM_REFUSED, ids)
         elif name == TOOL_SET_PROFILE:
             result = self._set_profile(args)
         elif name == TOOL_HIGHLIGHT:
@@ -767,6 +809,27 @@ class KrellLoop:
 
     def _now(self) -> int:
         return int(self._clock())
+
+    def _journal_refusal(self, name: object, code: str, ids: set[str]) -> None:
+        """One ``agent_action`` record for a call the loop refused before the core, as the core audits its own.
+
+        ``params`` is always empty, never masked: a ticket under an innocent
+        key (``correlation_id``) would survive masking. The tool name is
+        sanitized and scrubbed of known ticket ids. Never raises.
+        """
+        try:
+            tool = _scrub(sanitize.text(_shown_name(name), max_len=64), ids) or "unknown"
+            append_agent_record(
+                self._home,
+                ts=self._now(),
+                actor=KRELL,
+                tool=tool,
+                params={},
+                outcome="refused",
+                code=code,
+            )
+        except Exception:  # noqa: BLE001 — the refusal stands without its record, as in the core's audit.
+            _LOG.warning("Krell refusal not journaled")
 
     def _budget_state(self) -> token_budget.BudgetState:
         agents = user_policy.load_policy(self._home).agents
@@ -853,12 +916,32 @@ def _highlight(args: object) -> tuple[dict, str | None]:
 
 
 def _tool_content(payload: dict, ids: set[str]) -> str:
+    """A stored tool result as the model sees it.
+
+    A ``needs_confirm`` result's message is replaced by the loop's own
+    awaiting-human text in this copy only: the core's message speaks of
+    running the call again with a ticket, which is the human's to do. The
+    stored result (the person's card) keeps the core's message.
+    """
     result = payload.get("result")
     result = result if isinstance(result, dict) else {}
-    content = wrap_tool_result(str(payload.get("name") or ""), result)
     if result.get("effect") == "needs_confirm":
-        content += "\n" + NOTE_AWAITING_HUMAN
-    return _scrub(content, ids)
+        result = {**result, "message": NOTE_AWAITING_HUMAN}
+    return _scrub(wrap_tool_result(str(payload.get("name") or ""), result), ids)
+
+
+_CODE_RE = re.compile(r"[a-z0-9_]{1,64}")
+
+
+def _confirm_outcome(result: dict) -> str:
+    """What happened to a confirmed call, in the engine's words; it never claims a call ran that did not."""
+    code = result.get("code")
+    shown = code if isinstance(code, str) and _CODE_RE.fullmatch(code) else "unknown"
+    if result.get("ok") is True:
+        return "and Krellbot ran that call once, with the exact parameters on the card."
+    if result.get("effect") == "refused":
+        return f"but Krellbot refused the call ({shown}), so it did not run."
+    return f"but the call did not succeed ({shown})."
 
 
 def _notice_for_model(payload: dict, ids: set[str]) -> str | None:
@@ -872,8 +955,8 @@ def _notice_for_model(payload: dict, ids: set[str]) -> str | None:
     if not isinstance(result, dict):
         return None
     note = (
-        f"The person pressed Confirm on the {tool} card, so Krellbot made that call once, with the exact "
-        "parameters on the card. Only this result says what happened:\n" + wrap_tool_result(tool, result)
+        f"The person pressed Confirm on the {tool} card, {_confirm_outcome(result)} "
+        "Only this result says what happened:\n" + wrap_tool_result(tool, result)
     )
     return _scrub(note, ids)
 
@@ -916,9 +999,9 @@ def _provider_messages(history: list[StoredMessage], ids: set[str]) -> list[Chat
             calls = tuple(
                 ToolCall(
                     str(c.get("id") or ""),
-                    str(c.get("name") or ""),
+                    _scrub(str(c.get("name") or ""), ids),
                     arguments(c.get("arguments")),
-                    c.get("provider_data") if isinstance(c.get("provider_data"), dict) else None,
+                    arguments(c.get("provider_data")) if isinstance(c.get("provider_data"), dict) else None,
                 )
                 for c in payload.get("tool_calls") or []
                 if isinstance(c, dict)

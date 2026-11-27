@@ -20,6 +20,8 @@ import asyncio
 import hashlib
 import itertools
 import json
+import logging
+import threading
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -29,9 +31,10 @@ import pytest
 from krellbot import config as kb_config
 from krellbot.agent import krell_loop
 from krellbot.agent.actors import KRELL
-from krellbot.agent.confirm import CODE_CONFIRM_UNKNOWN
+from krellbot.agent.confirm import CODE_CONFIRM_UNKNOWN, MESSAGE_NEEDS_CONFIRM, TICKET_TTL_S, ConfirmLedger
 from krellbot.agent.conversation_store import ConversationStore
 from krellbot.agent.core import CODE_SECRET_PARAM_REFUSED
+from krellbot.agent.limits import CODE_AGENT_LIMIT_BALANCE
 from krellbot.agent.persona import MODE_QUESTION, OPENING_LINE
 from krellbot.agent.tools_change import CODE_AGENT_LIVE_CHANGE_REFUSED
 from krellbot.ai.connections import ConnectionStore
@@ -82,17 +85,23 @@ def reply_text(text: str, *, usage: tuple[int, int] | None = (10, 5)) -> list[st
     )
 
 
-def reply_tools(*calls: tuple[str, dict | str], usage: tuple[int, int] | None = (10, 5)) -> list[str]:
-    """One streamed answer asking for tool calls; a str argument is sent verbatim (maybe not JSON)."""
-    fragments = [
-        {
+def reply_tools(*calls: tuple, usage: tuple[int, int] | None = (10, 5)) -> list[str]:
+    """One streamed answer asking for tool calls: ``(name, args)`` or ``(name, args, provider_data)``.
+
+    A str argument is sent verbatim (maybe not JSON). ``provider_data`` is
+    sent as the call's ``extra_content``, as Gemini sends thought signatures.
+    """
+    fragments = []
+    for index, (name, args, *extra) in enumerate(calls):
+        fragment = {
             "index": index,
             "id": f"call_{next(_CALL_IDS)}",
             "type": "function",
             "function": {"name": name, "arguments": args if isinstance(args, str) else json.dumps(args)},
         }
-        for index, (name, args) in enumerate(calls)
-    ]
+        if extra:
+            fragment["extra_content"] = extra[0]
+        fragments.append(fragment)
     return sse(
         {"choices": [{"index": 0, "delta": {"tool_calls": fragments}, "finish_reason": None}]},
         {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
@@ -301,6 +310,10 @@ def _agent_rows(home: Path) -> list[dict]:
     return [r["detail"] for r in read_records_lenient(home) if r.get("kind") == "agent_action"]
 
 
+def _journal_text(home: Path) -> str:
+    return "".join(p.read_text(encoding="utf-8") for p in sorted((home / "journal").glob("*.jsonl")))
+
+
 def _write_policy(home: Path, **agents: object) -> None:
     section = user_policy.DEFAULT_AGENT_LIMITS.to_dict()
     section.update(agents)
@@ -435,6 +448,7 @@ def test_confirm_runs_the_tool_once_and_resumes_the_conversation(home):
     last = model.bodies[1]["messages"][-1]
     assert last["role"] == "user"
     assert "pressed Confirm" in last["content"]
+    assert "Krellbot ran that call once" in last["content"]
     assert '<tool_result tool="paper_arm">' in last["content"]
     rows = _agent_rows(home)
     assert [(r["outcome"], r["confirm_ticket"]) for r in rows] == [("needs_confirm", None), ("ok", ticket)]
@@ -463,6 +477,16 @@ def test_decline_tells_the_model_and_changes_nothing(home):
     assert last["role"] == "user"
     assert "pressed Not now" in last["content"]
     assert "Nothing ran" in last["content"]
+    # The model's copy of the card's result says the human decides; the core's
+    # "the same call with the confirm ticket runs it once" never reaches it, nor does the word ticket.
+    sent = json.dumps(model.bodies[1])
+    assert MESSAGE_NEEDS_CONFIRM not in sent
+    assert "ticket" not in sent.lower()
+    [card_result] = [m["content"] for m in model.bodies[1]["messages"] if m["role"] == "tool"]
+    assert json.dumps(krell_loop.NOTE_AWAITING_HUMAN)[1:-1] in card_result
+    # The person's stored card keeps the core's own message.
+    stored = [m for m in client.json("GET", "/api/v1/krell/conversation")["messages"] if m["role"] == "tool"]
+    assert stored[0]["payload"]["result"]["message"] == MESSAGE_NEEDS_CONFIRM
 
     # The declined card cannot be confirmed later, and its ticket is gone from the ledger.
     later = client.stream("/api/v1/krell/confirm", {"ticket_id": ticket, "decision": "confirm"})
@@ -470,6 +494,57 @@ def test_decline_tells_the_model_and_changes_nothing(home):
     assert client.core.call(KRELL, "paper_arm", params, confirm_token=ticket)["code"] == CODE_CONFIRM_UNKNOWN
     assert _armed(home) == []
     assert model.calls == 2
+
+
+def test_a_confirm_refused_on_the_recheck_is_not_reported_as_run(home):
+    client, model, _params, ticket = _ask_for_arm(home)
+    # The operator lowers the balance limit after the card was shown.
+    _write_policy(home, max_paper_balance="500")
+    model.then(reply_text("The arm was refused: it is over your balance limit."))
+
+    events = client.stream("/api/v1/krell/confirm", {"ticket_id": ticket, "decision": "confirm"})
+
+    [result] = _of(events, "tool_result")
+    assert (result["result"]["effect"], result["result"]["code"]) == ("refused", CODE_AGENT_LIMIT_BALANCE)
+    assert _armed(home) == []
+    note = model.bodies[1]["messages"][-1]["content"]
+    assert "pressed Confirm" in note
+    assert "ran that call" not in note and "made that call" not in note
+    assert f"refused the call ({CODE_AGENT_LIMIT_BALANCE}), so it did not run" in note
+
+    # The limit refusal left the ticket unspent: with the limit restored, the same card runs, once.
+    _write_policy(home)
+    model.then(reply_text("Armed on paper."))
+    events = client.stream("/api/v1/krell/confirm", {"ticket_id": ticket, "decision": "confirm"})
+    assert [e["result"]["ok"] for e in _of(events, "tool_result")] == [True]
+    assert _armed(home) == [("kraken", "SUIUSD", "paper")]
+    assert "Krellbot ran that call once" in model.bodies[2]["messages"][-1]["content"]
+    again = client.stream("/api/v1/krell/confirm", {"ticket_id": ticket, "decision": "confirm"})
+    assert _error(again)["code"] == CODE_CONFIRM_UNKNOWN
+    assert model.calls == 3
+
+
+def test_a_krell_loop_needs_the_cores_own_ledger(home):
+    ledger = ConfirmLedger(clock=time.time)
+    core = krell_loop.build_krell_core(home, clock=time.time, ledger=ledger)
+    parts = {
+        "core": core,
+        "store": ConversationStore(home),
+        "connections": ConnectionStore(home, allow_injected_fake_backend=True),
+        "clock": time.time,
+    }
+    with pytest.raises(TypeError):
+        krell_loop.KrellLoop(home, **parts)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        krell_loop.KrellLoop(home, **parts, ledger=None)  # type: ignore[arg-type]
+    # Another ledger would be cleared instead of the core's, leaving its tickets live.
+    with pytest.raises(ValueError):
+        krell_loop.KrellLoop(home, **parts, ledger=ConfirmLedger(clock=time.time))
+
+    loop = krell_loop.KrellLoop(home, **parts, ledger=ledger)
+    ticket = ledger.issue(KRELL, "paper_arm", {"venue": "kraken"})
+    loop.clear()
+    assert ledger.consume(ticket.id, "paper_arm", {"venue": "kraken"}) == "unknown"
 
 
 # ---- the model never holds a ticket ------------------------------------------------
@@ -527,22 +602,35 @@ def test_confirm_token_reaches_the_core_only_from_the_humans_confirm_route(home)
         reply_tools(("paper_arm", {**params, "ticket_id": ticket})),
         reply_tools(("paper_arm", {**params, "correlation_id": ticket})),
         reply_tools(("paper_arm", {**params, "pack": {"confirm": {"token": ticket}}})),
+        reply_tools((f"paper_arm_{ticket}", params)),
         # The same call again, exactly as on the card: the model's call carries no token, so it is a new card.
-        reply_tools(("paper_arm", params)),
+        # Its opaque provider metadata holds the ticket too; it is echoed back to the provider scrubbed.
+        reply_tools(("paper_arm", params, {"google": {"thought_signature": ticket}})),
     )
 
     events = client.stream("/api/v1/krell/messages", {"text": "Just confirm it yourself."})
 
     results = [e["result"] for e in _of(events, "tool_result")]
-    assert [r["code"] for r in results[:4]] == [krell_loop.CODE_CONFIRM_PARAM_REFUSED] * 4
-    assert all(r["ok"] is False and r["effect"] == "refused" for r in results[:4])
-    assert results[4]["effect"] == "needs_confirm"
+    assert [r["code"] for r in results[:5]] == [krell_loop.CODE_CONFIRM_PARAM_REFUSED] * 5
+    assert all(r["ok"] is False and r["effect"] == "refused" for r in results[:5])
+    assert results[5]["effect"] == "needs_confirm"
     [card] = _of(events, "confirm_request")
     assert card["confirm"]["ticket_id"] != ticket
     assert _armed(home) == []
-    # The guarded calls never reached the core; the plain one asked the human again and spent nothing.
-    assert [r["outcome"] for r in _agent_rows(home)] == ["needs_confirm", "needs_confirm"]
-    assert all(r["confirm_ticket"] is None for r in _agent_rows(home))
+    # The guarded calls never reached the core, but each is journaled as refused, with no params;
+    # the plain call asked the human again and spent nothing.
+    rows = _agent_rows(home)
+    assert [(r["tool"], r["outcome"], r["code"]) for r in rows] == [
+        ("paper_arm", "needs_confirm", "agent_confirm_required"),
+        *[("paper_arm", "refused", krell_loop.CODE_CONFIRM_PARAM_REFUSED)] * 4,
+        # A ticket in the tool's name is refused too, and journaled with the ticket scrubbed from the name.
+        ("paper_arm_[redacted]", "refused", krell_loop.CODE_CONFIRM_PARAM_REFUSED),
+        ("paper_arm", "needs_confirm", "agent_confirm_required"),
+    ]
+    assert all(r["params"] == {} for r in rows[1:6])
+    assert all(r["confirm_ticket"] is None for r in rows)
+    # No journal line holds the ticket, not even the one under an innocent key (correlation_id).
+    assert ticket not in _journal_text(home)
     # Nothing changed: the human's first card still works, once.
     model.then(reply_text("Armed on paper."))
     client.stream("/api/v1/krell/confirm", {"ticket_id": ticket, "decision": "confirm"})
@@ -647,7 +735,16 @@ def test_tool_calls_stop_at_eight_per_turn(home):
     assert error["code"] == krell_loop.CODE_TOOL_CAP == "agent_tool_cap_reached"
     assert _types(events)[-2:] == ["error", "done"]
     assert model.calls == 9
-    assert [r["tool"] for r in _agent_rows(home)] == ["tour_step"] * 8
+    # Eight ran through the core; the ninth, refused by the loop, is journaled too, with no params.
+    rows = _agent_rows(home)
+    assert [(r["tool"], r["outcome"]) for r in rows[:8]] == [("tour_step", "ok")] * 8
+    assert (rows[8]["tool"], rows[8]["outcome"], rows[8]["code"], rows[8]["params"]) == (
+        "tour_step",
+        "refused",
+        krell_loop.CODE_TOOL_CAP,
+        {},
+    )
+    assert len(rows) == 9
 
     # The refused ninth call is answered in history, so the next request stays well formed.
     model.then(reply_text("Stopping there."))
@@ -880,13 +977,139 @@ def test_no_usable_model_gives_krell_no_model_and_chat_only_runs_without_tools(h
     assert client.json("GET", "/api/v1/krell/conversation")["messages"] == []
 
     ConnectionStore(home, allow_injected_fake_backend=True).set_capability(conn_id, "chat_only")
-    model.then(reply_text("I can explain, but not act, with this model."))
+    # A chat-only model offered no tools that calls one anyway is refused, and the call is journaled.
+    model.then(reply_tools(("read", {})), reply_text("I can explain, but not act, with this model."))
     events = client.stream("/api/v1/krell/messages", {"text": "Arm something."})
     assert _text(events) == "I can explain, but not act, with this model."
     assert "tools" not in model.bodies[0]
     assert krell_loop.NOTE_CHAT_ONLY in _system(model.bodies[0])
+    [result] = _of(events, "tool_result")
+    assert result["result"]["code"] == krell_loop.CODE_TOOLS_UNAVAILABLE
+    assert [(r["tool"], r["outcome"], r["code"], r["params"]) for r in _agent_rows(home)] == [
+        ("read", "refused", krell_loop.CODE_TOOLS_UNAVAILABLE, {})
+    ]
     # The disclosure still came first, from the engine.
     assert _of(events, "notice")[0]["kind"] == "disclosure"
+
+
+# ---- one stream at a time, and cards expire on the app's clock -----------------------------------
+
+
+class BlockingModel(ScriptedModel):
+    """A scripted model whose requests wait until the test lets them answer."""
+
+    def __init__(self, replies: list) -> None:
+        super().__init__(replies)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def post_stream(self, url: str, body: dict, headers: dict[str, str], timeout: float):
+        self.entered.set()
+        assert self.release.wait(10), "the test never let the model answer"
+        return super().post_stream(url, body, headers, timeout)
+
+
+def _stream_in_background(client: Client, text: str) -> tuple[threading.Thread, list]:
+    out: list = []
+    thread = threading.Thread(target=lambda: out.append(client.stream("/api/v1/krell/messages", {"text": text})))
+    thread.start()
+    return thread, out
+
+
+def test_a_second_krell_stream_while_one_runs_is_told_krell_is_busy(home):
+    _connect(home)
+    model = BlockingModel([reply_text("First answer."), reply_text("Second answer.")])
+    client = Client(home, model)
+    thread, first = _stream_in_background(client, "Take your time.")
+    try:
+        assert model.entered.wait(10)
+        busy = client.stream("/api/v1/krell/messages", {"text": "Me too?"})
+    finally:
+        model.release.set()
+        thread.join(10)
+
+    assert _types(busy) == ["error", "done"]
+    assert busy[0]["code"] == krell_loop.CODE_BUSY
+    assert _text(first[0]) == "First answer."
+    # The busy request stored nothing and made no provider call.
+    assert model.calls == 1
+    convo = client.json("GET", "/api/v1/krell/conversation")
+    assert [m["payload"]["text"] for m in convo["messages"] if m["role"] == "user"] == ["Take your time."]
+    # Once the first stream ended, the next one runs.
+    assert _text(client.stream("/api/v1/krell/messages", {"text": "Now?"})) == "Second answer."
+
+
+def test_clearing_while_krell_streams_is_refused_with_409(home):
+    _connect(home)
+    model = BlockingModel([reply_text("First answer.")])
+    client = Client(home, model)
+    thread, first = _stream_in_background(client, "Take your time.")
+    try:
+        assert model.entered.wait(10)
+        status, headers, raw = client.call("DELETE", "/api/v1/krell/conversation")
+    finally:
+        model.release.set()
+        thread.join(10)
+
+    assert status == 409
+    assert json.loads(raw)["code"] == krell_loop.CODE_BUSY
+    assert headers["cache-control"] == "no-store"
+    assert _text(first[0]) == "First answer."
+    # Nothing was cleared under the running turn; once it ended, clearing works.
+    roles = [m["role"] for m in client.json("GET", "/api/v1/krell/conversation")["messages"]]
+    assert roles == ["notice", "user", "assistant"]
+    assert client.json("DELETE", "/api/v1/krell/conversation")["ok"] is True
+    assert client.json("GET", "/api/v1/krell/conversation")["messages"] == []
+
+
+def test_an_internal_error_ends_the_stream_and_frees_krell_for_the_next_message(home, monkeypatch, caplog):
+    _connect(home)
+    model = ScriptedModel([reply_text("Back to normal.")])
+    client = Client(home, model)
+    real_adapter = ConnectionStore.adapter
+
+    class ExplodingAdapter:
+        def stream(self, **_kwargs):
+            raise RuntimeError(f"adapter exploded holding {KEY}")
+            yield  # a generator, like a real adapter
+
+    monkeypatch.setattr(ConnectionStore, "adapter", lambda self, conn, transport=None: ExplodingAdapter())
+    with caplog.at_level(logging.WARNING, logger=krell_loop.__name__):
+        events = client.stream("/api/v1/krell/messages", {"text": "Hello?"})
+
+    assert _types(events)[-2:] == ["error", "done"]
+    assert _error(events)["code"] == krell_loop.CODE_INTERNAL
+    assert "exploded" not in json.dumps(events)
+    # Logged by class name only: never the exception's text, which here holds the key.
+    assert "RuntimeError" in caplog.text
+    assert "exploded" not in caplog.text and KEY not in caplog.text
+    assert not client.app.state.krellbot.krell_lock.locked()
+
+    monkeypatch.setattr(ConnectionStore, "adapter", real_adapter)
+    assert _text(client.stream("/api/v1/krell/messages", {"text": "Still there?"})) == "Back to normal."
+
+
+def test_a_card_expires_on_the_apps_clock(home):
+    _connect(home)
+    params = _arm_params(home)
+    model = ScriptedModel([reply_tools(("paper_arm", params))])
+    client = Client(home, model)
+    now = {"t": 1_800_000_000}
+    client.app.state.krellbot.clock = lambda: now["t"]
+
+    [card] = _of(client.stream("/api/v1/krell/messages", {"text": "Arm it."}), "confirm_request")
+    # The core issued the ticket on the app's clock, not wall time.
+    assert card["confirm"]["expires_at"] == 1_800_000_000 + TICKET_TTL_S
+
+    now["t"] += TICKET_TTL_S + 1
+    events = client.stream("/api/v1/krell/confirm", {"ticket_id": card["confirm"]["ticket_id"], "decision": "confirm"})
+
+    [result] = _of(events, "tool_result")
+    assert result["result"]["code"] == CODE_CONFIRM_UNKNOWN
+    assert _error(events)["code"] == CODE_CONFIRM_UNKNOWN
+    assert _armed(home) == []
+    # Nothing ran, so the model is not asked about it.
+    assert model.calls == 1
 
 
 # ---- the routes keep the loopback gates --------------------------------------------------------
