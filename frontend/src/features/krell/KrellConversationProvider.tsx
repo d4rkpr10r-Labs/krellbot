@@ -11,6 +11,10 @@
  * Confirm ticket ids never enter the display items: each one is kept in
  * a private map keyed by its tool call id, and `confirm(callId, …)` sends
  * it only in the confirm request body. Nothing here logs an event.
+ *
+ * M38.17: decisions (and an `agent_confirm_unknown` answer to a press)
+ * carry their card's call id, so each confirm card can show what the engine
+ * decided; the token budget and Krell's highlights are kept here too.
  */
 import {
   createContext,
@@ -25,6 +29,8 @@ import {
 } from "react";
 import {
   createKrellClient,
+  toBudget,
+  type KrellBudget,
   type KrellClient,
   type KrellConnection,
   type KrellDecision,
@@ -34,16 +40,20 @@ import {
   type KrellStoredMessage,
   type KrellToolResult,
 } from "./client";
+import { useKrellHighlight } from "./useKrellHighlight";
 
 export type KrellItem =
   /** `sending`: shown at once, not yet answered by the engine. */
   | { key: string; kind: "user"; text: string; sending?: boolean }
   | { key: string; kind: "krell"; text: string; question?: string; streaming: boolean }
   | { key: string; kind: "notice"; text: string }
-  | { key: string; kind: "error"; code: string; text: string }
-  | { key: string; kind: "tool"; callId: string; name: string; result: KrellToolResult | null }
+  /** `callId`: the confirm card whose press this error answered. */
+  | { key: string; kind: "error"; code: string; text: string; callId?: string }
+  /** `ended`: the stream that started the call has ended (with no result, it may or may not have run). */
+  | { key: string; kind: "tool"; callId: string; name: string; result: KrellToolResult | null; ended?: boolean }
   | { key: string; kind: "confirm"; callId: string; tool: string; confirm: Record<string, unknown> }
-  | { key: string; kind: "decision"; decision: KrellDecision; tool: string };
+  /** `callId`: the confirm card decided on ("" when it cannot be told). `ended`: its stream has ended. */
+  | { key: string; kind: "decision"; callId: string; decision: KrellDecision; tool: string; ended?: boolean };
 
 export type KrellStatus = "idle" | "loading" | "ready" | "failed";
 
@@ -53,6 +63,8 @@ export type KrellContextValue = {
   pending: boolean;
   /** The active model when Krell can use it (`tools` or `chat_only`), else null. */
   connection: KrellConnection | null;
+  /** Krell's token budget, once the engine has reported it. */
+  budget: KrellBudget | null;
   status: KrellStatus;
   loadError: string | null;
   /** The composer's text, shared by the tab and the panel. */
@@ -128,6 +140,8 @@ function toolItems(key: string, callId: string, name: string, result: unknown): 
 /** The stored thread as display items (what a reload shows). */
 function itemsFromHistory(messages: KrellStoredMessage[]): KrellItem[] {
   const items: KrellItem[] = [];
+  // Not now is stored with its ticket but no call id: find its card by ticket here.
+  const cardOf = new Map(Array.from(ticketsFromHistory(messages), ([callId, ticket]) => [ticket, callId]));
   for (const message of messages) {
     const p = message.payload;
     const key = `h${message.id}`;
@@ -147,8 +161,9 @@ function itemsFromHistory(messages: KrellStoredMessage[]): KrellItem[] {
         items.push({ key, kind: "error", code: str(p.code), text: str(p.message) });
       } else if (p.kind === "confirm_decision") {
         const tool = str(p.tool);
-        items.push({ key, kind: "decision", decision: asDecision(p.decision), tool });
-        if (isRecord(p.result)) items.push(...toolItems(`${key}-result`, str(p.call_id), tool, p.result));
+        const callId = str(p.call_id) || cardOf.get(str(p.ticket_id)) || "";
+        items.push({ key, kind: "decision", callId, decision: asDecision(p.decision), tool, ended: true });
+        if (isRecord(p.result)) items.push(...toolItems(`${key}-result`, callId, tool, p.result));
       }
     }
   }
@@ -192,7 +207,8 @@ function isSending(item: KrellItem | undefined): item is UserItem {
   return item?.kind === "user" && item.sending === true;
 }
 
-function applyEvent(items: KrellItem[], event: KrellEvent, key: string): KrellItem[] {
+/** `callId`: set for the events of a press on that confirm card. */
+function applyEvent(items: KrellItem[], event: KrellEvent, key: string, callId?: string): KrellItem[] {
   const last = items[items.length - 1];
   if (isSending(last) && event.type !== "error") {
     // Any answer but an error means the engine took the message. A new
@@ -208,7 +224,10 @@ function applyEvent(items: KrellItem[], event: KrellEvent, key: string): KrellIt
     case "notice":
       if (event.kind === "disclosure") return [...items, { key, kind: "notice", text: str(event.text) }];
       if (event.kind === "confirm_decision") {
-        return [...items, { key, kind: "decision", decision: asDecision(event.decision), tool: str(event.tool) }];
+        return [
+          ...items,
+          { key, kind: "decision", callId: callId ?? "", decision: asDecision(event.decision), tool: str(event.tool) },
+        ];
       }
       return items;
     case "opening":
@@ -250,11 +269,11 @@ function applyEvent(items: KrellItem[], event: KrellEvent, key: string): KrellIt
         },
       ];
     case "error":
-      return [...settle(items), { key, kind: "error", code: event.code, text: event.message }];
+      return [...settle(items), { key, kind: "error", code: event.code, text: event.message, callId }];
     case "done":
       return settle(items);
     default:
-      // budget, usage, highlight: the budget meter and highlights come in M38.17.
+      // budget, usage, highlight: kept in the provider's state, not shown as items.
       return items;
   }
 }
@@ -263,6 +282,9 @@ type State = {
   status: KrellStatus;
   loadError: string | null;
   connection: KrellConnection | null;
+  budget: KrellBudget | null;
+  /** The latest highlight event; `nonce` tells a repeat of the same test id apart. */
+  highlight: { testId: string; nonce: number } | null;
   messages: KrellItem[];
   pending: boolean;
   draft: string;
@@ -270,15 +292,15 @@ type State = {
 
 type Action =
   | { type: "loading" }
-  | { type: "loaded"; messages: KrellItem[]; connection: KrellConnection | null }
+  | { type: "loaded"; messages: KrellItem[]; connection: KrellConnection | null; budget: KrellBudget | null }
   | { type: "load_failed"; message: string }
   | { type: "pending"; value: boolean }
   | { type: "add"; item: KrellItem }
-  | { type: "event"; event: KrellEvent; key: string }
+  | { type: "event"; event: KrellEvent; key: string; callId?: string }
   | { type: "cleared" }
   | { type: "draft"; value: string; ifEmpty?: boolean }
   /** The stored thread, read again after a turn whose first answer was an error. */
-  | { type: "resync"; messages: KrellItem[]; connection: KrellConnection | null }
+  | { type: "resync"; messages: KrellItem[]; connection: KrellConnection | null; budget: KrellBudget | null }
   /** Drop the unanswered message (the thread could not be read to check it). */
   | { type: "unsend" };
 
@@ -286,10 +308,31 @@ const INITIAL: State = {
   status: "idle",
   loadError: null,
   connection: null,
+  budget: null,
+  highlight: null,
   messages: [],
   pending: false,
   draft: "",
 };
+
+/**
+ * A stream has ended: no result can still arrive for its calls or its
+ * Confirm, so cards stop saying they are running.
+ */
+function endStream(items: KrellItem[]): KrellItem[] {
+  const open = (item: KrellItem): boolean =>
+    (item.kind === "tool" && item.result === null && !item.ended) || (item.kind === "decision" && !item.ended);
+  return items.some(open) ? items.map((item) => (open(item) ? { ...item, ended: true } : item)) : items;
+}
+
+/** What an event changes besides the display items: the budget and the highlight. */
+function sideState(state: State, event: KrellEvent): Partial<Pick<State, "budget" | "highlight">> {
+  if (event.type === "budget") return { budget: toBudget(event) ?? state.budget };
+  if (event.type === "highlight" && typeof event.test_id === "string") {
+    return { highlight: { testId: event.test_id, nonce: (state.highlight?.nonce ?? 0) + 1 } };
+  }
+  return {};
+}
 
 function reduce(state: State, action: Action): State {
   switch (action.type) {
@@ -298,24 +341,35 @@ function reduce(state: State, action: Action): State {
       // result) until the new read lands.
       return state.status === "ready" ? state : { ...state, status: "loading", loadError: null };
     case "loaded":
-      return { ...state, status: "ready", messages: action.messages, connection: usable(action.connection) };
+      return {
+        ...state,
+        status: "ready",
+        messages: action.messages,
+        connection: usable(action.connection),
+        budget: action.budget ?? state.budget,
+      };
     case "load_failed":
       return { ...state, status: "failed", loadError: action.message };
     case "pending":
-      return { ...state, pending: action.value };
+      return { ...state, pending: action.value, messages: action.value ? state.messages : endStream(state.messages) };
     case "add":
       return { ...state, messages: [...state.messages, action.item] };
     case "event": {
-      const messages = applyEvent(state.messages, action.event, action.key);
+      const messages = applyEvent(state.messages, action.event, action.key, action.callId);
       const noModel = action.event.type === "error" && action.event.code === CODE_NO_MODEL;
-      return { ...state, messages, connection: noModel ? null : state.connection };
+      return { ...state, ...sideState(state, action.event), messages, connection: noModel ? null : state.connection };
     }
     case "cleared":
       return { ...state, messages: [] };
     case "draft":
       return { ...state, draft: action.ifEmpty && state.draft ? state.draft : action.value };
     case "resync":
-      return { ...state, messages: action.messages, connection: usable(action.connection) };
+      return {
+        ...state,
+        messages: action.messages,
+        connection: usable(action.connection),
+        budget: action.budget ?? state.budget,
+      };
     case "unsend":
       return { ...state, messages: state.messages.filter((item) => !isSending(item)) };
   }
@@ -355,20 +409,23 @@ export function KrellConversationProvider({
     return `k${keys.current}`;
   }, []);
 
-  const onEvent = useCallback<KrellEventHandler>(
-    (event) => {
+  useKrellHighlight(state.highlight?.testId ?? null, state.highlight?.nonce);
+
+  /** `callId`: the confirm card a press stream answers. */
+  const onEvent = useCallback(
+    (event: KrellEvent, callId?: string): void => {
       if (event.type === "confirm_request") {
         const ticket = event.confirm.ticket_id;
         if (typeof ticket === "string" && ticket) tickets.current.set(event.id, ticket);
       }
-      dispatch({ type: "event", event, key: nextKey() });
+      dispatch({ type: "event", event, key: nextKey(), callId });
     },
     [nextKey],
   );
 
   /** Run one Krell stream; refused locally while another runs. */
   const run = useCallback(
-    async (open: (handler: KrellEventHandler) => Promise<void>, before?: () => void): Promise<void> => {
+    async (open: (handler: typeof onEvent) => Promise<void>, before?: () => void): Promise<void> => {
       if (busy.current) {
         dispatch({ type: "add", item: { key: nextKey(), kind: "error", code: CODE_BUSY, text: MESSAGE_BUSY } });
         return;
@@ -398,7 +455,12 @@ export function KrellConversationProvider({
         return;
       }
       tickets.current = ticketsFromHistory(result.messages);
-      dispatch({ type: "loaded", messages: itemsFromHistory(result.messages), connection: result.connection });
+      dispatch({
+        type: "loaded",
+        messages: itemsFromHistory(result.messages),
+        connection: result.connection,
+        budget: result.budget,
+      });
       const conn = usable(result.connection);
       if (conn && needsStart(result.messages, conn.id)) await run((h) => api.start(h));
     } finally {
@@ -452,6 +514,7 @@ export function KrellConversationProvider({
             ? items
             : [...items, { key: nextKey(), kind: "error", code: error.code, text: error.message }],
           connection: result.connection,
+          budget: result.budget,
         });
       } else {
         dispatch({ type: "unsend" });
@@ -504,11 +567,11 @@ export function KrellConversationProvider({
       if (!ticket) {
         dispatch({
           type: "add",
-          item: { key: nextKey(), kind: "error", code: CODE_CONFIRM_UNKNOWN, text: MESSAGE_CONFIRM_UNKNOWN },
+          item: { key: nextKey(), kind: "error", code: CODE_CONFIRM_UNKNOWN, text: MESSAGE_CONFIRM_UNKNOWN, callId },
         });
         return;
       }
-      void run((h) => api.confirm(ticket, decision, h));
+      void run((h) => api.confirm(ticket, decision, (event) => h(event, callId)));
     },
     [api, nextKey, run],
   );
@@ -548,6 +611,7 @@ export function KrellConversationProvider({
       messages: state.messages,
       pending: state.pending,
       connection: state.connection,
+      budget: state.budget,
       status: state.status,
       loadError: state.loadError,
       draft: state.draft,

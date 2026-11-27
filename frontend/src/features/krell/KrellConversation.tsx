@@ -6,14 +6,39 @@
  * consecutive messages. Her tool calls and cards sit inside a run; a
  * person's message or an engine line (disclosure, error, decision) ends
  * it. All model text renders as plain text.
+ *
+ * Result and confirm cards (M38.17) are drawn only from tool results and
+ * confirm requests the engine sent, never from model text. A confirm ticket
+ * id never reaches a display item, so nothing here can show one.
  */
 import { useEffect, useId, useRef, type FormEvent, type JSX } from "react";
 import krellAvatar from "../../assets/character/krell-pfp-160.webp";
+import { BudgetMeter } from "./BudgetMeter";
+import type { KrellDecision } from "./client";
+import { ConfirmCard, confirmOutcomes, isPressable, type ConfirmOutcome } from "./ConfirmCard";
 import { useKrell, type KrellItem } from "./KrellConversationProvider";
+import { ToolResultCard } from "./ToolResultCard";
 import "./krell.css";
 
 /** The engine's limit on one message (`MAX_MESSAGE_CHARS`). */
 const MAX_MESSAGE_CHARS = 8000;
+
+/** What the confirm cards in the log need from the conversation. */
+type Cards = {
+  outcomes: Map<string, ConfirmOutcome>;
+  /** The card whose Confirm is the one sage primary: the newest that can still be pressed. */
+  primary: string | null;
+  busy: boolean;
+  decide(callId: string, decision: KrellDecision): void;
+};
+
+function primaryCard(items: KrellItem[], outcomes: Map<string, ConfirmOutcome>): string | null {
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const item = items[i];
+    if (item.kind === "confirm" && isPressable(outcomes.get(item.callId))) return item.callId;
+  }
+  return null;
+}
 
 type Row = { item: KrellItem; avatar: boolean };
 
@@ -30,44 +55,7 @@ function withAvatars(items: KrellItem[]): Row[] {
   });
 }
 
-function toolStatus(result: Record<string, unknown> | null): string {
-  if (result === null) return "running…";
-  if (result.effect === "needs_confirm") return "waiting for your choice";
-  if (result.effect === "refused") return "refused";
-  return result.ok === true ? "done" : "did not complete";
-}
-
-type PlaceholderItem = Extract<KrellItem, { kind: "tool" | "confirm" | "decision" }>;
-
-/**
- * Extension point (M38.17): result cards, confirm cards and decision
- * records replace these neutral lines. A confirm ticket id never reaches
- * a display item, so nothing here can show one.
- */
-function KrellPlaceholder({ item }: { item: PlaceholderItem }): JSX.Element {
-  switch (item.kind) {
-    case "tool":
-      return (
-        <li className="kbot-krell__line" data-testid="krell-item-tool">
-          Tool {item.name}: {toolStatus(item.result)}
-        </li>
-      );
-    case "confirm":
-      return (
-        <li className="kbot-krell__line" data-testid="krell-item-confirm">
-          Krell asked before running {item.tool}. It has not run.
-        </li>
-      );
-    case "decision":
-      return (
-        <li className="kbot-krell__line" data-testid="krell-item-decision">
-          You chose {item.decision === "confirm" ? "Confirm" : "Not now"} on {item.tool}.
-        </li>
-      );
-  }
-}
-
-function KrellRow({ item, avatar }: Row): JSX.Element {
+function KrellRow({ item, avatar, cards }: Row & { cards: Cards }): JSX.Element {
   switch (item.kind) {
     case "user":
       return (
@@ -114,8 +102,31 @@ function KrellRow({ item, avatar }: Row): JSX.Element {
           {item.text}
         </li>
       );
-    default:
-      return <KrellPlaceholder item={item} />;
+    case "tool":
+      return (
+        <li className="kbot-krell__card-row" data-testid="krell-item-tool">
+          <ToolResultCard name={item.name} result={item.result} ended={item.ended} />
+        </li>
+      );
+    case "confirm":
+      return (
+        <li className="kbot-krell__card-row" data-testid="krell-item-confirm">
+          <ConfirmCard
+            request={item.confirm}
+            outcome={cards.outcomes.get(item.callId)}
+            busy={cards.busy}
+            primary={item.callId === cards.primary}
+            onConfirm={() => cards.decide(item.callId, "confirm")}
+            onDecline={() => cards.decide(item.callId, "decline")}
+          />
+        </li>
+      );
+    case "decision":
+      return (
+        <li className="kbot-krell__line" data-testid="krell-item-decision">
+          You chose {item.decision === "confirm" ? "Confirm" : "Not now"} on {item.tool}.
+        </li>
+      );
   }
 }
 
@@ -154,16 +165,24 @@ export function KrellConversation(): JSX.Element {
     event?.preventDefault();
     if (canSend) krell.send(krell.draft);
   };
+  const outcomes = confirmOutcomes(krell.messages);
+  const cards: Cards = {
+    outcomes,
+    primary: primaryCard(krell.messages, outcomes),
+    busy: krell.pending,
+    decide: krell.confirm,
+  };
 
   return (
     <div className="kbot-krell__conversation" data-testid="krell-conversation">
       <div className="kbot-krell__log" ref={logRef} role="log" aria-label="Conversation with Krell">
         <ol className="kbot-krell__list">
           {withAvatars(krell.messages).map((row) => (
-            <KrellRow key={row.item.key} item={row.item} avatar={row.avatar} />
+            <KrellRow key={row.item.key} item={row.item} avatar={row.avatar} cards={cards} />
           ))}
         </ol>
       </div>
+      {krell.budget ? <BudgetMeter budget={krell.budget} /> : null}
       {krell.pending ? (
         <p className="kbot-krell__line" role="status">
           Krell is answering…

@@ -1,5 +1,6 @@
 /*
- * Krell tab, side panel and conversation (M38.16).
+ * Krell tab, side panel and conversation (M38.16); result and confirm
+ * cards, the budget meter and highlights (M38.17).
  * Contract: KRELL-SIGNAL-20261010. Colors come from tokens.css only.
  *
  * The side panel docks right at 340px (the shell makes room for it) and
@@ -219,14 +220,196 @@
   resize: vertical;
 }
 
+/* Secondary, so a confirm card's Confirm is the conversation's one sage primary. */
 .kbot-krell .kbot-krell__send {
   min-height: 44px;
   padding: 8px 16px;
+  background: var(--panel);
+  color: var(--seafoam);
+  border: 1px solid var(--seafoam);
+  border-radius: var(--radius-control);
+  font-weight: 700;
+}
+
+/* Cards (M38.17), drawn only from tool results and confirm requests. They
+ * line up with Krell's bubbles (32px avatar + 8px gap). */
+.kbot-krell__card-row {
+  min-width: 0;
+  padding-left: 40px;
+}
+
+.kbot-krell__card {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.kbot-krell__card--confirm {
+  background: var(--panel);
+}
+
+.kbot-krell__card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  margin: 0;
+  color: var(--text);
+  font-weight: 700;
+}
+
+.kbot-krell__card-title {
+  margin: 0;
+  color: var(--text);
+  font-weight: 700;
+}
+
+.kbot-krell__card-label {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.kbot-krell__card-tool,
+.kbot-krell__code,
+.kbot-krell__facts dd {
+  font-family: var(--font-mono);
+  font-weight: 500;
+}
+
+.kbot-krell__card--refused .kbot-krell__card-outcome {
+  color: var(--caution-text);
+}
+
+.kbot-krell__card-sub {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.kbot-krell__card-detail,
+.kbot-krell__card-status {
+  margin: 0;
+  color: var(--muted);
+}
+
+.kbot-krell__facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  margin: 0;
+}
+
+.kbot-krell__facts dt {
+  color: var(--muted);
+}
+
+.kbot-krell__facts dd {
+  min-width: 0;
+  margin: 0;
+}
+
+.kbot-krell__pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.kbot-krell__pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 8px;
+  background: color-mix(in srgb, var(--navy) 55%, var(--panel));
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.kbot-krell__card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-tight);
+}
+
+/* The one sage primary: an open confirm card's Confirm. */
+.kbot-krell .kbot-krell__go {
+  min-height: 34px;
+  padding: 6px 14px;
   background: var(--action-primary-bg);
   color: var(--action-primary-text);
   border: 1px solid var(--action-primary-bg);
   border-radius: var(--radius-control);
+  font-size: 12.5px;
   font-weight: 700;
+}
+
+/* Token budget: conversation and month usage against the limits. */
+.kbot-krell__budget {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.kbot-krell__budget-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 2px var(--space-tight);
+}
+
+.kbot-krell__budget-count {
+  justify-self: end;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.kbot-krell__budget-bar {
+  grid-column: 1 / -1;
+  width: 100%;
+  height: 6px;
+  appearance: none;
+  background: var(--navy);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.kbot-krell__budget-bar::-webkit-meter-bar {
+  background: var(--navy);
+  border: 0;
+  border-radius: 999px;
+}
+
+.kbot-krell__budget-bar::-webkit-meter-optimum-value {
+  background: var(--seafoam);
+  border-radius: 999px;
+}
+
+.kbot-krell__budget-bar::-moz-meter-bar {
+  background: var(--seafoam);
+  border-radius: 999px;
+}
+
+/* Krell's highlight (useKrellHighlight), for 4 s: an outline only. No
+ * motion, and nothing is laid over the element or its controls. Dashed, so
+ * it does not read as the solid focus ring. */
+[data-krell-highlight="true"] {
+  outline: 2px dashed var(--seafoam);
+  outline-offset: 3px;
 }
 
 .kbot-krell__sr {
@@ -264,7 +447,8 @@
   }
 
   /* >=44px targets on phones (Close is the only way off the sheet). */
-  .kbot-krell .kbot-krell__btn {
+  .kbot-krell .kbot-krell__btn,
+  .kbot-krell .kbot-krell__go {
     min-height: 44px;
   }
 

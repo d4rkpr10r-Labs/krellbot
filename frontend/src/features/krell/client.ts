@@ -26,6 +26,15 @@ export type KrellConnection = {
 
 export type KrellToolResult = Record<string, unknown>;
 
+/** Krell's token budget, as the conversation payload and `budget` events report it. */
+export type KrellBudget = {
+  conversation_used: number;
+  conversation_limit: number;
+  month_used: number;
+  month_limit: number;
+  exhausted: boolean;
+};
+
 export type KrellEvent =
   | { type: "notice"; kind: string; [field: string]: unknown }
   | { type: "opening"; text: string; question: string; quick_replies: string[] }
@@ -50,6 +59,7 @@ export type KrellStoredMessage = {
 export type KrellConversationBody = {
   messages: KrellStoredMessage[];
   connection: KrellConnection | null;
+  budget: KrellBudget | null;
 };
 
 export type KrellRefusal = { ok: false; code: string; message: string };
@@ -190,6 +200,29 @@ function toConnection(raw: unknown): KrellConnection | null {
   };
 }
 
+function count(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+/** The budget from a conversation payload or a `budget` event; null unless every count is there. */
+export function toBudget(raw: unknown): KrellBudget | null {
+  if (!isRecord(raw)) return null;
+  const conversationUsed = count(raw.conversation_used);
+  const conversationLimit = count(raw.conversation_limit);
+  const monthUsed = count(raw.month_used);
+  const monthLimit = count(raw.month_limit);
+  if (conversationUsed === null || conversationLimit === null || monthUsed === null || monthLimit === null) {
+    return null;
+  }
+  return {
+    conversation_used: conversationUsed,
+    conversation_limit: conversationLimit,
+    month_used: monthUsed,
+    month_limit: monthLimit,
+    exhausted: raw.exhausted === true,
+  };
+}
+
 function toStored(raw: unknown): KrellStoredMessage | null {
   if (!isRecord(raw) || typeof raw.role !== "string" || !isRecord(raw.payload)) return null;
   return { id: typeof raw.id === "number" ? raw.id : 0, role: raw.role, payload: raw.payload };
@@ -209,6 +242,7 @@ export function createKrellClient(): KrellClient {
           ok: true,
           messages: rows.map(toStored).filter((m): m is KrellStoredMessage => m !== null),
           connection: toConnection(record.connection),
+          budget: toBudget(record.budget),
         };
       } catch {
         return { ok: false, code: "network_error", message: NETWORK_MESSAGE };
