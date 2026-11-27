@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from krellbot import config as kb_config
 from krellbot import release_policy
+from krellbot.agent import audit as agent_audit
 from krellbot.api.jobs import (
     JOB_ERROR_COSTS_UNAVAILABLE,
     JOB_ERROR_FILLS_UNAVAILABLE,
@@ -4239,6 +4240,69 @@ def create_app(
             status_code=200,
             headers={"Cache-Control": "no-store"},
         )
+
+    @app.get("/api/v1/agents/activity")
+    async def agents_activity(request: Request) -> Response:
+        """Return recent agent tool calls (Krell and MCP clients), newest first.
+
+        Same session gate as ``GET /api/v1/paper/status`` (``_gate_get``).
+        Optional exact-match filters ``actor``, ``tool``, ``outcome`` and an
+        integer ``since`` timestamp; bad values are 400 with a typed code.
+        Rows carry only the contract fields: recorded params are never
+        returned (``pair`` is read from ``params.pair`` when present).
+        """
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+
+        q = request.query_params
+        outcome = q.get("outcome") or None
+        if outcome is not None and outcome not in agent_audit.OUTCOMES:
+            return JSONResponse(
+                {"code": "agent_activity_outcome_invalid", "detail": "outcome filter not recognised"},
+                status_code=400,
+            )
+        since_ts: int | None = None
+        since_raw = q.get("since")
+        if since_raw:
+            try:
+                since_ts = int(since_raw)
+            except ValueError:
+                return JSONResponse(
+                    {"code": "agent_activity_since_invalid", "detail": "since must be an integer timestamp"},
+                    status_code=400,
+                )
+
+        records = agent_audit.read_agent_activity(
+            s.home,
+            actor=q.get("actor") or None,
+            tool=q.get("tool") or None,
+            outcome=outcome,
+            since_ts=since_ts,
+            limit=200,
+        )
+        rows = []
+        for record in records:
+            detail = record["detail"]
+            params = detail.get("params")
+            pair = params.get("pair") if isinstance(params, dict) else None
+            venue = record.get("venue")
+            rows.append(
+                {
+                    "ts": record["ts"],
+                    "actor": detail.get("actor"),
+                    "tool": detail.get("tool"),
+                    "outcome": detail.get("outcome"),
+                    "code": detail.get("code"),
+                    "venue": venue if venue and venue != "-" else None,
+                    "pair": pair if isinstance(pair, str) and pair else None,
+                    "confirm_ticket": detail.get("confirm_ticket"),
+                    "tokens": detail.get("tokens"),
+                }
+            )
+        return JSONResponse({"rows": rows}, status_code=200, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/v1/paper/armed")
     async def paper_armed(request: Request) -> Response:
