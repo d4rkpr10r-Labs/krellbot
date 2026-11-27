@@ -13,6 +13,8 @@ export type OwnedDraftSummary = {
   label: string;
   pair: string;
   timeframe: string;
+  /** Who drafted the revision: "workstation", "krell" or "mcp:<client>". */
+  origin?: string;
 };
 
 /** The bytes + read-only identity the Editor already takes as ``initial``. */
@@ -38,6 +40,7 @@ type RawOwnedSummary = {
   label?: unknown;
   pair?: unknown;
   timeframe?: unknown;
+  origin?: unknown;
 };
 
 function asDraftState(raw: unknown): DraftState {
@@ -66,6 +69,10 @@ function adaptSummary(raw: RawOwnedSummary): OwnedDraftSummary {
     label: asString(raw.label),
     pair: asString(raw.pair),
     timeframe: asString(raw.timeframe),
+    // Absent stays absent: the library reads a missing origin as "workstation".
+    ...(typeof raw.origin === "string" && raw.origin !== ""
+      ? { origin: raw.origin }
+      : {}),
   };
 }
 
