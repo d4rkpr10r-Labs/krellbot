@@ -25,6 +25,8 @@ export type KrellConnection = {
   host: string;
   model: string;
   capability: string;
+  /** "chatgpt" when Krell's requests use the person's ChatGPT plan (M38.23). */
+  plan?: "chatgpt" | null;
 };
 
 export type KrellToolResult = Record<string, unknown>;
@@ -202,6 +204,7 @@ function toConnection(raw: unknown): KrellConnection | null {
     host: str(raw.host),
     model: str(raw.model),
     capability: str(raw.capability),
+    plan: raw.plan === "chatgpt" ? "chatgpt" : null,
   };
 }
 

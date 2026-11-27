@@ -14,20 +14,36 @@ from krellbot.ai.types import ErrorCode, ProviderError
 from krellbot.tls import ssl_context
 
 _MAX_ERROR_BODY = 2000
+_MAX_FORM_REPLY = 256 * 1024
+_MAX_REQUEST_ID = 200
 
 
 class TransportError(Exception):
-    """Non-2xx response (status set) or network failure (status None)."""
+    """Non-2xx response (status set) or network failure (status None).
 
-    def __init__(self, status: int | None, body: str = "") -> None:
+    ``request_id`` is the response's ``x-request-id`` header when there was one.
+    """
+
+    def __init__(self, status: int | None, body: str = "", *, request_id: str | None = None) -> None:
         super().__init__(f"transport error status={status}")
         self.status = status
         self.body = body
+        self.request_id = request_id
 
 
 class HttpTransport(Protocol):
     def post_stream(self, url: str, body: dict, headers: dict[str, str], timeout: float) -> Iterator[bytes]:
         """POST JSON and yield response lines. Raises TransportError."""
+        ...
+
+    def get_json(self, url: str, headers: dict[str, str], timeout: float) -> dict: ...
+
+
+class FormTransport(Protocol):
+    """What an OAuth exchange needs: a form POST, and JSON reads for discovery and keys."""
+
+    def post_form(self, url: str, fields: dict[str, str], headers: dict[str, str], timeout: float) -> tuple[int, bytes]:
+        """POST ``application/x-www-form-urlencoded``; return a 2xx status and its body. Raises TransportError."""
         ...
 
     def get_json(self, url: str, headers: dict[str, str], timeout: float) -> dict: ...
@@ -48,12 +64,22 @@ def error_from_transport(exc: TransportError) -> ProviderError:
     return ProviderError(code, msg)
 
 
+def _request_id(headers: object) -> str | None:
+    try:
+        value = headers.get("x-request-id") if headers is not None else None  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 — a missing or odd header object means no id
+        return None
+    if not isinstance(value, str) or not value or len(value) > _MAX_REQUEST_ID or not value.isprintable():
+        return None
+    return value
+
+
 def _http_error(exc: urllib.error.HTTPError) -> TransportError:
     try:
         text = exc.read(_MAX_ERROR_BODY).decode("utf-8", "replace")
     except (OSError, ValueError):
         text = ""
-    return TransportError(exc.code, text)
+    return TransportError(exc.code, text, request_id=_request_id(exc.headers))
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -119,6 +145,30 @@ class UrllibTransport:
         if not isinstance(parsed, dict):
             raise TransportError(None, "not an object")
         return parsed
+
+    def post_form(self, url: str, fields: dict[str, str], headers: dict[str, str], timeout: float) -> tuple[int, bytes]:
+        try:
+            req = urllib.request.Request(
+                url,
+                data=urllib.parse.urlencode(fields).encode("ascii"),
+                headers={
+                    "content-type": "application/x-www-form-urlencoded",
+                    "accept": "application/json",
+                    "user-agent": "krellbot/0.1",
+                    **headers,
+                },
+                method="POST",
+            )
+            with _open(req, timeout) as res:
+                body = res.read(_MAX_FORM_REPLY + 1)
+                status = int(res.status)
+        except urllib.error.HTTPError as exc:
+            raise _http_error(exc) from None
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            raise TransportError(None, type(exc).__name__) from None
+        if len(body) > _MAX_FORM_REPLY:
+            raise TransportError(None, "reply too large")
+        return status, body
 
 
 class BadStream(Exception):

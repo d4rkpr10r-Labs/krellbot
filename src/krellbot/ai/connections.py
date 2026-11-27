@@ -51,6 +51,8 @@ _MAX_URL = 2048
 _MAX_MODEL = 256
 _MAX_LABEL = 80
 _MAX_CREDENTIAL = 4096
+# A sign-in's credential record (JSON: identity, client id, tokens, scopes, expiry), M38.23.
+_MAX_CREDENTIAL_RECORD = 64 * 1024
 _FORBIDDEN_URL_CHARS = frozenset("@?#; \\")
 
 # Every store for one file shares a lock: routes run store writes in worker threads.
@@ -85,6 +87,27 @@ REFUSAL_MESSAGES: dict[str, str] = {
     "ai_connection_not_found": "There is no AI connection with that id.",
     "ai_connections_unreadable": "The AI connections file could not be read, so it was left unchanged.",
     "ai_body_invalid": "The request body is not a valid AI connection request.",
+    # Sign in with ChatGPT (M38.23).
+    "ai_chatgpt_signin_required": (
+        "This ChatGPT sign-in has ended. Choose Continue with ChatGPT for this connection to sign in again; "
+        "the conversation is kept."
+    ),
+    "ai_chatgpt_plan_disabled": (
+        "ChatGPT plan use was not allowed for this sign-in, so Krell cannot use it. Choose Continue with "
+        "ChatGPT again and allow plan use, or connect an OpenAI API key instead."
+    ),
+    "ai_chatgpt_refresh_unavailable": (
+        "OpenAI could not be reached to renew the ChatGPT sign-in. The sign-in is kept; try again later."
+    ),
+    "ai_chatgpt_client_invalid": (
+        "OpenAI no longer accepts this ChatGPT registration. Remove the connection and choose Continue with "
+        "ChatGPT to register again."
+    ),
+    "ai_chatgpt_state_unreadable": (
+        "Krellbot's ChatGPT sign-in file could not be read, so nothing was changed. Fix or remove "
+        "ai/chatgpt.json in the Krellbot home folder."
+    ),
+    "ai_chatgpt_not_chatgpt": "That connection is not a ChatGPT sign-in.",
 }
 
 
@@ -157,12 +180,20 @@ def check_endpoint(conn: Connection) -> ProviderPreset:
     return preset
 
 
+def is_chatgpt(conn: Connection) -> bool:
+    """A Sign in with ChatGPT connection: OAuth to OpenAI, served by the Responses API path."""
+
+    return conn.auth == "oauth" and conn.preset == "openai"
+
+
 def build_adapter(conn: Connection, credential: str | None, transport: HttpTransport) -> ChatAdapter:
-    """The streaming adapter for ``conn``."""
+    """The streaming adapter for ``conn``. For a ChatGPT sign-in, ``credential`` is its access token."""
 
     preset = check_endpoint(conn)
     if conn.format == "anthropic_messages":
         return AnthropicMessagesAdapter(conn.base_url, credential, transport)
+    if is_chatgpt(conn):
+        return OpenAICompatAdapter(conn.base_url, credential, transport, api="responses")
     return OpenAICompatAdapter(conn.base_url, credential, transport, token_limit_field=preset.token_limit_field)
 
 
@@ -214,12 +245,17 @@ class ConnectionStore:
         clock: Callable[[], str] | None = None,
         allow_injected_fake_backend: bool = False,
     ) -> None:
-        self._dir = Path(home) / "ai"
+        self.home = Path(home)
+        self._dir = self.home / "ai"
         self._path = self._dir / "connections.json"
         self._clock = clock or _now_iso
         # Tests-only: admit the in-tree FakeKeyring, as the exchange-key routes do.
         self._allow_fake = allow_injected_fake_backend
         self._lock = _lock_for(self._path)
+
+    @property
+    def allow_injected_fake_backend(self) -> bool:
+        return self._allow_fake
 
     # ---- reads ------------------------------------------------------------
 
@@ -257,6 +293,12 @@ class ConnectionStore:
 
     def adapter(self, conn: Connection, transport: HttpTransport | None = None) -> ChatAdapter:
         check_endpoint(conn)  # before the keychain is touched
+        if is_chatgpt(conn):
+            # The access token comes from the sign-in's record, renewed near expiry. Imported here:
+            # the sign-in module imports this one.
+            from krellbot.ai.oauth import chatgpt_adapter
+
+            return chatgpt_adapter(self, conn, transport=transport or UrllibTransport())
         return build_adapter(conn, self.credential_for(conn), transport or UrllibTransport())
 
     # ---- writes -----------------------------------------------------------
@@ -350,6 +392,74 @@ class ConnectionStore:
             raise
         return conn
 
+    def add_record(self, preset: str, *, model: str, record: str, label: str | None = None) -> Connection:
+        """Store a new ``oauth`` connection whose keychain entry is a sign-in's credential record.
+
+        ``record`` is a JSON object (identity, client id, tokens, scopes,
+        expiry); it goes only to the keychain, never to the metadata file.
+        """
+
+        clean = self._clean_record(record)
+        with self._lock:
+            conns, active = self._load()
+            spec = PRESETS.get(preset) if isinstance(preset, str) else None
+            if spec is None:
+                raise ConnectionRefused("ai_preset_unknown")
+            if spec.custom or spec.signin == "none":
+                raise ConnectionRefused("ai_auth_invalid")
+            clean_model = _clean_text(model, _MAX_MODEL)
+            if clean_model is None:
+                raise ConnectionRefused("ai_model_invalid")
+            clean_label = _clean_text(spec.label if label is None else label, _MAX_LABEL)
+            if clean_label is None:
+                raise ConnectionRefused("ai_label_invalid")
+            taken = {c.id for c in conns}
+            conn_id = stdlib_secrets.token_hex(8)
+            while conn_id in taken:
+                conn_id = stdlib_secrets.token_hex(8)
+            conn = Connection(
+                id=conn_id,
+                preset=spec.id,
+                label=clean_label,
+                format=spec.format,
+                base_url=spec.base_url,
+                model=clean_model,
+                auth="oauth",
+                capability="unprobed",
+                created_at=self._clock(),
+            )
+            self._store_secret(conn_id, clean)
+            try:
+                self._save([*conns, conn], active)
+            except BaseException:
+                self._forget_secret(conn_id, strict=False)
+                raise
+            return conn
+
+    def replace_record(self, conn_id: str, record: str) -> None:
+        """Replace an ``oauth`` connection's credential record in one keychain write (a whole token set)."""
+
+        clean = self._clean_record(record)
+        with self._lock:
+            found = next((c for c in self._load()[0] if c.id == conn_id), None) if is_connection_id(conn_id) else None
+            if found is None:
+                raise ConnectionRefused("ai_connection_not_found")
+            if found.auth != "oauth":
+                raise ConnectionRefused("ai_auth_invalid")
+            self._store_secret(conn_id, clean, keep_on_failure=True)
+
+    @staticmethod
+    def _clean_record(record: object) -> str:
+        if not isinstance(record, str) or not record or len(record) > _MAX_CREDENTIAL_RECORD:
+            raise ConnectionRefused("ai_credential_invalid")
+        try:
+            parsed = json.loads(record)
+        except (ValueError, RecursionError):
+            raise ConnectionRefused("ai_credential_invalid") from None
+        if not isinstance(parsed, dict):
+            raise ConnectionRefused("ai_credential_invalid")
+        return record
+
     def remove(self, conn_id: str) -> None:
         """Delete the keychain entry first, so a failure leaves a keyed connection listed and removable.
 
@@ -403,7 +513,9 @@ class ConnectionStore:
             raise ConnectionRefused("ai_credential_invalid")
         return value
 
-    def _store_secret(self, conn_id: str, secret: str) -> None:
+    def _store_secret(self, conn_id: str, secret: str, *, keep_on_failure: bool = False) -> None:
+        """Write and read back. A failed new entry is deleted; a failed replacement (``keep_on_failure``) is left."""
+
         service = _service(conn_id)
         backend = keyring.get_keyring()
         if not keychain_is_safe(backend, allow_injected_fake_backend=self._allow_fake):
@@ -414,7 +526,8 @@ class ConnectionStore:
         except Exception:  # noqa: BLE001 — backend errors can carry arbitrary text; never surfaced
             stored = None
         if stored != secret:
-            self._forget_secret(conn_id, strict=False)
+            if not keep_on_failure:
+                self._forget_secret(conn_id, strict=False)
             raise ConnectionRefused("ai_keychain_unavailable")
 
     @staticmethod

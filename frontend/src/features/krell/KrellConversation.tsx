@@ -13,6 +13,12 @@
  *
  * The opening's Standard and Advanced quick replies (M38.18) show only while
  * no mode is set.
+ *
+ * On a Sign in with ChatGPT connection (M38.23) "Using ChatGPT plan" sits
+ * near the composer with a Manage usage link to ChatGPT settings. When the
+ * latest turn ended on a ChatGPT usage limit, a compact "Usage limit reached"
+ * state takes its place, with Manage usage as its primary action (secondary
+ * while a confirm card's Confirm is the conversation's one primary).
  */
 import { useEffect, useId, useRef, type FormEvent, type JSX } from "react";
 import krellAvatar from "../../assets/character/krell-pfp-160.webp";
@@ -25,6 +31,52 @@ import "./krell.css";
 
 /** The engine's limit on one message (`MAX_MESSAGE_CHARS`). */
 const MAX_MESSAGE_CHARS = 8000;
+
+/** ChatGPT's own usage page: review usage and change Krellbot's limit. */
+export const CHATGPT_USAGE_URL = "https://chatgpt.com/settings/usage";
+/** The engine's code for a ChatGPT usage-limit error. */
+const CODE_USAGE_LIMIT = "provider_usage_limit";
+
+/** The latest turn ended on a ChatGPT usage limit: no answer or tool call from Krell since that error. */
+function usageLimited(items: KrellItem[]): boolean {
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const item = items[i];
+    if (item.kind === "error") return item.code === CODE_USAGE_LIMIT;
+    if (item.kind === "krell" || item.kind === "tool") return false;
+  }
+  return false;
+}
+
+/** "Using ChatGPT plan", or the usage-limit state, near the composer. */
+function ChatgptPlan({ limited, primary }: { limited: boolean; primary: boolean }): JSX.Element {
+  if (limited) {
+    return (
+      <div className="kbot-krell__plan-limit" role="status" data-testid="krell-usage-limit">
+        <p className="kbot-krell__plan-limit-head">ChatGPT</p>
+        <p className="kbot-krell__plan-limit-title">Usage limit reached</p>
+        <p className="kbot-krell__plan-limit-copy">
+          Review your plan's limit, or Krellbot's, in ChatGPT settings. Krell paused and retried nothing.
+        </p>
+        <a
+          className={primary ? "kbot-krell__go" : "kbot-krell__btn"}
+          href={CHATGPT_USAGE_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          Manage usage
+        </a>
+      </div>
+    );
+  }
+  return (
+    <p className="kbot-krell__plan" data-testid="krell-chatgpt-plan">
+      Using ChatGPT plan{" "}
+      <a className="kbot-krell__plan-link" href={CHATGPT_USAGE_URL} target="_blank" rel="noopener noreferrer">
+        Manage usage
+      </a>
+    </p>
+  );
+}
 
 const MODES: readonly KrellMode[] = ["standard", "advanced"];
 
@@ -198,6 +250,7 @@ export function KrellConversation(): JSX.Element {
     busy: krell.pending,
     decide: krell.confirm,
   };
+  const limited = usageLimited(krell.messages);
 
   return (
     <div className="kbot-krell__conversation" data-testid="krell-conversation">
@@ -216,6 +269,9 @@ export function KrellConversation(): JSX.Element {
       ) : null}
       {krell.mode === null && modeAsked(krell.messages) ? (
         <ModeQuickReplies busy={krell.pending} choose={krell.setMode} />
+      ) : null}
+      {limited || krell.connection?.plan === "chatgpt" ? (
+        <ChatgptPlan limited={limited} primary={cards.primary === null} />
       ) : null}
       <form className="kbot-krell__composer" onSubmit={submit}>
         <label className="kbot-krell__sr" htmlFor={inputId}>

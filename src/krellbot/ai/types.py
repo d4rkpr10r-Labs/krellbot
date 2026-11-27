@@ -11,6 +11,10 @@ ErrorCode = Literal[
     "provider_rate_limited",
     "provider_unavailable",
     "provider_bad_response",
+    # ChatGPT plan usage (M38.23): the plan's usage limit, and plan refusals that retrying cannot fix.
+    "provider_usage_limit",
+    "provider_plan_not_eligible",
+    "provider_plan_unsupported",
 ]
 
 
@@ -62,7 +66,15 @@ class Done:
 @dataclass(frozen=True)
 class ProviderError:
     code: ErrorCode
+    # A fixed string: never provider text, model text or a credential.
     message: str
+    # Diagnostics the ChatGPT plan path keeps (M38.22: status, body, code and request id).
+    # ``detail`` is the provider's bounded body: diagnostic text, never shown as the message.
+    status: int | None = None
+    provider_code: str | None = None
+    param: str | None = None
+    request_id: str | None = None
+    detail: str | None = None
 
 
 StreamEvent = TextDelta | ToolCallDone | Usage | Done | ProviderError
