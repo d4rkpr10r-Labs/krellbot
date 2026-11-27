@@ -68,9 +68,9 @@ below rather than scraping authenticated browser cookies.
 | `backtest` | Offline research (simulated); returns the receipt and the run identity (`run_id`, receipt digest) the workstation records for the same inputs | `revision_id` **or** `pack_path`, `dataset_csv`, optional `venue`, `pair`, `timeframe`, costs and window |
 | `compare` | Backtest 2 to 4 draft revisions on one dataset, side by side (simulated) | `revision_ids`, `dataset_csv` |
 | `paper_arm` | Paper-arm a pack or validated revision | `venue`, `mode="paper"`, `pack_path` **or** `revision_id`, optional `paper_balance` |
-| `pause_entries`, `resume_entries`, `disarm` | Pause or resume entries on, or disarm, an armed **paper** strategy; a live one is refused (`agent_live_change_refused`) | `venue`, `pair` |
+| `pause_entries`, `resume_entries`, `disarm` | Pause or resume entries on, or disarm, an armed **paper** strategy; a live (or non-paper) one is refused (`agent_live_change_refused`) | `venue`, `pair` |
 
-`compare` is added to the agent core by the hosts that offer it, which call `register_research_tools`; the three change tools likewise, through `register_change_tools`. External agents may pause, resume or disarm only after the operator turns on `mcp_allow_pause_resume` or `mcp_allow_disarm` in the agent limits (otherwise `agent_change_not_allowed`). Closing a position sells at market, so it is never an agent tool.
+`compare` is added to the agent core by the hosts that offer it, which call `register_research_tools`; the three change tools likewise, through `register_change_tools`. External agents may pause, resume or disarm only after the operator turns on `mcp_allow_pause_resume` or `mcp_allow_disarm` in the agent limits (otherwise `agent_change_not_allowed`). Before turning on `mcp_allow_pause_resume`, know that an agent's `resume_entries` also lifts the entry hold a person's close-by-operator leaves on a paper strategy, as the workstation's Resume does, so that strategy may buy again. A live target is refused before Krell asks anyone to confirm; pause or disarm a live strategy yourself in the workstation. Closing a position sells at market, so it is never an agent tool.
 
 Happy path for an agent: **`validate` → `backtest` → `paper_arm`**.
 Call `read` first when you need ids/paths. Research files must live in the

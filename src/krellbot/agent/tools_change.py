@@ -10,22 +10,27 @@ Each tool takes ``{venue, pair}`` and delegates to
    and disarm by default; external MCP agents may not until the operator
    turns ``mcp_allow_pause_resume`` or ``mcp_allow_disarm`` on. A refusal is
    ``agent_change_not_allowed``, journaled as a ``user_policy`` refused row.
-2. Confirm step: Krell's call returns ``needs_confirm`` with a ticket bound
+2. Pre-check (:attr:`~krellbot.agent.core.ToolSpec.precheck`): ``venue`` and
+   ``pair`` must match the read tools' patterns (``mcp_invalid_request``)
+   before anything is read. Then the config is loaded, and when any stored
+   record on that venue and pair has a mode other than ``paper`` the call is
+   refused with ``agent_live_change_refused``. This runs before the confirm
+   step, so Krell never asks a human to confirm a change to a live (or
+   non-paper) strategy, and again on the confirmed call, where a refusal
+   leaves the ticket unspent. Every record is checked, not only the first,
+   because ``PaperService.disarm`` removes every record on the pair.
+3. Confirm step: Krell's call returns ``needs_confirm`` with a ticket bound
    to its exact params, and runs once the human confirms
    (:mod:`krellbot.agent.confirm`). External MCP agents get no ticket.
-3. The handler here: ``venue`` and ``pair`` must match the read tools'
-   patterns (``mcp_invalid_request``) before anything is read. Then the
-   config is loaded, and when any stored record on that venue and pair has a
-   mode other than ``paper`` the call is refused with
-   ``agent_live_change_refused`` without calling the service, so the config
-   keeps its exact bytes. Every record is checked, not only the first,
-   because ``PaperService.disarm`` removes every record on the pair. With no
-   record, the service answers with its own ``not_armed``.
+4. The handler here: the same check again on a fresh read of the config,
+   then the service. With no record, the service answers with its own
+   ``not_armed``. ``PaperService`` reads the stored mode once more before it
+   writes; its ``stored_mode_not_paper`` (a record re-armed between the
+   reads) is reported as ``agent_live_change_refused`` too.
 
-The core's ``agent_action`` audit record journals every outcome with its code.
-``PaperService`` reads the stored mode again before it writes and refuses a
-non-paper record with ``stored_mode_not_paper``, so a record re-armed live
-between the two reads is still never changed.
+A refused live target never reaches the service, so the config keeps its
+exact bytes. The core's ``agent_action`` audit record journals every outcome
+with its code.
 
 ``close_position`` sells at market, so it is never an agent tool: nothing
 here registers it, and the core answers ``mcp_unknown_tool``. This module
@@ -38,18 +43,10 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from krellbot import sanitize
-from krellbot.agent.core import (
-    LABEL_PAPER,
-    SCHEMA_VERSION,
-    AgentToolCore,
-    ToolContext,
-    ToolRefusal,
-    ToolSpec,
-    invalid_request,
-)
+from krellbot.agent.core import LABEL_PAPER, SCHEMA_VERSION, AgentToolCore, ToolContext, ToolRefusal, ToolSpec
 from krellbot.agent.limits import DISARM_TOOLS, PAUSE_RESUME_TOOLS
-from krellbot.agent.tools_read import _PAIR_RE, _VENUE_RE, MESSAGE_BAD_PAIR, MESSAGE_BAD_VENUE
-from krellbot.application.paper import CommandResultV1, PaperService
+from krellbot.agent.tools_read import _market_names
+from krellbot.application.paper import CODE_STORED_MODE_NOT_PAPER, CommandResultV1, PaperService
 from krellbot.config import load_config
 
 # The names the agent limits gate (``limits.CHANGE_TOOLS``), so the allow flags and the tools agree.
@@ -58,25 +55,43 @@ TOOL_PAUSE_ENTRIES, TOOL_RESUME_ENTRIES = PAUSE_RESUME_TOOLS
 
 CODE_AGENT_LIVE_CHANGE_REFUSED = "agent_live_change_refused"
 MESSAGE_AGENT_LIVE_CHANGE_REFUSED = (
-    "this market is not armed on paper; agent change tools act on paper strategies only, "
-    "and a live strategy stays under human control"
+    "this strategy is armed live (or non-paper); agent change tools act on paper strategies only, "
+    "so a person must use Pause or Disarm in the workstation"
 )
 MAX_MESSAGE_CHARS = 200
 
+Command = Callable[[PaperService, str, str], CommandResultV1]
 
-def _market(tool: str, params: dict) -> tuple[str, str] | dict:
-    """``(venue, pair)`` checked against the read tools' patterns, or the ``mcp_invalid_request`` refusal."""
-    venue = params.get("venue")
-    pair = params.get("pair")
-    if not isinstance(venue, str) or _VENUE_RE.fullmatch(venue) is None:
-        return invalid_request(tool, f"venue: {MESSAGE_BAD_VENUE}").to_dict()
-    if not isinstance(pair, str) or _PAIR_RE.fullmatch(pair) is None:
-        return invalid_request(tool, f"pair: {MESSAGE_BAD_PAIR}").to_dict()
+
+def _live_change_refused(tool: str) -> dict:
+    return ToolRefusal(CODE_AGENT_LIVE_CHANGE_REFUSED, MESSAGE_AGENT_LIVE_CHANGE_REFUSED, tool).to_dict()
+
+
+def _paper_target(ctx: ToolContext, tool: str, params: dict) -> tuple[str, str] | dict:
+    """``(venue, pair)`` of a call that may go to the paper service, or its refusal.
+
+    ``venue`` and ``pair`` are checked against the read tools' patterns before
+    the config is read. Then every stored record on that venue and pair must
+    be a paper record; a missing record passes, and the service answers it.
+    """
+    names, refusal = _market_names(tool, params, timeframe=False)
+    if refusal:
+        return refusal
+    venue, pair, _ = names
+    stored = [armed for armed in load_config(ctx.home).armed if armed.venue == venue and armed.pair == pair]
+    if any(armed.mode != "paper" for armed in stored):
+        return _live_change_refused(tool)
     return venue, pair
 
 
 def _result(tool: str, venue: str, pair: str, result: CommandResultV1) -> dict:
-    """The agent result for a paper command: its ``ok``, ``effect``, ``code`` and ``message``."""
+    """The agent result for a paper command: its ``ok``, ``effect``, ``code`` and ``message``.
+
+    The service's ``stored_mode_not_paper`` (the record was re-armed live
+    after the handler's read) is the same refusal as a live target.
+    """
+    if result.code == CODE_STORED_MODE_NOT_PAPER:
+        return _live_change_refused(tool)
     return {
         "schema_version": SCHEMA_VERSION,
         "ok": result.ok is True,
@@ -89,17 +104,24 @@ def _result(tool: str, venue: str, pair: str, result: CommandResultV1) -> dict:
     }
 
 
-def _paper_change(tool: str, command: Callable[[PaperService, str, str], CommandResultV1]):
-    """The handler for one change tool: check the market, refuse a non-paper target, then run ``command``."""
+def _precheck(tool: str) -> Callable[[ToolContext, dict], dict | None]:
+    """The pre-check for one change tool: its refusal, or ``None`` to go on to the confirm step."""
+
+    def precheck(ctx: ToolContext, params: dict) -> dict | None:
+        target = _paper_target(ctx, tool, params)
+        return target if isinstance(target, dict) else None
+
+    return precheck
+
+
+def _handler(tool: str, command: Command) -> Callable[[ToolContext, dict], dict]:
+    """The handler for one change tool: the pre-check again on a fresh read, then ``command``."""
 
     def handler(ctx: ToolContext, params: dict) -> dict:
-        market = _market(tool, params)
-        if isinstance(market, dict):
-            return market
-        venue, pair = market
-        stored = [armed for armed in load_config(ctx.home).armed if armed.venue == venue and armed.pair == pair]
-        if any(armed.mode != "paper" for armed in stored):
-            return ToolRefusal(CODE_AGENT_LIVE_CHANGE_REFUSED, MESSAGE_AGENT_LIVE_CHANGE_REFUSED, tool).to_dict()
+        target = _paper_target(ctx, tool, params)
+        if isinstance(target, dict):
+            return target
+        venue, pair = target
         return _result(tool, venue, pair, command(PaperService(ctx.home, clock=ctx.clock), venue, pair))
 
     return handler
@@ -125,7 +147,7 @@ _WHO_MAY = (
 def change_specs() -> tuple[ToolSpec, ...]:
     """The three paper change tools, in ``limits.CHANGE_TOOLS`` order. Schemas are built fresh per call."""
 
-    def spec(name: str, description: str, command) -> ToolSpec:
+    def spec(name: str, description: str, command: Command) -> ToolSpec:
         return ToolSpec(
             name=name,
             effect="change",
@@ -133,7 +155,8 @@ def change_specs() -> tuple[ToolSpec, ...]:
             input_schema=_schema(),
             labels=(LABEL_PAPER,),
             description=f"{description} {_WHO_MAY}",
-            handler=_paper_change(name, command),
+            handler=_handler(name, command),
+            precheck=_precheck(name),
         )
 
     return (
@@ -144,7 +167,10 @@ def change_specs() -> tuple[ToolSpec, ...]:
         ),
         spec(
             TOOL_RESUME_ENTRIES,
-            "Resume entries on a paused paper strategy; this also lifts the entry hold an operator close leaves.",
+            (
+                "Resume entries on a paused paper strategy. This also lifts the entry hold left when a person "
+                "closed its position (close-by-operator), so the strategy may buy again."
+            ),
             lambda service, venue, pair: service.resume_entries(venue=venue, pair=pair),
         ),
         spec(

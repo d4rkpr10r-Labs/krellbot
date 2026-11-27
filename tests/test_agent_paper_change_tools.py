@@ -27,7 +27,11 @@ from krellbot.agent.audit import read_agent_activity
 from krellbot.agent.confirm import CODE_CONFIRM_REQUIRED, CODE_CONFIRM_UNKNOWN, ConfirmLedger
 from krellbot.agent.core import CODE_INVALID_REQUEST, CODE_UNKNOWN_TOOL, AgentToolCore
 from krellbot.agent.limits import CHANGE_TOOLS, CODE_AGENT_CHANGE_NOT_ALLOWED
-from krellbot.agent.tools_change import CODE_AGENT_LIVE_CHANGE_REFUSED, register_change_tools
+from krellbot.agent.tools_change import (
+    CODE_AGENT_LIVE_CHANGE_REFUSED,
+    MESSAGE_AGENT_LIVE_CHANGE_REFUSED,
+    register_change_tools,
+)
 from krellbot.agent.tools_read import register_read_tools
 from krellbot.agent.tools_research import register_research_tools
 from krellbot.application import paper as paper_app
@@ -155,10 +159,20 @@ def _assert_live_refused(result: dict, tool: str, actor: str) -> None:
     assert result["ok"] is False, result
     assert result["effect"] == "refused"
     assert result["code"] == CODE_AGENT_LIVE_CHANGE_REFUSED
+    assert result["message"] == MESSAGE_AGENT_LIVE_CHANGE_REFUSED
     assert result["tool"] == tool
     assert result["actor"] == actor
     assert result["labels"] == ["paper"]
     assert "confirm" not in result
+
+
+def _swap_mode(home: Path, mode: str) -> None:
+    """Re-arm the paper market's record in ``mode`` (another process writing the config)."""
+    config = load_config(home)
+    for armed in config.armed:
+        if (armed.venue, armed.pair) == (PAPER_MARKET["venue"], PAPER_MARKET["pair"]):
+            armed.mode = mode
+    save_config(home, config)
 
 
 # ---- live targets ----------------------------------------------------------
@@ -174,11 +188,12 @@ def test_agent_pause_on_a_live_strategy_is_refused_before_any_config_write(
     core = _core(home)
 
     by_mcp = core.call(CURSOR, "pause_entries", LIVE_MARKET)
-    by_krell = _krell_confirmed(core, "pause_entries", LIVE_MARKET)
+    # Krell is refused on its first call: no ticket, so no human is asked to confirm a call that cannot run.
+    by_krell = core.call(KRELL, "pause_entries", LIVE_MARKET)
 
     _assert_live_refused(by_mcp, "pause_entries", "mcp:cursor")
     _assert_live_refused(by_krell, "pause_entries", "krell")
-    # Refused in the handler: the paper service is never called and not one config byte changes.
+    # The paper service is never called and not one config byte changes.
     assert calls == []
     assert _config_bytes(home) == before
     live = [a for a in load_config(home).armed if a.pair == "BTCUSD"]
@@ -186,7 +201,6 @@ def test_agent_pause_on_a_live_strategy_is_refused_before_any_config_write(
     # Journaled with its typed code, for each actor.
     assert _audit_rows(home, "pause_entries") == [
         ("mcp:cursor", "refused", CODE_AGENT_LIVE_CHANGE_REFUSED, "kraken"),
-        ("krell", "needs_confirm", CODE_CONFIRM_REQUIRED, "kraken"),
         ("krell", "refused", CODE_AGENT_LIVE_CHANGE_REFUSED, "kraken"),
     ]
 
@@ -209,7 +223,7 @@ def test_agent_resume_and_disarm_on_a_non_paper_strategy_are_refused_too(
     for market in (LIVE_MARKET, other):
         for tool in ("resume_entries", "disarm"):
             _assert_live_refused(core.call(CURSOR, tool, market), tool, "mcp:cursor")
-            _assert_live_refused(_krell_confirmed(core, tool, market), tool, "krell")
+            _assert_live_refused(core.call(KRELL, tool, market), tool, "krell")
 
     assert calls == []
     assert _config_bytes(home) == before
@@ -217,6 +231,76 @@ def test_agent_resume_and_disarm_on_a_non_paper_strategy_are_refused_too(
         ("BTCUSD", "live", True),
         ("BTC-USD", "shadow", False),
     ]
+
+
+def test_a_paper_record_on_the_same_pair_does_not_open_a_live_record_to_agents(
+    home: Path, live_capable_release, monkeypatch: pytest.MonkeyPatch
+):
+    # ``PaperService.disarm`` removes every record on the pair, so a paper
+    # record listed first must not let an agent disarm the live one with it.
+    _save(home, _paper(home), _record(home, mode="live", **PAPER_MARKET))
+    _write_policy(home, mcp_allow_pause_resume=True, mcp_allow_disarm=True)
+    calls = _spy_service(monkeypatch)
+    before = _config_bytes(home)
+    core = _core(home)
+
+    for tool in ("disarm", "pause_entries"):
+        _assert_live_refused(core.call(CURSOR, tool, PAPER_MARKET), tool, "mcp:cursor")
+        _assert_live_refused(core.call(KRELL, tool, PAPER_MARKET), tool, "krell")
+
+    assert calls == []
+    assert _config_bytes(home) == before
+    assert [(a.mode, a.entries_paused) for a in load_config(home).armed] == [("paper", False), ("live", False)]
+
+
+def test_a_record_re_armed_live_after_the_confirm_is_refused_and_the_ticket_stays_unspent(
+    home: Path, live_capable_release, monkeypatch: pytest.MonkeyPatch
+):
+    _save(home, _paper(home))
+    calls = _spy_service(monkeypatch)
+    core = _core(home)
+
+    asked = core.call(KRELL, "pause_entries", PAPER_MARKET)
+    assert asked["effect"] == "needs_confirm"
+    ticket = asked["confirm"]["ticket_id"]
+
+    _swap_mode(home, "live")
+    swapped = _config_bytes(home)
+    refused = core.call(KRELL, "pause_entries", PAPER_MARKET, confirm_token=ticket)
+    _assert_live_refused(refused, "pause_entries", "krell")
+    assert calls == []
+    assert _config_bytes(home) == swapped
+    assert _audit_rows(home, "pause_entries")[-1] == ("krell", "refused", CODE_AGENT_LIVE_CHANGE_REFUSED, "kraken")
+
+    # The refusal came before the confirm step, so the ticket was not spent.
+    _swap_mode(home, "paper")
+    paused = core.call(KRELL, "pause_entries", PAPER_MARKET, confirm_token=ticket)
+    assert (paused["ok"], paused["code"]) == (True, paper_app.CODE_ENTRIES_PAUSED)
+    assert calls == ["pause_entries"]
+
+
+@pytest.mark.parametrize("tool", ["pause_entries", "disarm"])
+def test_a_record_re_armed_live_while_the_service_runs_is_reported_as_a_live_refusal(
+    home: Path, live_capable_release, monkeypatch: pytest.MonkeyPatch, tool: str
+):
+    _save(home, _paper(home))
+    _write_policy(home, mcp_allow_pause_resume=True, mcp_allow_disarm=True)
+    real = getattr(PaperService, tool)
+    swapped: list[bytes] = []
+
+    def re_armed_live_first(self, *args, **kwargs):
+        # The handler read a paper record; another process re-arms it live before the service reads it.
+        _swap_mode(home, "live")
+        swapped.append(_config_bytes(home))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(PaperService, tool, re_armed_live_first)
+    result = _core(home).call(CURSOR, tool, PAPER_MARKET)
+
+    # The service refused with ``stored_mode_not_paper`` and wrote nothing; agents see the live-target code.
+    _assert_live_refused(result, tool, "mcp:cursor")
+    assert _config_bytes(home) == swapped[0]
+    assert [(a.mode, a.entries_paused) for a in load_config(home).armed] == [("live", False)]
 
 
 # ---- per-actor allow flags -------------------------------------------------
