@@ -85,6 +85,11 @@ function groupByStrategy(
   return groups;
 }
 
+/** Missing or "workstation" origin is a plain draft; anything else was agent-drafted. */
+function isAgentOrigin(origin: string | undefined): origin is string {
+  return typeof origin === "string" && origin !== "" && origin !== "workstation";
+}
+
 export function SavedStrategyLibrary({
   client,
   onReopen,
@@ -540,6 +545,15 @@ export function SavedStrategyLibrary({
                           >
                             {state.label}
                           </span>
+                          {isAgentOrigin(row.origin) ? (
+                            <span
+                              className="kbot-strategy-library__origin"
+                              data-testid="library-row-agent-origin"
+                              title={row.origin}
+                            >
+                              Drafted by agent
+                            </span>
+                          ) : null}
                           <span className="kbot-strategy-library__identity-item">
                             {row.strategy_id || row.id || "(unknown strategy)"}
                           </span>
