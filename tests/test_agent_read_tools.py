@@ -9,6 +9,8 @@ Every candle and trace below is synthetic local data, never market data.
 
 from __future__ import annotations
 
+import ast
+import hashlib
 import json
 from decimal import Decimal
 from pathlib import Path
@@ -92,7 +94,7 @@ def _arm(home: Path, *, mode: str = "paper", venue: str = "kraken", pair: str = 
     pack_path.write_text(json.dumps(_pack()), encoding="utf-8")
     armed = ArmedPack(
         pack_path=str(pack_path),
-        pack_sha256="0" * 64,
+        pack_sha256=hashlib.sha256(pack_path.read_bytes()).hexdigest(),
         pack_id="trend-follow",
         pack_version="1.0.0",
         venue=venue,
@@ -229,6 +231,12 @@ def test_journal_recent_caps_tail_at_fifty_and_marks_truncation(home: Path):
     small = core.call(KRELL, "journal_recent", {"tail": 5})
     assert len(small["records"]) == 5 and small["truncated"] is False
 
+    few_home = home / "few"
+    few_home.mkdir()
+    _journal(few_home, [_row(NOW - 10 + i, n=i) for i in range(3)])
+    few = _core(few_home).call(KRELL, "journal_recent", {"tail": 500})
+    assert len(few["records"]) == 3 and few["truncated"] is False
+
     windowed = core.call(KRELL, "journal_recent", {"since": "24h"})
     assert len(windowed["records"]) == 50 and windowed["truncated"] is True
 
@@ -236,6 +244,77 @@ def test_journal_recent_caps_tail_at_fifty_and_marks_truncation(home: Path):
     assert bad["ok"] is False and bad["code"] == "mcp_invalid_request"
     bad_tail = core.call(KRELL, "journal_recent", {"tail": 0})
     assert bad_tail["ok"] is False and bad_tail["code"] == "mcp_invalid_request"
+
+
+def test_journal_summary_does_not_carry_back_scrubbed_secret_values(home: Path):
+    _journal(
+        home,
+        [
+            {
+                "ts": NOW - 5,
+                "kind": "note",
+                "venue": "kraken",
+                "pack": "trend-follow",
+                "bar_ts": 0,
+                "detail": {"api_token": "LEAK-TOKEN-1", "credential": "LEAK-CRED-2", "authorization": "LEAK-AUTH-3"},
+            }
+        ],
+    )
+    result = _core(home).call(KRELL, "journal_recent", {"tail": 5})
+    assert result["ok"] is True and len(result["records"]) == 1
+    text = json.dumps(result)
+    for leaked in ("LEAK-TOKEN-1", "LEAK-CRED-2", "LEAK-AUTH-3"):
+        assert leaked not in text
+    assert result["records"][0]["summary"]
+
+
+def test_registered_secrets_are_redacted_from_journal_and_alert_data(home: Path):
+    from krellbot import sanitize
+
+    sanitize.register_secret("registered-secret-9911")
+    _arm(home)
+    _journal(
+        home,
+        [
+            _row(NOW - 5, note="value registered-secret-9911 here"),
+            _row(NOW - 4, reason="registered-secret-9911", pair="SUIUSD"),
+        ],
+    )
+    core = _core(home)
+    journal_text = json.dumps(core.call(KRELL, "journal_recent", {"tail": 10}))
+    assert "registered-secret-9911" not in journal_text and "***" in journal_text
+    assert "registered-secret-9911" not in json.dumps(core.call(KRELL, "alerts", {}))
+
+
+def test_explain_bar_does_not_follow_a_symlinked_job_file(home: Path):
+    _stored_job(home, "realjob", [{"bar_ts": START_MS, "warmup": False}])
+    jobs = home / "research-jobs"
+    (jobs / "linkjob.json").symlink_to(jobs / "realjob.json")
+    core = _core(home)
+    ok = core.call(CURSOR, "explain_bar", {"job_id": "realjob", "bar_ts": START_MS})
+    assert ok["ok"] is True
+    linked = core.call(CURSOR, "explain_bar", {"job_id": "linkjob", "bar_ts": START_MS})
+    assert linked["ok"] is False and linked["code"] == "explain_bar_not_found"
+
+
+def test_explain_bar_refuses_when_the_armed_pack_file_changed(home: Path):
+    armed = _arm(home)
+    cache.write_cache(home, "kraken", "SUIUSD", "1h", _candles(10))
+    Path(armed.pack_path).write_text(json.dumps({**_pack(), "label": "edited"}), encoding="utf-8")
+    result = _core(home).call(KRELL, "explain_bar", {"venue": "kraken", "pair": "SUIUSD", "bar_ts": START_MS})
+    assert result["ok"] is False and result["code"] == "explain_bar_pack_changed"
+
+
+def test_unresolved_orders_only_maps_the_real_obligations_error(home: Path, monkeypatch: pytest.MonkeyPatch):
+    class ObligationsUnavailable(RuntimeError):
+        pass
+
+    def lookalike(_home, *, now):
+        raise ObligationsUnavailable("x")
+
+    monkeypatch.setattr(tools_read.operations, "list_unresolved_orders", lookalike)
+    result = _core(home).call(KRELL, "unresolved_orders", {})
+    assert result["ok"] is False and result["code"] == "agent_tool_error"
 
 
 def test_journal_recent_leaves_out_live_records(home: Path):
@@ -295,7 +374,12 @@ def test_market_snapshot_returns_last_n_cached_candles_and_freshness(home: Path)
     assert set(result["freshness"]) >= {"last_bar_ts_ms", "candle_age_s", "candle_stale"}
 
     capped = core.call(CURSOR, "market_snapshot", {"venue": "kraken", "pair": "SUIUSD", "timeframe": "1h", "bars": 900})
-    assert len(capped["candles"]) == 30 and capped["truncated"] is True  # 900 asked, 200 is the cap
+    # Fewer rows exist than the cap, so nothing was cut.
+    assert len(capped["candles"]) == 30 and capped["truncated"] is False
+
+    cache.write_cache(home, "kraken", "ADAUSD", "1h", _candles(250))
+    deep = core.call(CURSOR, "market_snapshot", {"venue": "kraken", "pair": "ADAUSD", "timeframe": "1h", "bars": 900})
+    assert len(deep["candles"]) == 200 and deep["truncated"] is True
 
     missing = core.call(CURSOR, "market_snapshot", {"venue": "kraken", "pair": "ETHUSD", "timeframe": "1h"})
     assert missing["ok"] is False and missing["code"] == "market_snapshot_not_found"
@@ -462,6 +546,16 @@ def test_trim_helper_drops_the_oldest_end_and_refuses_when_nothing_fits():
 
 
 def test_handlers_do_not_import_risk_path_modules():
-    source = Path(tools_read.__file__).read_text(encoding="utf-8")
-    for name in ("krellbot.run", "krellbot.venues", "krellbot.execution", "krellbot.keys", "krellbot.secrets"):
-        assert f"import {name}" not in source and f"from {name}" not in source, name
+    tree = ast.parse(Path(tools_read.__file__).read_text(encoding="utf-8"))
+    banned = {"run", "venues", "execution", "keys", "secrets"}
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+            if node.module == "krellbot":
+                imported.update(f"krellbot.{alias.name}" for alias in node.names)
+    for name in imported:
+        parts = name.split(".")
+        assert not (parts[0] == "krellbot" and len(parts) > 1 and parts[1] in banned), name

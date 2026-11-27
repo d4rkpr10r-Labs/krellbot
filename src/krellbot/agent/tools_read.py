@@ -32,8 +32,11 @@ bounded and secret-free:
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
+import os
 import re
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -78,12 +81,14 @@ CODE_UNRESOLVED_ORDERS_UNAVAILABLE = "unresolved_orders_unavailable"
 CODE_MARKET_SNAPSHOT_NOT_FOUND = "market_snapshot_not_found"
 CODE_EXPLAIN_BAR_NOT_FOUND = "explain_bar_not_found"
 CODE_TOUR_STEP_NOT_FOUND = "tour_step_not_found"
+CODE_EXPLAIN_BAR_PACK_CHANGED = "explain_bar_pack_changed"
 
 MESSAGE_LIVE_READ_REFUSED = "this market is armed live; agent read tools show paper markets only"
 MESSAGE_RESULT_TOO_LARGE = "the result does not fit in 32 KiB even with its lists emptied"
 MESSAGE_UNRESOLVED_ORDERS_UNAVAILABLE = "the operational store could not be read, so unresolved orders are unknown"
 MESSAGE_MARKET_SNAPSHOT_NOT_FOUND = "no cached candles for this venue, pair and timeframe"
 MESSAGE_EXPLAIN_BAR_NOT_FOUND = "no decision found for this bar"
+MESSAGE_EXPLAIN_BAR_PACK_CHANGED = "the armed pack file no longer matches the pack that was armed"
 MESSAGE_BAD_JOB_ID = "job_id must be 1-64 characters of letters, digits, '-' and '_'"
 MESSAGE_BAD_VENUE = "venue must be 1-32 characters of a-z, 0-9, '-' and '_'"
 MESSAGE_BAD_PAIR = "pair must be 1-32 characters of letters, digits, '.', '-', '_' and '/'"
@@ -99,6 +104,7 @@ _TIMEFRAME_RE = re.compile(r"[0-9]{1,3}[mhdw]")
 _DROPPED_FIELDS = frozenset({"key", "secret", "license", "balance"})
 
 _TOOL_ERROR_UNAVAILABLE = "ObligationsUnavailable"
+_TOOL_ERROR_MODULE = "krellbot.execution.obligations"
 
 
 # ---- one result builder, one cap ----------------------------------------
@@ -232,6 +238,19 @@ def _positions(ctx: ToolContext, params: dict) -> dict:
 TOOL_JOURNAL_RECENT = "journal_recent"
 
 
+def _agent_record(record: dict) -> dict:
+    """One journal record for an agent, with its summary rebuilt from the scrubbed record.
+
+    ``journal.browse`` builds ``summary`` before :func:`_scrub` runs, and a record
+    with no reason or event summarizes as the JSON of its whole ``detail``, which
+    would carry back the secret-shaped values the scrub removes.
+    """
+    mode = record.get("mode")
+    clean = _scrub(journal.drop_export_secret_fields({k: v for k, v in record.items() if k != "summary"}))
+    clean["summary"] = journal.summarize_record(clean, mode=mode if isinstance(mode, str) else None)
+    return clean
+
+
 def _journal_recent(ctx: ToolContext, params: dict) -> dict:
     tool = TOOL_JOURNAL_RECENT
     since = params.get("since")
@@ -242,16 +261,17 @@ def _journal_recent(ctx: ToolContext, params: dict) -> dict:
         return refusal
     asked = tail if tail is not None else (JOURNAL_MAX_TAIL if since else JOURNAL_DEFAULT_TAIL)
     wanted = min(asked, JOURNAL_MAX_TAIL)
-    truncated = asked > JOURNAL_MAX_TAIL
     try:
         # Paper-classified records only: live records are out of scope for agents.
-        records = journal.browse(ctx.home, tail=None if since else wanted, since=since, mode="paper", now=ctx.clock())
+        # One extra record is read so "more existed than were returned" is known.
+        records = journal.browse(
+            ctx.home, tail=None if since else wanted + 1, since=since, mode="paper", now=ctx.clock()
+        )
     except journal.BrowseError:
         return invalid_request(tool, "the journal selection was refused").to_dict()
-    if len(records) > wanted:
-        records = records[-wanted:]
-        truncated = True
-    records = [journal.drop_export_secret_fields(record) for record in records]
+    # Truncated means the 50-record limit hid records the call would otherwise have returned.
+    truncated = len(records) > wanted and (since is not None or asked > JOURNAL_MAX_TAIL)
+    records = [_agent_record(record) for record in records[-wanted:]]
     return cap_result(tool, {"records": records, "truncated": truncated}, drop_front=("records",))
 
 
@@ -276,7 +296,7 @@ def _unresolved_orders(ctx: ToolContext, params: dict) -> dict:
         rows = operations.list_unresolved_orders(ctx.home, now=int(ctx.clock()))
     except RuntimeError as exc:
         # ``execution`` is off limits here, so the facade's error is matched by name.
-        if type(exc).__name__ != _TOOL_ERROR_UNAVAILABLE:
+        if type(exc).__name__ != _TOOL_ERROR_UNAVAILABLE or type(exc).__module__ != _TOOL_ERROR_MODULE:
             raise
         return _refused(
             TOOL_UNRESOLVED_ORDERS, CODE_UNRESOLVED_ORDERS_UNAVAILABLE, MESSAGE_UNRESOLVED_ORDERS_UNAVAILABLE
@@ -361,7 +381,7 @@ def _market_snapshot(ctx: ToolContext, params: dict) -> dict:
         "armed_on_paper": armed is not None,
         "freshness": freshness,
         "candles": [_candle_row(c) for c in candles[-wanted:]],
-        "truncated": asked > SNAPSHOT_MAX_BARS,
+        "truncated": len(candles) > wanted and asked > wanted,
     }
     return cap_result(tool, body, drop_front=("candles",))
 
@@ -427,6 +447,33 @@ def _catalogue(ctx: ToolContext, params: dict) -> dict:
 TOOL_EXPLAIN_BAR = "explain_bar"
 
 
+def _read_job_file(path: Path) -> bytes | None:
+    """Read one stored job file: a regular file only, never through a symlink, bounded."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            return None
+        fd = os.open(path, flags)
+    except (OSError, ValueError):
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_STORED_JOB_BYTES:
+            return None
+        data = os.read(fd, MAX_STORED_JOB_BYTES + 1)
+        chunks = [data]
+        total = len(data)
+        while data and total <= MAX_STORED_JOB_BYTES:
+            data = os.read(fd, MAX_STORED_JOB_BYTES + 1 - total)
+            chunks.append(data)
+            total += len(data)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return b"".join(chunks) if total <= MAX_STORED_JOB_BYTES else None
+
+
 def _stored_job_trace(home: Path, job_id: str) -> list | None:
     """The stored trace of a succeeded backtest job, or ``None``.
 
@@ -440,7 +487,7 @@ def _stored_job_trace(home: Path, job_id: str) -> list | None:
     for path in paths:
         if path.stem != job_id:
             continue
-        raw = read_regular_file_bounded(path, MAX_STORED_JOB_BYTES)
+        raw = _read_job_file(path)
         if raw is None:
             return None
         try:
@@ -472,6 +519,8 @@ def _explain_paper_bar(ctx: ToolContext, venue: str, pair: str, bar_ts: int) -> 
     if armed is None:
         return _refused(tool, CODE_EXPLAIN_BAR_NOT_FOUND, MESSAGE_EXPLAIN_BAR_NOT_FOUND)
     raw = read_regular_file_bounded(Path(armed.pack_path), MAX_PACK_BYTES)
+    if raw is None or hashlib.sha256(raw).hexdigest() != armed.pack_sha256:
+        return _refused(tool, CODE_EXPLAIN_BAR_PACK_CHANGED, MESSAGE_EXPLAIN_BAR_PACK_CHANGED)
     try:
         pack = json.loads(raw) if raw is not None else None
     except ValueError:
@@ -657,6 +706,7 @@ def register_read_tools(core: AgentToolCore) -> None:
 
 __all__ = [
     "CODE_EXPLAIN_BAR_NOT_FOUND",
+    "CODE_EXPLAIN_BAR_PACK_CHANGED",
     "CODE_LIVE_READ_REFUSED",
     "CODE_MARKET_SNAPSHOT_NOT_FOUND",
     "CODE_RESULT_TOO_LARGE",
