@@ -464,7 +464,7 @@ def test_costs_route_serves_the_side_car_and_keeps_the_stored_result(home: Path)
     assert (home / "research-costs" / f"{job_id}.json").is_file()
     assert sorted(p.name for p in (home / "research-jobs").rglob("*.json")) == [f"{job_id}.json"]
     job_record = json.loads((home / "research-jobs" / f"{job_id}.json").read_text(encoding="utf-8"))
-    assert set(job_record) == {"job", "result"}
+    assert set(job_record) == {"job", "result", "run"}
     assert set(job_record["result"]) == {"legacy_receipt", "trace"}
 
     # A restarted workstation restores the job and still serves its costs.
