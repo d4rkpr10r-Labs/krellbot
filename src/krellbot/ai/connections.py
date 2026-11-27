@@ -17,7 +17,7 @@ import secrets as stdlib_secrets  # the standard library module, not krellbot.se
 import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, get_args
 from urllib.parse import urlsplit
@@ -168,7 +168,7 @@ def _clean_text(value: object, max_len: int) -> str | None:
 
 
 def _now_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class ConnectionStore:
