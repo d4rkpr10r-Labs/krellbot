@@ -8,6 +8,7 @@ v1 API exposes at:
   * ``POST /api/v1/jobs/{id}/cancel``
   * ``GET  /api/v1/jobs/{id}/fills``
   * ``GET  /api/v1/jobs/{id}/costs`` (side-car, see ``costs_for``)
+  * ``GET  /api/v1/jobs/{id}/run`` (run record, see ``run_for``)
   * ``GET  /api/v1/events``
 
 Jobs expose bounded execution and typed observable status.
@@ -60,6 +61,7 @@ JOB_ERROR_NOT_FOUND = "not_found"
 JOB_ERROR_RESULT_UNAVAILABLE = "result_unavailable"
 JOB_ERROR_FILLS_UNAVAILABLE = "fills_unavailable"
 JOB_ERROR_COSTS_UNAVAILABLE = "costs_unavailable"
+JOB_ERROR_RUN_UNAVAILABLE = "run_unavailable"
 
 # Research side-cars live outside ``research-jobs/``: ``_restore_jobs``
 # parses every ``*.json`` file there as a job record.
@@ -179,6 +181,247 @@ def canonical_receipt_bytes(receipt: dict) -> bytes:
     """
 
     return json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def receipt_canonical_sha256(receipt: dict) -> str:
+    """Return the ``receipt_canonical_sha256`` digest of a ``legacy_receipt`` dict.
+
+    Hex sha256 of ``canonical_receipt_bytes(receipt)``: the digest a research
+    job stores beside its result and an in-process agent backtest returns.
+    """
+
+    return hashlib.sha256(canonical_receipt_bytes(receipt)).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Run identity
+# ---------------------------------------------------------------------------
+
+RUN_RECORD_SCHEMA_VERSION = "1"
+
+# The 13 inputs a run id hashes.
+RUN_ID_INPUT_KEYS: tuple[str, ...] = (
+    "pack_sha256",
+    "data_manifest_sha256",
+    "engine_version",
+    "fee_bps",
+    "slippage_bps",
+    "slippage_mult",
+    "from_ms",
+    "to_ms",
+    "holdout_from_ms",
+    "holdout_to_ms",
+    "venue",
+    "pair",
+    "tf",
+)
+_RUN_ID_TEXT_KEYS = frozenset({"pack_sha256", "data_manifest_sha256", "engine_version", "venue", "pair", "tf"})
+_RUN_ID_INT_KEYS = frozenset({"fee_bps", "slippage_bps"})
+# A window bound the request did not send is null, and still a known input.
+_RUN_ID_WINDOW_KEYS = frozenset({"from_ms", "to_ms", "holdout_from_ms", "holdout_to_ms"})
+# The run inputs the receipt itself states (the window bounds are not among them).
+_RECEIPT_RUN_INPUT_KEYS: tuple[str, ...] = (
+    "pack_sha256",
+    "data_manifest_sha256",
+    "engine_version",
+    "fee_bps",
+    "slippage_bps",
+    "slippage_mult",
+    "venue",
+    "pair",
+    "tf",
+)
+
+
+def _run_input_value(key: str, value: Any) -> Any:
+    """Return ``value`` as the run id serializes it; raise on a wrong type."""
+
+    if key in _RUN_ID_TEXT_KEYS:
+        if not isinstance(value, str) or not value:
+            raise TypeError(f"{key} must be a non-empty string")
+        return value
+    if key in _RUN_ID_INT_KEYS:
+        if type(value) is not int:
+            raise TypeError(f"{key} must be an int")
+        return value
+    if key in _RUN_ID_WINDOW_KEYS:
+        if value is not None and type(value) is not int:
+            raise TypeError(f"{key} must be an int or None")
+        return value
+    if key == "slippage_mult":
+        if type(value) not in (int, float):
+            raise TypeError("slippage_mult must be a number")
+        mult = float(value)
+        if not math.isfinite(mult):
+            raise ValueError("slippage_mult must be finite")
+        # The receipt keeps the multiplier as a float, so 1 and 1.0 name one run.
+        return mult
+    raise KeyError(key)
+
+
+def compute_run_id(
+    *,
+    pack_sha256: str,
+    data_manifest_sha256: str,
+    engine_version: str,
+    fee_bps: int,
+    slippage_bps: int,
+    slippage_mult: float,
+    from_ms: int | None,
+    to_ms: int | None,
+    holdout_from_ms: int | None,
+    holdout_to_ms: int | None,
+    venue: str,
+    pair: str,
+    tf: str,
+) -> str:
+    """Return a research run's id: hex sha256 over its 13 canonical inputs.
+
+    The inputs are serialized with ``canonical_receipt_bytes``, so identical
+    inputs give the identical id in any process and any input change gives
+    a new one. Every input must be resolved: only the four window bounds
+    may be ``None``, meaning the request did not send that bound. A wrong
+    type raises instead of being coerced.
+
+    How the job layer fills a run record (``build_run_record``):
+
+      * ``pack_sha256`` is the receipt identity,
+        ``backtest.receipt.pack_sha256(strip_editor(pack))``, and
+        ``data_manifest_sha256`` is the sha256 of the dataset CSV bytes.
+        The default runner resolves both itself before the run, so a failed
+        run still records them and counts toward "variants tried".
+      * ``run_id`` is null unless all 13 inputs are known. A window bound
+        the request did not send stays null and counts as known.
+      * A job cancelled mid-run keeps the inputs it resolved; its
+        ``receipt_canonical_sha256`` is null because no result is stored.
+    """
+
+    values = {
+        "pack_sha256": pack_sha256,
+        "data_manifest_sha256": data_manifest_sha256,
+        "engine_version": engine_version,
+        "fee_bps": fee_bps,
+        "slippage_bps": slippage_bps,
+        "slippage_mult": slippage_mult,
+        "from_ms": from_ms,
+        "to_ms": to_ms,
+        "holdout_from_ms": holdout_from_ms,
+        "holdout_to_ms": holdout_to_ms,
+        "venue": venue,
+        "pair": pair,
+        "tf": tf,
+    }
+    canonical = {key: _run_input_value(key, values[key]) for key in RUN_ID_INPUT_KEYS}
+    return hashlib.sha256(canonical_receipt_bytes(canonical)).hexdigest()
+
+
+def build_run_record(
+    *,
+    state: str,
+    request: dict,
+    identity: dict | None,
+    receipt: dict | None,
+    receipt_digest: str | None,
+) -> dict:
+    """Build the terminal run record stored as ``run`` in the job file.
+
+    ``identity`` holds what the runner resolved (only keys it resolved are
+    present); ``receipt`` is the run's own receipt when it completed and
+    overrides ``identity`` for the inputs it states. Fields the run never
+    resolved are null, never guessed, and ``run_id`` is null unless every
+    input is known (see ``compute_run_id``).
+
+    The agent research tools (``krellbot.agent.tools_research``) build their
+    in-process runs' records here too, so the same inputs name the same run
+    whether a web job or an agent ran it.
+    """
+
+    known: dict[str, Any] = {}
+    if isinstance(identity, dict):
+        for key in RUN_ID_INPUT_KEYS:
+            if key in identity:
+                try:
+                    known[key] = _run_input_value(key, identity[key])
+                except (TypeError, ValueError):
+                    continue
+    if isinstance(receipt, dict):
+        for key in _RECEIPT_RUN_INPUT_KEYS:
+            if key not in receipt:
+                continue
+            try:
+                known[key] = _run_input_value(key, receipt[key])
+            except (TypeError, ValueError):
+                known.pop(key, None)
+
+    strategy_id = identity.get("strategy_id") if isinstance(identity, dict) else None
+    if not isinstance(strategy_id, str) or not strategy_id:
+        strategy_id = None
+    elif isinstance(receipt, dict) and identity.get("pack_sha256") != known.get("pack_sha256"):
+        # The run scored other pack bytes than the job layer read: not this id.
+        strategy_id = None
+
+    # The default runner prefers ``pack_path``; a revision is echoed only when it was the source.
+    revision_id = request.get("revision_id")
+    if not isinstance(revision_id, str) or not revision_id or request.get("pack_path"):
+        revision_id = None
+
+    complete = len(known) == len(RUN_ID_INPUT_KEYS)
+    return {
+        "schema_version": RUN_RECORD_SCHEMA_VERSION,
+        "run_id": compute_run_id(**known) if complete else None,
+        "inputs": {key: known.get(key) for key in RUN_ID_INPUT_KEYS},
+        "receipt_canonical_sha256": receipt_digest,
+        "request": {"revision_id": revision_id, "strategy_id": strategy_id},
+        "state": state,
+    }
+
+
+def _record_text(record: Any, section: str, key: str) -> str | None:
+    """Read one non-empty string from a stored run record, or ``None``."""
+
+    if not isinstance(record, dict):
+        return None
+    part = record.get(section)
+    if not isinstance(part, dict):
+        return None
+    value = part.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _pack_identity(path: Path) -> dict:
+    """Resolve a pack file's receipt identity and strategy id, or nothing.
+
+    ``pack_sha256`` is the receipt's identity: canonical JSON of the
+    editor-stripped pack (``backtest.receipt.pack_sha256``), never the
+    file's raw-byte hash. A file that is not a JSON object resolves nothing.
+    """
+
+    from krellbot.backtest.receipt import pack_sha256
+    from krellbot.strategy_ir.v1 import strip_editor
+
+    try:
+        pack = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(pack, dict):
+        return {}
+    out: dict = {"pack_sha256": pack_sha256(strip_editor(pack))}
+    strategy_id = pack.get("id")
+    if isinstance(strategy_id, str) and strategy_id:
+        out["strategy_id"] = strategy_id
+    return out
+
+
+def _dataset_identity(path: Path) -> dict:
+    """Resolve a dataset CSV's manifest digest (sha256 of its bytes), or nothing."""
+
+    from krellbot.data.cache import sha256_bytes
+
+    try:
+        body = path.read_bytes()
+    except OSError:
+        return {}
+    return {"data_manifest_sha256": sha256_bytes(body)}
 
 
 def _resolve_dataset_id(home: Path, dataset_id: Any, dataset_csv: Any) -> tuple[Any, dict | None]:
@@ -380,6 +623,10 @@ class _InternalJob:
     # Stored only on success. ``None`` for queued, running, cancelling,
     # cancelled, and failed jobs. The result route reads this directly.
     result: dict | None = None
+    # The run record, set once the job reaches a terminal state (any of
+    # them). ``None`` before that, and for jobs stored before records were
+    # kept. Evidence only: never read to queue or replay a job.
+    run: dict | None = None
 
     def snapshot(self) -> JobV1:
         return copy.deepcopy(self.job)
@@ -427,8 +674,36 @@ class JobManager:
         """Persist observable evidence, never a request to replay on restart."""
         directory = self._home / "research-jobs"
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        payload = {"job": internal.job.to_dict(), "result": internal.result}
+        payload = {"job": internal.job.to_dict(), "result": internal.result, "run": internal.run}
         atomic_write(directory / f"{internal.id}.json", json.dumps(payload).encode("utf-8"))
+
+    def _record_run(self, internal: _InternalJob, *, outcome: Any = None, identity: dict | None = None) -> None:
+        """Attach the run record for the terminal state ``internal`` has just reached.
+
+        The receipt of a completed run (``outcome``) states most inputs; a
+        job cancelled mid-run keeps them, but only a succeeded job, whose
+        result is stored, names its ``receipt_canonical_sha256``.
+        """
+
+        receipt: dict | None = None
+        digest: str | None = None
+        if isinstance(outcome, dict) and outcome.get("ok") is True and isinstance(outcome.get("legacy_receipt"), dict):
+            receipt = outcome["legacy_receipt"]
+            claimed = outcome.get("receipt_canonical_sha256")
+            if internal.job.state == JOB_STATE_SUCCEEDED and internal.result is not None and isinstance(claimed, str):
+                try:
+                    actual = receipt_canonical_sha256(receipt)
+                except (TypeError, ValueError):
+                    actual = None
+                # Only a digest that names the stored receipt is recorded.
+                digest = claimed if claimed == actual else None
+        internal.run = build_run_record(
+            state=internal.job.state,
+            request=internal.request,
+            identity=identity,
+            receipt=receipt,
+            receipt_digest=digest,
+        )
 
     def _costs_path(self, job_id: str) -> Path | None:
         if _SIDE_CAR_JOB_ID.fullmatch(job_id) is None:
@@ -456,6 +731,8 @@ class JobManager:
         for path in (self._home / "research-jobs").glob("*.json"):
             payload = json.loads(path.read_text(encoding="utf-8"))
             job = JobV1(**payload["job"])
+            # Older files have no ``run``; a record is evidence, never a replay request.
+            run = payload.get("run")
             internal = _InternalJob(
                 id=job.id,
                 kind=job.kind,
@@ -463,6 +740,7 @@ class JobManager:
                 created_at=job.created_at,
                 job=job,
                 result=payload["result"],
+                run=run if isinstance(run, dict) else None,
             )
             if job.state not in JOB_STATES_TERMINAL:
                 job.state = JOB_STATE_INTERRUPTED
@@ -473,6 +751,8 @@ class JobManager:
                     "message": "Workstation stopped before the job finished; submit a new run to retry.",
                 }
                 internal.result = None
+                # The request is not persisted, so nothing the run resolved is known.
+                self._record_run(internal)
                 self._persist_job(internal)
             records.append(internal)
         for internal in sorted(records, key=lambda record: record.created_at):
@@ -655,6 +935,36 @@ class JobManager:
             return None
         return costs if isinstance(costs, dict) else None
 
+    def run_for(self, job_id: str) -> dict | None:
+        """Return ``{"run", "variants_tried"}`` for ``job_id``, or ``None``.
+
+        ``None`` covers an unknown job, a job that has not ended, and a job
+        stored before run records were kept. ``variants_tried`` is read-only:
+        the number of distinct ``pack_sha256`` across stored run records that
+        share this record's ``strategy_id`` and ``data_manifest_sha256``,
+        failed and cancelled runs included. It is ``None`` when this record
+        names no strategy or no dataset, never a guessed zero.
+        """
+
+        with self._lock:
+            internal = self._jobs.get(job_id)
+            if internal is None or not isinstance(internal.run, dict):
+                return None
+            record = copy.deepcopy(internal.run)
+            strategy_id = _record_text(record, "request", "strategy_id")
+            manifest = _record_text(record, "inputs", "data_manifest_sha256")
+            variants: int | None = None
+            if strategy_id is not None and manifest is not None:
+                packs = {
+                    _record_text(other.run, "inputs", "pack_sha256")
+                    for other in self._jobs.values()
+                    if _record_text(other.run, "request", "strategy_id") == strategy_id
+                    and _record_text(other.run, "inputs", "data_manifest_sha256") == manifest
+                }
+                packs.discard(None)
+                variants = len(packs)
+        return {"run": record, "variants_tried": variants}
+
     def cancel(self, job_id: str) -> JobV1 | None:
         """Cancel ``job_id`` if known and not already terminal. Idempotent.
 
@@ -683,6 +993,8 @@ class JobManager:
                 internal.job.state = JOB_STATE_CANCELLED
                 internal.job.finished_at = _now_iso()
                 internal.job.result_ref = None
+                # A queued job never ran: nothing is resolved.
+                self._record_run(internal)
                 self._persist_job(internal)
                 self._events.append(
                     kind=EVENT_KIND_JOB_CHANGED,
@@ -747,6 +1059,7 @@ class JobManager:
                     self._queue_order.pop(0)
                     internal.job.state = JOB_STATE_CANCELLED
                     internal.job.finished_at = _now_iso()
+                    self._record_run(internal)
                     self._persist_job(internal)
                     self._events.append(
                         kind=EVENT_KIND_JOB_CHANGED,
@@ -789,19 +1102,26 @@ class JobManager:
 
         outcome: Any = None
         runner_error: Exception | None = None
+        # What the default runner resolved so far; kept even when it raises.
+        resolved: dict = {}
 
         try:
-            runner = self._runner if self._runner is not None else self._default_runner
-            outcome = runner(request_payload)
+            if self._runner is not None:
+                outcome = self._runner(request_payload)
+            else:
+                outcome = self._default_runner(request_payload, resolved)
         except Exception:  # noqa: BLE001 — coerced to a closed JobV1 error code
             runner_error = RuntimeError("runner raised")
         finally:
             with self._lock:
+                identity = resolved
+                if isinstance(outcome, dict) and isinstance(outcome.get("run_identity"), dict):
+                    identity = outcome["run_identity"]
                 cancel_requested = cancel_event.is_set()
                 if cancel_requested and internal.job.state in JOB_STATES_CANCEL:
-                    self._finalize_cancelled(internal)
+                    self._finalize_cancelled(internal, outcome=outcome, identity=identity)
                 elif runner_error is not None:
-                    self._finalize_failed(internal, code=JOB_ERROR_JOB_FAILED, message="job failed")
+                    self._finalize_failed(internal, code=JOB_ERROR_JOB_FAILED, message="job failed", identity=identity)
                 elif isinstance(outcome, dict) and outcome.get("ok") is True:
                     ref = outcome.get("result_ref")
                     if isinstance(ref, str) and ref:
@@ -822,12 +1142,14 @@ class JobManager:
                         costs = outcome.get("costs")
                         if isinstance(costs, dict):
                             self._persist_costs(internal, costs)
-                        self._finalize_state(internal, JOB_STATE_SUCCEEDED)
+                        self._finalize_state(internal, JOB_STATE_SUCCEEDED, outcome=outcome, identity=identity)
                     else:
                         self._finalize_failed(
                             internal,
                             code=JOB_ERROR_MISSING_RESULT_REF,
                             message="runner returned no result_ref",
+                            outcome=outcome,
+                            identity=identity,
                         )
                 else:
                     code = outcome.get("code") if isinstance(outcome, dict) else None
@@ -837,9 +1159,12 @@ class JobManager:
                             internal,
                             code=code,
                             message=str(message) if isinstance(message, str) else "job failed",
+                            identity=identity,
                         )
                     else:
-                        self._finalize_failed(internal, code=JOB_ERROR_JOB_FAILED, message="job failed")
+                        self._finalize_failed(
+                            internal, code=JOB_ERROR_JOB_FAILED, message="job failed", identity=identity
+                        )
 
                 if self._running_id == internal.id:
                     self._running_id = None
@@ -850,9 +1175,12 @@ class JobManager:
 
     # ---- finalize helpers ------------------------------------------------
 
-    def _finalize_state(self, internal: _InternalJob, state: str) -> None:
+    def _finalize_state(
+        self, internal: _InternalJob, state: str, *, outcome: Any = None, identity: dict | None = None
+    ) -> None:
         internal.job.state = state
         internal.job.finished_at = _now_iso()
+        self._record_run(internal, outcome=outcome, identity=identity)
         self._persist_job(internal)
         self._events.append(
             kind=EVENT_KIND_JOB_CHANGED,
@@ -860,11 +1188,12 @@ class JobManager:
             payload={"state": state, "kind": internal.job.kind},
         )
 
-    def _finalize_cancelled(self, internal: _InternalJob) -> None:
+    def _finalize_cancelled(self, internal: _InternalJob, *, outcome: Any = None, identity: dict | None = None) -> None:
         internal.job.state = JOB_STATE_CANCELLED
         internal.job.finished_at = _now_iso()
         internal.job.result_ref = None
         internal.job.error = None
+        self._record_run(internal, outcome=outcome, identity=identity)
         self._persist_job(internal)
         self._events.append(
             kind=EVENT_KIND_JOB_CHANGED,
@@ -872,11 +1201,20 @@ class JobManager:
             payload={"state": JOB_STATE_CANCELLED, "kind": internal.job.kind},
         )
 
-    def _finalize_failed(self, internal: _InternalJob, *, code: str, message: str) -> None:
+    def _finalize_failed(
+        self,
+        internal: _InternalJob,
+        *,
+        code: str,
+        message: str,
+        outcome: Any = None,
+        identity: dict | None = None,
+    ) -> None:
         internal.job.state = JOB_STATE_FAILED
         internal.job.finished_at = _now_iso()
         internal.job.result_ref = None
         internal.job.error = {"code": code, "message": message}
+        self._record_run(internal, outcome=outcome, identity=identity)
         self._persist_job(internal)
         self._events.append(
             kind=EVENT_KIND_JOB_CHANGED,
@@ -886,17 +1224,30 @@ class JobManager:
 
     # ---- default runner --------------------------------------------------
 
-    def _default_runner(self, request_payload: dict) -> dict:
+    def _default_runner(self, request_payload: dict, resolved: dict | None = None) -> dict:
         """Default runner for the production path.
 
         Translates the API request dict into a :class:`ResearchRequest`
         and runs it through :class:`ResearchService`. Raises any
         exception the service raises; the worker captures it as a closed
         JobV1 error code.
+
+        Run inputs are written to ``resolved`` as they are resolved, so a
+        run that refuses or raises still leaves what it resolved for its
+        run record; every returned outcome also carries a copy as
+        ``run_identity``. A key is present only once resolved.
         """
 
+        identity = resolved if resolved is not None else {}
+        outcome = self._run_default(request_payload, identity)
+        outcome["run_identity"] = dict(identity)
+        return outcome
+
+    def _run_default(self, request_payload: dict, identity: dict) -> dict:
+        from krellbot import __version__ as engine_version
         from krellbot.application.research import ResearchRequest, ResearchService, fills_to_json
 
+        identity["engine_version"] = engine_version
         pack_path = request_payload.get("pack_path", "")
         revision_id = request_payload.get("revision_id")
         if not pack_path and isinstance(revision_id, str) and revision_id:
@@ -910,13 +1261,18 @@ class JobManager:
                     "code": JOB_ERROR_NOT_FOUND,
                     "message": "revision not found",
                 }
+        if pack_path:
+            identity.update(_pack_identity(Path(str(pack_path))))
         venue = request_payload.get("venue") or "kraken"
+        identity["venue"] = str(venue)
         pair = request_payload.get("pair")
         timeframe = request_payload.get("timeframe")
         dataset_id = request_payload.get("dataset_id")
         dataset_csv, refusal = _resolve_dataset_id(self._home, dataset_id, request_payload.get("dataset_csv"))
         if refusal is not None:
             return {"ok": False, **refusal}
+        if dataset_csv:
+            identity.update(_dataset_identity(Path(str(dataset_csv))))
         starting_cash = request_payload.get("starting_cash")
         fee_bps = request_payload.get("fee_bps")
         slippage_bps = request_payload.get("slippage_bps")
@@ -950,6 +1306,17 @@ class JobManager:
             "to_ms": int(to_ms) if to_ms is not None else None,
             "allow_gaps": allow_gaps,
         }
+        # Costs the request sent are what the run uses; an unsent one is the
+        # engine default, which only the run resolves (its receipt states it).
+        for key in ("fee_bps", "slippage_bps", "slippage_mult"):
+            if kwargs[key] is not None:
+                identity[key] = kwargs[key]
+        identity["from_ms"] = kwargs["from_ms"]
+        identity["to_ms"] = kwargs["to_ms"]
+        # A holdout bound that is not an int is refused by the run, so it stays unresolved.
+        for key, raw in (("holdout_from_ms", holdout_from_ms_raw), ("holdout_to_ms", holdout_to_ms_raw)):
+            if raw is None or type(raw) is int:
+                identity[key] = raw
         if "holdout_from_ms" in request_payload:
             kwargs["holdout_from_ms"] = holdout_from_ms_raw
         if "holdout_to_ms" in request_payload:
@@ -980,8 +1347,7 @@ class JobManager:
         detail = result.detail if isinstance(result.detail, dict) else {}
         trace = detail.get("trace")
         legacy_receipt = result.legacy_receipt if isinstance(result.legacy_receipt, dict) else {}
-        receipt_bytes = canonical_receipt_bytes(legacy_receipt)
-        receipt_digest = hashlib.sha256(receipt_bytes).hexdigest()
+        receipt_digest = receipt_canonical_sha256(legacy_receipt)
         outcome = {
             "ok": True,
             "result_ref": f"backtest:{correlation_id}:{job_id}",

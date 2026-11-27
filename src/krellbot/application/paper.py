@@ -34,6 +34,10 @@ Command contracts:
     stored-mode check; a missing `mode` or a `mode: paper` payload still
     refuses when the stored record is live. Live authority stays in the
     legacy CLI path.
+  * `arm` may carry a daily loss limit (`daily_loss_limit_pct`, M28.31). It
+    is validated before any write, set in the same paper command transaction
+    as the arm, and an arm whose limit cannot be set is rolled back. Without
+    it, `arm` behaves and writes exactly as before.
 """
 
 from __future__ import annotations
@@ -41,12 +45,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from krellbot import catalog as kb_catalog
 from krellbot import config as kb_config
 from krellbot import secrets as kb_secrets
 from krellbot.data import TF_MS
@@ -79,6 +85,13 @@ CODE_EXPORTED = "exported"
 CODE_OVER_RESERVED = reservations.CODE_OVER_RESERVED
 CODE_KILL_SWITCH_ENGAGED = "kill_switch_engaged"
 CODE_USER_POLICY_DENIED = "user_policy_denied"
+# An arm with a daily loss limit. The first two match the workstation's
+# ``risk.set_daily_loss_limit`` codes; ``loss_limit_not_applied`` means the
+# arm was rolled back, ``loss_limit_rollback_failed`` that it could not be.
+CODE_INVALID_LOSS_LIMIT = "invalid_loss_limit"
+CODE_CONFIG_BUSY = "config_busy"
+CODE_LOSS_LIMIT_NOT_APPLIED = "loss_limit_not_applied"
+CODE_LOSS_LIMIT_ROLLBACK_FAILED = "loss_limit_rollback_failed"
 
 
 @dataclass(frozen=True)
@@ -1015,6 +1028,148 @@ def _resolve_cap(pack_path: Path) -> Decimal | None:
         return None
 
 
+def arm_terms(raw: bytes, venue: str) -> tuple[str, Decimal | None]:
+    """Return ``(pair, risk cap)`` that an arm of these pack bytes on ``venue`` records.
+
+    These are ``ArmedPack.pair`` and ``ArmedPack.cap`` (the pack's
+    ``risk.max_account_pct``, shown as the risk cap since M28.7), parsed the
+    way ``run.arm_pack`` parses them. The caller passes the exact bytes it
+    will arm (agent arms arm an immutable snapshot of them), so what is
+    checked is what is armed. ``""`` or ``None`` means the value cannot be
+    read; agent limits (M38.3) refuse rather than guess.
+    """
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "", None
+    if not isinstance(data, dict):
+        return "", None
+    pair = ""
+    markets = data.get("markets") or []
+    try:
+        market = next((m for m in markets if m.get("venue") == venue), None)
+    except (AttributeError, TypeError):
+        # A malformed ``markets`` list (entries that are not objects).
+        market = None
+    if isinstance(market, dict):
+        pair = str(market.get("pair", ""))
+    cap: Decimal | None = None
+    risk = data.get("risk") or {}
+    if isinstance(risk, dict) and risk.get("max_account_pct") is not None:
+        try:
+            cap = Decimal(str(risk["max_account_pct"]))
+        except (ValueError, ArithmeticError):
+            cap = None
+    return pair, cap
+
+
+def pack_requires_license(home: Path, source_path: Path) -> bool:
+    """True when a pack read from ``source_path`` needs a license (a paid catalog pack)."""
+    return kb_catalog.requires_license_for(Path(source_path), Path(home))
+
+
+# The daily loss limit as ``risk.set_daily_loss_limit`` accepts it: a plain
+# decimal percent above 0 and at most 100.
+_LOSS_LIMIT_PCT = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?")
+
+
+def parse_daily_loss_limit_pct(raw: object) -> Decimal:
+    """Parse an untrusted daily loss limit percent; ``ValueError`` when invalid.
+
+    Accepts the workstation command's form (a plain decimal string) and the
+    same digits sent as a JSON number. Booleans and anything outside
+    (0, 100] are refused.
+    """
+    if isinstance(raw, str):
+        text = raw
+    elif isinstance(raw, (int, float, Decimal)) and not isinstance(raw, bool):
+        text = str(raw)
+    else:
+        text = ""
+    if not _LOSS_LIMIT_PCT.fullmatch(text):
+        raise ValueError("daily loss limit must be a plain percent")
+    pct = Decimal(text)
+    if not valid_daily_loss_limit(pct):
+        raise ValueError("daily loss limit must be above 0 and at most 100")
+    return pct
+
+
+def valid_daily_loss_limit(pct: object) -> bool:
+    """True for a finite Decimal percent in (0, 100]."""
+    return isinstance(pct, Decimal) and pct.is_finite() and Decimal(0) < pct <= Decimal(100)
+
+
+ArmKey = tuple[str, str, int]
+
+
+def arm_keys(config: kb_config.Config) -> set[ArmKey]:
+    """``(venue, pair, armed_at_ts)`` of every armed record."""
+    return {(a.venue, a.pair, a.armed_at_ts) for a in config.armed}
+
+
+def new_arms_of(
+    config: kb_config.Config, *, venue: str, pack_path: Path | str, before: set[ArmKey]
+) -> list[kb_config.ArmedPack]:
+    """Records an arm of ``pack_path`` on ``venue`` added since ``before``.
+
+    The identity is the venue, a key that was not armed before, and the
+    exact ``pack_path`` ``run.arm_pack`` stored. A record with another
+    ``pack_path``, such as a human's arm of another pack, never matches.
+    """
+    stored = str(pack_path)
+    return [
+        a
+        for a in config.armed
+        if a.venue == venue and (a.venue, a.pair, a.armed_at_ts) not in before and a.pack_path == stored
+    ]
+
+
+def _new_arm(
+    config: kb_config.Config, *, venue: str, pack_path: Path, before: set[ArmKey]
+) -> kb_config.ArmedPack | None:
+    """The one record this arm added, or None when there is none or more than one."""
+    new = new_arms_of(config, venue=venue, pack_path=pack_path, before=before)
+    return new[0] if len(new) == 1 else None
+
+
+def _apply_loss_limit_to_new_arm(home: Path, *, venue: str, pack_path: Path, before: set[ArmKey], pct: Decimal) -> bool:
+    """Set ``pct`` on the arm ``run.arm_pack`` just added; False when it cannot.
+
+    The caller holds the paper command lock, so this makes the same checks as
+    ``config.set_daily_loss_limit`` (a paper record with a positive starting
+    cash) without taking the lock again.
+    """
+    config = kb_config.load_config(home)
+    armed = _new_arm(config, venue=venue, pack_path=pack_path, before=before)
+    if armed is None or armed.mode != "paper":
+        return False
+    cash = armed.starting_cash
+    if cash is None or not cash.is_finite() or cash <= 0:
+        return False
+    armed.daily_loss_limit_pct = pct
+    kb_config.save_config(home, config)
+    return True
+
+
+def _drop_new_arm(home: Path, *, venue: str, pack_path: Path, before: set[ArmKey], existed: bool) -> bool:
+    """Roll back the arm this call added (matched by identity); False when it is not there.
+
+    Only that record is removed. A config file that did not exist before the
+    arm is removed again when nothing else is in it, so the rollback leaves
+    the bytes as they were.
+    """
+    config = kb_config.load_config(home)
+    armed = _new_arm(config, venue=venue, pack_path=pack_path, before=before)
+    if armed is None:
+        return False
+    config.armed = [a for a in config.armed if a is not armed]
+    if not existed and not config.armed and not config.live_first_armed:
+        kb_config.config_path(home).unlink(missing_ok=True)
+        return True
+    kb_config.save_config(home, config)
+    return True
+
+
 def _classify_invalid_input(pack_path: Path, venue: str) -> tuple[str, str]:
     """Map an `rc=2` (invalid input) refusal to a specific code + message.
 
@@ -1068,8 +1223,22 @@ class PaperService:
         paper_balance: Decimal | None,
         correlation_id: str = "",
         requires_license: bool | None = None,
+        daily_loss_limit_pct: Decimal | None = None,
+        source_path: Path | None = None,
     ) -> CommandResultV1:
-        """Arm a pack in paper mode.
+        """Arm a pack in paper mode, optionally with a daily loss limit.
+
+        ``daily_loss_limit_pct`` (a percent of the paper balance in (0, 100],
+        M28.31) is set on the new record in the same paper command
+        transaction as the arm. If it cannot be set, the arm is rolled back
+        and the result is ``loss_limit_not_applied``. ``None`` keeps the
+        historic behaviour and config bytes.
+
+        ``source_path`` is where ``pack_path``'s bytes were copied from when
+        ``pack_path`` is a snapshot (agent arms arm an immutable copy of the
+        pack they were checked against). License and pack-library
+        classification then follow the source, exactly as an arm of the
+        source path would. ``None`` means ``pack_path`` is the source.
 
         The service is the boundary; the engine's ``run.arm_pack``
         remains the single authority for live key checks, pack-shape
@@ -1138,6 +1307,13 @@ class PaperService:
                 correlation_id,
                 rev_before,
             )
+        if daily_loss_limit_pct is not None and not valid_daily_loss_limit(daily_loss_limit_pct):
+            return self._refusal(
+                CODE_INVALID_LOSS_LIMIT,
+                "daily loss limit must be a percent above 0 and at most 100",
+                correlation_id,
+                rev_before,
+            )
 
         try:
             cap = _resolve_cap(pack_path)
@@ -1168,14 +1344,35 @@ class PaperService:
         # be at process start.
         from krellbot import run as kb_run
 
-        rc = kb_run.arm_pack(
-            pack_path,
-            venue=venue,
-            mode=mode,
-            paper_balance=paper_balance,
-            requires_license=requires_license,
-            home=self._home,
-        )
+        if requires_license is None and source_path is not None:
+            # A snapshot lives outside packs/catalog/; the source decides,
+            # exactly as run.arm_pack would decide for the source path.
+            requires_license = pack_requires_license(self._home, source_path)
+
+        def arm_pack() -> int:
+            return kb_run.arm_pack(
+                pack_path,
+                venue=venue,
+                mode=mode,
+                paper_balance=paper_balance,
+                requires_license=requires_license,
+                home=self._home,
+            )
+
+        if daily_loss_limit_pct is None:
+            rc = arm_pack()
+        else:
+            limited = self._arm_with_loss_limit(
+                arm_pack,
+                pack_path=pack_path,
+                venue=venue,
+                pct=daily_loss_limit_pct,
+                correlation_id=correlation_id,
+                rev_before=rev_before,
+            )
+            if isinstance(limited, CommandResultV1):
+                return limited
+            rc = limited
 
         rev_after = _revision(self._home)
 
@@ -1198,7 +1395,7 @@ class PaperService:
             if armed is not None and isinstance(armed.pack_id, str) and armed.pack_id:
                 from krellbot.application import pack_library as pack_library_app
 
-                if pack_library_app.is_library_pack_path(pack_path):
+                if pack_library_app.is_library_pack_path(source_path if source_path is not None else pack_path):
                     try:
                         pack_library_app.mark_deployed(
                             self._home,
@@ -1244,6 +1441,69 @@ class PaperService:
         # adapter can render the right reason.
         code, msg = _classify_invalid_input(pack_path, venue)
         return self._refusal(code, msg, correlation_id, rev_before)
+
+    def _arm_with_loss_limit(
+        self,
+        arm_pack: Callable[[], int],
+        *,
+        pack_path: Path,
+        venue: str,
+        pct: Decimal,
+        correlation_id: str,
+        rev_before: str | None,
+    ) -> int | CommandResultV1:
+        """Arm and set the daily loss limit under the paper command lock.
+
+        No stop, pause, resume or limit command can land between the two
+        writes. ``run.arm_pack`` writes the record itself, so the limit is a
+        second write. The new record is found by identity (this venue, a key
+        not armed before, and this ``pack_path``), never by pair alone. If
+        the limit cannot be set, that record is removed again and
+        ``loss_limit_not_applied`` is returned; if it cannot even be found,
+        ``loss_limit_rollback_failed`` (never a success). Returns
+        ``arm_pack``'s code otherwise.
+        """
+        with kb_config._paper_command_transaction(self._home) as acquired:
+            if not acquired:
+                return self._refusal(
+                    CODE_CONFIG_BUSY,
+                    "another paper command is updating config",
+                    correlation_id,
+                    rev_before,
+                )
+            existed = kb_config.config_path(self._home).exists()
+            before = arm_keys(kb_config.load_config(self._home))
+            rc = arm_pack()
+            if rc != 0:
+                return rc
+            try:
+                applied = _apply_loss_limit_to_new_arm(
+                    self._home, venue=venue, pack_path=pack_path, before=before, pct=pct
+                )
+            except OSError:
+                applied = False
+            if applied:
+                return rc
+            removed = _drop_new_arm(self._home, venue=venue, pack_path=pack_path, before=before, existed=existed)
+        if removed:
+            code = CODE_LOSS_LIMIT_NOT_APPLIED
+            message = "the daily loss limit could not be set, so the arm was rolled back"
+        else:
+            code = CODE_LOSS_LIMIT_ROLLBACK_FAILED
+            message = (
+                "the daily loss limit could not be set and the new arm could not be found to roll it back; "
+                "an arm on this venue may be running without it"
+            )
+        return CommandResultV1(
+            schema_version=SCHEMA_VERSION,
+            correlation_id=correlation_id,
+            code=code,
+            ok=False,
+            message=message,
+            effect="refused",
+            revision_before=rev_before,
+            revision_after=_revision(self._home),
+        )
 
     # ---- disarm ----------------------------------------------------------
 
