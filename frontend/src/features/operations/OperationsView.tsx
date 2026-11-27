@@ -39,6 +39,11 @@ import {
 import { SchedulerPanel } from "./SchedulerPanel";
 import { UnresolvedOrdersList } from "./UnresolvedOrdersList";
 import { JournalBrowsePanel } from "./JournalBrowsePanel";
+import { AgentActivity } from "./AgentActivity";
+import {
+  createAgentActivityHttpClient,
+  type AgentActivityClient,
+} from "./agentActivityClient";
 
 const DISABLED_BANNER =
   "Live trading is disabled in this paper-only release.";
@@ -81,6 +86,8 @@ export type OperationsViewProps = {
   homeExportClient?: HomeExportClient;
   /** Local home restore with fence honesty (M16.6). Defaults to HTTP client. */
   homeRestoreClient?: HomeRestoreClient;
+  /** Agent tool-call activity (M38.21). Defaults to HTTP client. */
+  agentActivityClient?: AgentActivityClient;
   /** Optional navigation hook to open the Deploy view (preflight, guardrails, live arm). */
   onOpenDeploy?: () => void;
 };
@@ -269,6 +276,7 @@ export function OperationsView({
   notificationsClient,
   homeExportClient,
   homeRestoreClient,
+  agentActivityClient,
   onOpenDeploy,
 }: OperationsViewProps): JSX.Element {
   const defaultNotificationsClient = useMemo(
@@ -280,6 +288,11 @@ export function OperationsView({
   const homeExport = homeExportClient ?? defaultHomeExportClient;
   const defaultHomeRestoreClient = useMemo(() => createHomeRestoreHttpClient(), []);
   const homeRestore = homeRestoreClient ?? defaultHomeRestoreClient;
+  const defaultAgentActivityClient = useMemo(
+    () => createAgentActivityHttpClient(),
+    [],
+  );
+  const agentActivity = agentActivityClient ?? defaultAgentActivityClient;
   const [killReason, setKillReason] = useState<string>("");
   const killInFlight = useRef(false);
   const [killPending, setKillPending] = useState(false);
@@ -938,6 +951,16 @@ export function OperationsView({
           data-testid="ops-live-authorization-panel"
         >
           <LiveAuthorizationPanel client={client} />
+        </DisclosureSection>
+
+        <DisclosureSection
+          title="Agent activity"
+          summary="Who did what: Krell and MCP tool calls, including refusals."
+          defaultOpen={false}
+          storageKey="krellbot.disclosure.ops.agent-activity"
+          data-testid="ops-agent-activity-panel"
+        >
+          <AgentActivity client={agentActivity} />
         </DisclosureSection>
 
         <DisclosureSection
