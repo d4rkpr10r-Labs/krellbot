@@ -357,6 +357,33 @@
   overflow-wrap: anywhere;
 }
 
+/* Agents & limits: grouped limit cards, labelled fields, allowlist radios
+   and multi-line setup snippets. */
+.kbot-settings__form {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.kbot-settings__field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.kbot-settings__toggle-row input[type="radio"] {
+  margin-top: 3px;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  accent-color: var(--seafoam, #a8d8d1);
+}
+
+pre.kbot-settings__code {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
 @media (max-width: 780px) {
   .kbot-settings__layout {
     grid-template-columns: minmax(0, 1fr);

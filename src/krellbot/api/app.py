@@ -7,7 +7,11 @@ import contextlib
 import hmac
 import ipaddress
 import json
+import os
 import re
+import shlex
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -432,6 +436,27 @@ def _scheduler_executable(s: _AppState) -> str:
     if s.scheduler_executable:
         return s.scheduler_executable
     return sys.executable
+
+
+def _mcp_launch() -> tuple[str, list[str]]:
+    """How an MCP client starts ``krellbot mcp`` on this computer.
+
+    A frozen build runs its own executable. A source install runs the
+    ``krellbot`` script on PATH, or else this interpreter with the CLI module.
+    """
+
+    if getattr(sys, "frozen", False):
+        return sys.executable, ["mcp"]
+    script = shutil.which("krellbot")
+    if script:
+        return os.path.abspath(script), ["mcp"]
+    return sys.executable, ["-m", "krellbot.cli", "mcp"]
+
+
+def _mcp_shell_line(argv: list[str], *, windows: bool) -> str:
+    """``argv`` quoted for this computer's shell, so paths with spaces survive a paste."""
+
+    return subprocess.list2cmdline(argv) if windows else shlex.join(argv)
 
 
 def _stored_deployment_mode(home: Path) -> str | None:
@@ -4973,24 +4998,32 @@ def create_app(
 
     @app.get("/api/v1/user-policy")
     async def get_user_policy(request: Request) -> Response:
-        """Return the operator user-policy snapshot (defaults if missing)."""
+        """Return the operator user-policy snapshot (defaults if missing).
+
+        An invalid file reads as the fail-closed snapshot the engine enforces,
+        with ``code`` ``user_policy_invalid`` and the engine's message, so the
+        editor never shows that snapshot as the operator's choice.
+        """
 
         s = _state(request.app)
         denied = _gate_get(request, s)
         if denied is not None:
             return denied
-        policy = user_policy_app.load_policy(s.home)
-        return JSONResponse(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "ok": True,
-                "effect": "unchanged",
-                "policy": policy.to_dict(),
-                "path": user_policy_app.POLICY_FILENAME,
-            },
-            status_code=200,
-            headers={"Cache-Control": "no-store"},
-        )
+        # ``check`` reads the file once and never journals, unlike ``ensure_allowed``.
+        decision = user_policy_app.check(s.home, user_policy_app.ACTION_PAPER_ARM)
+        policy = decision.policy or user_policy_app.load_policy(s.home)
+        out: dict = {
+            "schema_version": SCHEMA_VERSION,
+            "ok": True,
+            "effect": "unchanged",
+            "code": user_policy_app.CODE_OK,
+            "policy": policy.to_dict(),
+            "path": user_policy_app.POLICY_FILENAME,
+        }
+        if decision.code == user_policy_app.CODE_POLICY_INVALID:
+            out["code"] = decision.code
+            out["message"] = decision.message
+        return JSONResponse(out, status_code=200, headers={"Cache-Control": "no-store"})
 
     @app.put("/api/v1/user-policy")
     async def put_user_policy(request: Request) -> Response:
@@ -5022,6 +5055,40 @@ def create_app(
         if result.policy is not None:
             out["policy"] = result.policy.to_dict()
         return JSONResponse(out, status_code=status, headers={"Cache-Control": "no-store"})
+
+    # ---- MCP client setup (M38.10) --------------------------------------
+
+    @app.get("/api/v1/agents/mcp-setup")
+    async def get_mcp_setup(request: Request) -> Response:
+        """How an MCP client launches ``krellbot mcp`` here, for the setup snippets.
+
+        Only the command, its args and ``KRELLBOT_HOME``; ``claude_code`` is
+        the Claude Code line built from them, quoted for this computer's shell.
+        """
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+        command, args = _mcp_launch()
+        home = str(s.home.absolute())
+        claude_code = _mcp_shell_line(
+            ["claude", "mcp", "add", "krellbot", "--env", f"KRELLBOT_HOME={home}", "--", command, *args],
+            windows=sys.platform == "win32",
+        )
+        return JSONResponse(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "ok": True,
+                "effect": "unchanged",
+                "command": command,
+                "args": args,
+                "env": {"KRELLBOT_HOME": home},
+                "claude_code": claude_code,
+            },
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
 
     # ---- strategy drafts (NS08a) --------------------------------------
 
