@@ -80,7 +80,6 @@ from krellbot.application.paper import (
     new_arms_of,
     parse_daily_loss_limit_pct,
 )
-from krellbot.application.research import ResearchRequest, ResearchService
 from krellbot.application.strategy import (
     DraftNotRunnable,
     RevisionNotFound,
@@ -343,7 +342,9 @@ class AgentToolCore:
 
     The five existing MCP verbs (read, draft, validate, backtest, paper_arm)
     are registered on construction; later tools are added with
-    :meth:`register`. ``confirm`` is the confirm-ticket ledger that M38.7
+    :meth:`register` (``compare`` by
+    :func:`krellbot.agent.tools_research.register_research_tools`).
+    ``confirm`` is the confirm-ticket ledger that M38.7
     wires into :meth:`_confirm_step`; until then it is stored and unused.
     """
 
@@ -634,41 +635,6 @@ def _validate(ctx: ToolContext, params: dict) -> dict:
     }
 
 
-def _backtest(ctx: ToolContext, params: dict) -> dict:
-    pack_path = params.get("pack_path")
-    dataset_csv = params.get("dataset_csv")
-    if pack_path is None:
-        return invalid_request("backtest", "backtest requires pack_path").to_dict()
-    request = ResearchRequest(
-        pack_path=Path(pack_path),
-        dataset_csv=Path(dataset_csv) if dataset_csv is not None else None,
-        venue=str(params.get("venue", "kraken")),
-        pair=params.get("pair"),
-        timeframe=params.get("timeframe"),
-        allow_gaps=bool(params.get("allow_gaps", False)),
-    )
-    # Offline by default: no fetch means refuse without network/keyring.
-    result = ResearchService(home=ctx.home, fetch=ctx.fetch).run(request)
-    if not result.ok:
-        refusal = result.refusal or {}
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "ok": False,
-            "effect": "refused",
-            "tool": "backtest",
-            "code": str(refusal.get("code") or "research_refused"),
-            "message": str(refusal.get("message") or "backtest refused"),
-        }
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "ok": True,
-        "effect": "unchanged",
-        "tool": "backtest",
-        "legacy_receipt": result.legacy_receipt,
-        "detail": result.detail,
-    }
-
-
 @dataclass(frozen=True)
 class _ArmRequest:
     """A ``paper_arm`` call resolved from one read of its pack's bytes.
@@ -695,20 +661,20 @@ MAX_PACK_BYTES = 1024 * 1024
 MESSAGE_PACK_UNREADABLE = "the pack must be a readable regular file of at most 1 MiB"
 
 
-def _read_pack_bytes(path: Path) -> bytes | None:
-    """Read an agent-named pack file, bounded; ``None`` when it is not acceptable.
+def read_regular_file_bounded(path: Path, max_bytes: int) -> bytes | None:
+    """Read an agent-named file, bounded; ``None`` when it is not acceptable.
 
-    Only a regular file (after following symlinks) of at most
-    :data:`MAX_PACK_BYTES` is read. The file is opened non-blocking and
-    checked again on the open descriptor, so a path swapped for a FIFO or a
-    device after the first check cannot block or flood the read, and at most
-    one byte more than the limit is ever read.
+    Only a regular file (after following symlinks) of at most ``max_bytes``
+    is read. The file is opened non-blocking and checked again on the open
+    descriptor, so a path swapped for a FIFO or a device after the first
+    check cannot block or flood the read, and at most one byte more than the
+    limit is ever read.
     """
     try:
         info = os.stat(path)
     except (OSError, ValueError):
         return None
-    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PACK_BYTES:
+    if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
         return None
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
     try:
@@ -717,12 +683,12 @@ def _read_pack_bytes(path: Path) -> bytes | None:
         return None
     try:
         opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_size > MAX_PACK_BYTES:
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size > max_bytes:
             return None
         chunks: list[bytes] = []
         total = 0
-        while total <= MAX_PACK_BYTES:
-            chunk = os.read(fd, MAX_PACK_BYTES + 1 - total)
+        while total <= max_bytes:
+            chunk = os.read(fd, max_bytes + 1 - total)
             if not chunk:
                 break
             chunks.append(chunk)
@@ -731,9 +697,14 @@ def _read_pack_bytes(path: Path) -> bytes | None:
         return None
     finally:
         os.close(fd)
-    if total > MAX_PACK_BYTES:
+    if total > max_bytes:
         return None
     return b"".join(chunks)
+
+
+def _read_pack_bytes(path: Path) -> bytes | None:
+    """Read an agent-named pack file of at most :data:`MAX_PACK_BYTES`, or ``None``."""
+    return read_regular_file_bounded(path, MAX_PACK_BYTES)
 
 
 def _arm_request(ctx: ToolContext, params: dict) -> _ArmRequest | dict:
@@ -1006,7 +977,14 @@ def _paper_arm(ctx: ToolContext, params: dict) -> dict:
 
 
 def _builtin_specs() -> tuple[ToolSpec, ...]:
-    """The five existing MCP verbs. Schemas are built fresh per core."""
+    """The five existing MCP verbs. Schemas are built fresh per core.
+
+    ``backtest`` lives with the other research tools in
+    :mod:`krellbot.agent.tools_research`, which imports this module, so it is
+    imported here, when a core is built.
+    """
+    from krellbot.agent.tools_research import backtest_spec
+
     return (
         ToolSpec(
             name="read",
@@ -1049,28 +1027,7 @@ def _builtin_specs() -> tuple[ToolSpec, ...]:
             description="Lint a stored draft revision. A clean pack becomes validated and runnable on paper.",
             handler=_validate,
         ),
-        ToolSpec(
-            name="backtest",
-            effect="research",
-            cost="heavy",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "pack_path": {"type": "string"},
-                    "dataset_csv": {"type": "string", "description": "Local OHLCV CSV."},
-                    "venue": {"type": "string", "default": "kraken"},
-                    "pair": {"type": "string"},
-                    "timeframe": {"type": "string"},
-                    "allow_gaps": {"type": "boolean", "default": False},
-                },
-                "required": ["pack_path"],
-            },
-            labels=(LABEL_SIMULATED,),
-            description=(
-                "Backtest a pack offline against a local dataset. Results are simulated, not market performance."
-            ),
-            handler=_backtest,
-        ),
+        backtest_spec(),
         ToolSpec(
             name="paper_arm",
             effect="change",
@@ -1157,6 +1114,7 @@ __all__ = [
     "normalize_tool_name",
     "path_id_refusal",
     "policy_denied",
+    "read_regular_file_bounded",
     "secret_param_refused",
     "unknown_tool",
 ]
