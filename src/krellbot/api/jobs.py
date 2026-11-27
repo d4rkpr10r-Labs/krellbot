@@ -183,6 +183,16 @@ def canonical_receipt_bytes(receipt: dict) -> bytes:
     return json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def receipt_canonical_sha256(receipt: dict) -> str:
+    """Return the ``receipt_canonical_sha256`` digest of a ``legacy_receipt`` dict.
+
+    Hex sha256 of ``canonical_receipt_bytes(receipt)``: the digest a research
+    job stores beside its result and an in-process agent backtest returns.
+    """
+
+    return hashlib.sha256(canonical_receipt_bytes(receipt)).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Run identity
 # ---------------------------------------------------------------------------
@@ -273,7 +283,7 @@ def compute_run_id(
     may be ``None``, meaning the request did not send that bound. A wrong
     type raises instead of being coerced.
 
-    How the job layer fills a run record (``_build_run_record``):
+    How the job layer fills a run record (``build_run_record``):
 
       * ``pack_sha256`` is the receipt identity,
         ``backtest.receipt.pack_sha256(strip_editor(pack))``, and
@@ -305,7 +315,7 @@ def compute_run_id(
     return hashlib.sha256(canonical_receipt_bytes(canonical)).hexdigest()
 
 
-def _build_run_record(
+def build_run_record(
     *,
     state: str,
     request: dict,
@@ -320,6 +330,10 @@ def _build_run_record(
     overrides ``identity`` for the inputs it states. Fields the run never
     resolved are null, never guessed, and ``run_id`` is null unless every
     input is known (see ``compute_run_id``).
+
+    The agent research tools (``krellbot.agent.tools_research``) build their
+    in-process runs' records here too, so the same inputs name the same run
+    whether a web job or an agent ran it.
     """
 
     known: dict[str, Any] = {}
@@ -678,12 +692,12 @@ class JobManager:
             claimed = outcome.get("receipt_canonical_sha256")
             if internal.job.state == JOB_STATE_SUCCEEDED and internal.result is not None and isinstance(claimed, str):
                 try:
-                    actual = hashlib.sha256(canonical_receipt_bytes(receipt)).hexdigest()
+                    actual = receipt_canonical_sha256(receipt)
                 except (TypeError, ValueError):
                     actual = None
                 # Only a digest that names the stored receipt is recorded.
                 digest = claimed if claimed == actual else None
-        internal.run = _build_run_record(
+        internal.run = build_run_record(
             state=internal.job.state,
             request=internal.request,
             identity=identity,
@@ -1333,8 +1347,7 @@ class JobManager:
         detail = result.detail if isinstance(result.detail, dict) else {}
         trace = detail.get("trace")
         legacy_receipt = result.legacy_receipt if isinstance(result.legacy_receipt, dict) else {}
-        receipt_bytes = canonical_receipt_bytes(legacy_receipt)
-        receipt_digest = hashlib.sha256(receipt_bytes).hexdigest()
+        receipt_digest = receipt_canonical_sha256(legacy_receipt)
         outcome = {
             "ok": True,
             "result_ref": f"backtest:{correlation_id}:{job_id}",
