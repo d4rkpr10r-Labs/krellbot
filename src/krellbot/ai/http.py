@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Iterator
 from typing import Protocol
@@ -65,12 +66,23 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 # Tests inject fake handlers here (placed first) to prove behaviour without sockets.
 _TEST_HANDLERS: tuple = ()
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _is_loopback(url: str) -> bool:
+    try:
+        return urllib.parse.urlsplit(url).hostname in _LOOPBACK_HOSTS
+    except ValueError:
+        return False
+
 
 def _open(req: urllib.request.Request, timeout: float):
-    opener = urllib.request.build_opener(
-        *_TEST_HANDLERS, _NoRedirect, urllib.request.HTTPSHandler(context=ssl_context())
-    )
-    return opener.open(req, timeout=timeout)
+    handlers: list = [*_TEST_HANDLERS, _NoRedirect, urllib.request.HTTPSHandler(context=ssl_context())]
+    if _is_loopback(req.full_url):
+        # A local model is reached directly. An environment or system proxy would otherwise
+        # receive plain-http requests, credential header included.
+        handlers.append(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(*handlers).open(req, timeout=timeout)
 
 
 class UrllibTransport:
