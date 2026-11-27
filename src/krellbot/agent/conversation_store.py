@@ -87,8 +87,11 @@ class ConversationStore:
     def _connection(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            if self.path.exists() and self.path.read_bytes()[:16] not in {b"", _SQLITE_HEADER}:
-                raise StoreCorrupt("database header is not sqlite")
+            if self.path.exists():
+                with open(self.path, "rb") as handle:
+                    header = handle.read(16)
+                if header not in {b"", _SQLITE_HEADER}:
+                    raise StoreCorrupt("database header is not sqlite")
             try:
                 os.close(os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600))
                 conn = sqlite3.connect(self.path, isolation_level=None, timeout=5.0)

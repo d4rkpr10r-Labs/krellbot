@@ -102,6 +102,17 @@ def test_month_rollover_resets_month_usage(home):
     assert store.month_tokens(now=_ts(2027, 1, 1)) == 0
 
 
+def test_clearing_cannot_get_past_the_monthly_ceiling(home):
+    store = ConversationStore(home)
+    now = _ts(2026, 11, 20)
+    store.record_usage(600, 400, ts=now)
+    store.clear()
+    state = budget.check(store, _limits(conversation=5000, month=1000), now=now)
+    assert state.exhausted is True
+    assert state.reason == "month"
+    assert state.conversation_used == 0
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
 def test_store_file_is_private_to_the_user(home):
     old = os.umask(0o022)
@@ -109,10 +120,12 @@ def test_store_file_is_private_to_the_user(home):
         store = ConversationStore(home)
         store.append("user", {"text": "x"})
         store.record_usage(1, 1, ts=1)
+        # Hold a connection open so the WAL side files exist while we look.
+        with store._connection() as conn:
+            conn.execute("INSERT INTO messages (role, payload, ts) VALUES ('user', '{}', 1)")
+            for name in ("krell.sqlite", "krell.sqlite-wal", "krell.sqlite-shm"):
+                path = home / name
+                assert path.exists(), name
+                assert stat.S_IMODE(path.stat().st_mode) == 0o600, name
     finally:
         os.umask(old)
-    assert (home / "krell.sqlite").exists()
-    for name in ("krell.sqlite", "krell.sqlite-wal", "krell.sqlite-shm"):
-        path = home / name
-        if path.exists():
-            assert stat.S_IMODE(path.stat().st_mode) == 0o600, name
