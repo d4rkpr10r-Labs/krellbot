@@ -29,6 +29,7 @@ from krellbot import config as kb_config
 from krellbot import run as kb_run
 from krellbot.agent import arm_registry
 from krellbot.agent.actors import KRELL, Actor
+from krellbot.agent.confirm import CODE_CONFIRM_REQUIRED, ConfirmLedger
 from krellbot.agent.core import MAX_PACK_BYTES, MESSAGE_PACK_UNREADABLE, AgentToolCore, ToolSpec
 from krellbot.api.app import CSRF_HEADER, SESSION_COOKIE
 from krellbot.application import paper as paper_app
@@ -98,6 +99,31 @@ def _agent_arm(
     if loss is not None:
         params["daily_loss_limit_pct"] = loss
     return AgentToolCore(home).call(actor, "paper_arm", params)
+
+
+def _confirming_core(home: Path) -> AgentToolCore:
+    """A core with the engine's confirm ledger, so a Krell change can run once a human confirms it."""
+    return AgentToolCore(home, confirm=ConfirmLedger(clock=time.time))
+
+
+def _krell_confirmed(core: AgentToolCore, tool: str, params: dict) -> dict:
+    """A Krell change as the human confirms it: ``needs_confirm`` first, then the same call with its ticket."""
+    asked = core.call(KRELL, tool, params)
+    assert asked["effect"] == "needs_confirm", asked
+    assert asked["code"] == CODE_CONFIRM_REQUIRED
+    return core.call(KRELL, tool, params, confirm_token=asked["confirm"]["ticket_id"])
+
+
+def _krell_arm(home: Path, pack: Path) -> dict:
+    """``_agent_arm`` for Krell, confirmed by the human."""
+    params = {
+        "pack_path": str(pack),
+        "venue": "kraken",
+        "mode": "paper",
+        "paper_balance": "1000",
+        "daily_loss_limit_pct": "5",
+    }
+    return _krell_confirmed(_confirming_core(home), "paper_arm", params)
 
 
 def _human_arm(home: Path, pack: Path) -> None:
@@ -495,13 +521,13 @@ def test_agent_arm_with_a_daily_loss_limit_sets_it_on_the_armed_record(home: Pat
     if os.name != "nt":
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
-    # Krell arming a validated draft revision records the revision.
-    core = AgentToolCore(home)
+    # Krell arming a validated draft revision (confirmed by the human) records the revision.
+    core = _confirming_core(home)
     draft = core.call(KRELL, "draft", {"pack": json.loads(_pack(home, pair="BTCUSD").read_text(encoding="utf-8"))})
     revision_id = draft["result"]["revision_id"]
     assert core.call(KRELL, "validate", {"revision_id": revision_id})["ok"] is True
-    armed_by_krell = core.call(
-        KRELL,
+    armed_by_krell = _krell_confirmed(
+        core,
         "paper_arm",
         {"revision_id": revision_id, "venue": "kraken", "paper_balance": 500, "daily_loss_limit_pct": 100},
     )
@@ -695,7 +721,7 @@ def test_a_refused_twin_arm_never_undoes_the_other_calls_arm(home: Path, monkeyp
     def arm_while_a_twin_arms(self, *args, **kwargs):
         if not twin:
             twin.append({})
-            twin[0] = _agent_arm(home, pack, actor=KRELL)
+            twin[0] = _krell_arm(home, pack)
         return real_arm(self, *args, **kwargs)
 
     monkeypatch.setattr(PaperService, "arm", arm_while_a_twin_arms)
@@ -720,7 +746,7 @@ def test_two_agent_arms_that_both_passed_the_count_cannot_exceed_the_limit(home:
         # writes, a second agent passes the same pre-check and arms first.
         if not racing:
             racing.append({})
-            racing[0] = _agent_arm(home, _pack(home, pair="BTCUSD"), actor=KRELL)
+            racing[0] = _krell_arm(home, _pack(home, pair="BTCUSD"))
         return real_arm(self, *args, **kwargs)
 
     monkeypatch.setattr(PaperService, "arm", arm_while_another_agent_arms)
@@ -944,7 +970,7 @@ def test_a_failure_inside_the_arm_after_the_write_is_undone(home: Path, monkeypa
     # Marking the draft deployed raises after a revision arm: undone the same way.
     monkeypatch.setattr(paper_app, "_apply_loss_limit_to_new_arm", real_apply)
     monkeypatch.setattr(paper_app, "_drop_new_arm", real_drop)
-    core = AgentToolCore(home)
+    core = _confirming_core(home)
     draft = core.call(KRELL, "draft", {"pack": json.loads(_pack(home, pair="BTCUSD").read_text(encoding="utf-8"))})
     revision_id = draft["result"]["revision_id"]
     assert core.call(KRELL, "validate", {"revision_id": revision_id})["ok"] is True
@@ -953,8 +979,8 @@ def test_a_failure_inside_the_arm_after_the_write_is_undone(home: Path, monkeypa
         raise OSError("drafts are read-only")
 
     monkeypatch.setattr(StrategyDraftService, "mark_deployed", mark_fails)
-    result = core.call(
-        KRELL,
+    result = _krell_confirmed(
+        core,
         "paper_arm",
         {"revision_id": revision_id, "venue": "kraken", "paper_balance": "1000", "daily_loss_limit_pct": "5"},
     )
@@ -973,7 +999,7 @@ def test_change_tools_follow_the_per_actor_allow_flags(home: Path):
         ran.append((ctx.actor.label, params["tool"]))
         return {"schema_version": "1", "ok": True, "effect": "changed", "tool": params["tool"]}
 
-    core = AgentToolCore(home)
+    core = _confirming_core(home)
     for name in CHANGE_TOOLS:
         core.register(
             ToolSpec(
@@ -987,9 +1013,9 @@ def test_change_tools_follow_the_per_actor_allow_flags(home: Path):
             )
         )
 
-    # Defaults: Krell may pause, resume and disarm; external agents may not.
+    # Defaults: Krell may pause, resume and disarm (once a human confirms); external agents may not.
     for name in CHANGE_TOOLS:
-        assert core.call(KRELL, name, {"tool": name})["ok"] is True
+        assert _krell_confirmed(core, name, {"tool": name})["ok"] is True
         refused = core.call(MCP, name, {"tool": name})
         assert refused["ok"] is False
         assert refused["code"] == CODE_AGENT_CHANGE_NOT_ALLOWED
