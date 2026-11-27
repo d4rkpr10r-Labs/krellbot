@@ -13,6 +13,7 @@ import { AboutPanel } from "../../shell/AboutPanel";
 import type { View } from "../../shell/Navigation";
 import { ReconnectQr } from "../../shell/ReconnectQr";
 import type { SettingsSection } from "../../shell/route";
+import { AiModelSection } from "./AiModelSection";
 import { DemoFixturePanel } from "../demo/DemoFixturePanel";
 import { DiagnosticReport } from "../diagnostics/DiagnosticReport";
 import { KeysOnboardingPanel } from "../keys/KeysOnboardingPanel";
@@ -79,6 +80,11 @@ export const SETTINGS_NAV_ITEMS: ReadonlyArray<SectionMeta> = [
     id: "keys",
     label: "Exchange keys",
     shortNote: "Local OS keyring",
+  },
+  {
+    id: "ai",
+    label: "AI model",
+    shortNote: "Your model for Krell",
   },
   {
     id: "safety",
@@ -418,6 +424,9 @@ export function SettingsView({
             </div>
           </section>
         );
+
+      case "ai":
+        return <AiModelSection />;
 
       case "safety":
         return (
