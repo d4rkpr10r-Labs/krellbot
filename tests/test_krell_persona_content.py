@@ -85,3 +85,24 @@ def test_tour_has_the_seven_steps_in_order_and_no_return_claims():
         assert 3 <= len(step.facts) <= 6, step.id
         for fact in step.facts:
             assert not bad.search(fact), fact
+
+
+def test_mcp_prompt_says_the_client_approves_calls_and_claims_no_krellbot_confirmations():
+    prompt = _prompts()["mcp"].lower()
+    # MCP agents get no Krellbot confirm cards; their client's own approval is the human check.
+    assert "confirm" not in prompt
+    assert "hard limits" in prompt
+    assert "approval" in prompt
+
+
+def test_mode_texts_and_opening_text_are_the_texts_the_mode_prompts_use():
+    modes = persona.mode_texts()
+    assert set(modes) == {"standard", "advanced"}
+    assert modes["standard"] in _prompts()["standard"]
+    assert modes["advanced"] in _prompts()["advanced"]
+    assert modes["standard"] not in _prompts()["advanced"]
+    opening = persona.opening_text()
+    assert opening in persona.system_prompt(mode=None, profile={}, surface="workstation")
+    assert persona.OPENING_LINE in opening
+    assert persona.MODE_QUESTION in opening
+    assert "Do not suggest anything until they answer." in opening
