@@ -342,3 +342,44 @@ test("panel becomes a full-screen sheet at phone width", async ({ journey }) => 
   await expect(ask).toBeFocused();
   journey.assertGuards();
 });
+
+test("the phone header keeps Ask Krell and Search on the brand row with room to spare", async ({ journey }) => {
+  const { page } = journey;
+  await page.setViewportSize({ width: 360, height: 780 });
+  await page.goto(journey.workstation.baseURL);
+  await journey.waitForSessionReady(page);
+
+  // Measure only once the bundled fonts are in, so text metrics are final.
+  const measure = () =>
+    page.evaluate(async () => {
+      await document.fonts.ready;
+      const box = (selector: string) => {
+        const rect = document.querySelector<HTMLElement>(selector)?.getBoundingClientRect();
+        return rect ? { x: rect.x, y: rect.y, right: rect.right, height: rect.height } : null;
+      };
+      const bar = document.querySelector<HTMLElement>(".kbot-shell__brandbar");
+      return {
+        header: box(".kbot-shell__header"),
+        brand: box('[data-testid="kbot-shell-brand"]'),
+        jobs: box(".kbot-jobs__trigger"),
+        ask: box('[data-testid="ask-krell"]'),
+        search: box('[data-testid="kbot-shell-palette-hint"]'),
+        gap: bar ? parseFloat(getComputedStyle(bar).columnGap) || 0 : 0,
+      };
+    });
+
+  const narrow = await measure();
+  expect(Math.abs(narrow.ask!.y - narrow.brand!.y)).toBeLessThanOrEqual(2);
+  expect(Math.abs(narrow.search!.y - narrow.brand!.y)).toBeLessThanOrEqual(2);
+  expect(narrow.header!.height).toBeLessThanOrEqual(180);
+  expect(narrow.ask!.height).toBeGreaterThanOrEqual(44);
+  expect(narrow.search!.height).toBeGreaterThanOrEqual(44);
+
+  // At 390px the brand row has real slack, not a few pixels of text metrics:
+  // the free space is what the brand's auto margin absorbs before Jobs.
+  await page.setViewportSize({ width: 390, height: 844 });
+  const phone = await measure();
+  expect(Math.abs(phone.search!.y - phone.brand!.y)).toBeLessThanOrEqual(2);
+  expect(phone.jobs!.x - phone.brand!.right - phone.gap).toBeGreaterThanOrEqual(40);
+  journey.assertGuards();
+});
