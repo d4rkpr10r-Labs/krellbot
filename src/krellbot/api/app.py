@@ -7,8 +7,13 @@ import contextlib
 import hmac
 import ipaddress
 import json
+import os
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+import sysconfig
 import threading
 import time
 import urllib.error
@@ -444,6 +449,77 @@ def _scheduler_executable(s: _AppState) -> str:
     if s.scheduler_executable:
         return s.scheduler_executable
     return sys.executable
+
+
+def _mcp_launch() -> tuple[str, list[str]]:
+    """How an MCP client starts ``krellbot mcp`` on this computer.
+
+    A frozen build runs its own executable. A source install runs the
+    ``krellbot`` script installed beside this interpreter, so the client runs
+    the same install as the engine; else the ``krellbot`` script on PATH;
+    else this interpreter with the CLI module.
+    """
+
+    if getattr(sys, "frozen", False):
+        return sys.executable, ["mcp"]
+    script = _interpreter_krellbot_script() or shutil.which("krellbot")
+    if script:
+        return os.path.abspath(script), ["mcp"]
+    return sys.executable, ["-m", "krellbot.cli", "mcp"]
+
+
+def _interpreter_krellbot_script() -> str | None:
+    """The ``krellbot`` script in the running interpreter's scripts folder, if installed there."""
+
+    scripts = sysconfig.get_path("scripts")
+    if not scripts:
+        return None
+    script = os.path.join(scripts, "krellbot.exe" if sys.platform == "win32" else "krellbot")
+    return script if os.path.isfile(script) else None
+
+
+def _windows_quoted(value: str) -> str:
+    """``value`` always in double quotes, escaped the way Windows programs split their arguments.
+
+    ``subprocess.list2cmdline`` quotes only on whitespace, which leaves ``&``
+    and the like bare for cmd to act on. A backslash run before a quote, or at
+    the end, is doubled so it stays literal.
+    """
+
+    out: list[str] = []
+    backslashes = 0
+    for char in value:
+        if char == "\\":
+            backslashes += 1
+            continue
+        if char == '"':
+            out.append("\\" * (backslashes * 2 + 1) + '"')
+        else:
+            out.append("\\" * backslashes + char)
+        backslashes = 0
+    out.append("\\" * (backslashes * 2))
+    return '"' + "".join(out) + '"'
+
+
+def _claude_code_line(command: str, args: list[str], home: str, *, windows: bool) -> str:
+    """The ``claude mcp add`` line, quoted for this computer's shell so it survives a paste.
+
+    On Windows the command and the ``--env`` value are always double-quoted;
+    elsewhere ``shlex`` quotes only what needs it.
+    """
+
+    env = f"KRELLBOT_HOME={home}"
+    if not windows:
+        return shlex.join(["claude", "mcp", "add", "krellbot", "--env", env, "--", command, *args])
+    return " ".join(
+        [
+            "claude mcp add krellbot --env",
+            _windows_quoted(env),
+            "--",
+            _windows_quoted(command),
+            *([subprocess.list2cmdline(args)] if args else []),
+        ]
+    )
 
 
 def _stored_deployment_mode(home: Path) -> str | None:
@@ -5396,28 +5472,43 @@ def create_app(
 
     @app.get("/api/v1/user-policy")
     async def get_user_policy(request: Request) -> Response:
-        """Return the operator user-policy snapshot (defaults if missing)."""
+        """Return the operator user-policy snapshot (defaults if missing).
+
+        An invalid file reads as the fail-closed snapshot the engine enforces,
+        with ``code`` ``user_policy_invalid`` and the engine's message, so the
+        editor never shows that snapshot as the operator's choice. ``digest``
+        names the exact file bytes the snapshot came from (``absent`` for no
+        file); an editor sends it back as ``expected_digest`` when it saves.
+        """
 
         s = _state(request.app)
         denied = _gate_get(request, s)
         if denied is not None:
             return denied
-        policy = user_policy_app.load_policy(s.home)
-        return JSONResponse(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "ok": True,
-                "effect": "unchanged",
-                "policy": policy.to_dict(),
-                "path": user_policy_app.POLICY_FILENAME,
-            },
-            status_code=200,
-            headers={"Cache-Control": "no-store"},
-        )
+        # One read of the file, so the snapshot and its digest always match.
+        read = user_policy_app.read_policy(s.home)
+        out: dict = {
+            "schema_version": SCHEMA_VERSION,
+            "ok": True,
+            "effect": "unchanged",
+            "code": user_policy_app.CODE_POLICY_INVALID if read.invalid else user_policy_app.CODE_OK,
+            "policy": read.policy.to_dict(),
+            "path": user_policy_app.POLICY_FILENAME,
+            "digest": read.digest,
+        }
+        if read.invalid:
+            out["message"] = user_policy_app.MESSAGE_INVALID
+        return JSONResponse(out, status_code=200, headers={"Cache-Control": "no-store"})
 
     @app.put("/api/v1/user-policy")
     async def put_user_policy(request: Request) -> Response:
-        """Replace the operator user-policy file; audits the change."""
+        """Replace the operator user-policy file; audits the change.
+
+        With ``expected_digest`` (the ``digest`` a GET returned), the save is
+        refused with 409 ``user_policy_changed``, and nothing is written, if
+        the file changed since that read; a successful save then also returns
+        the new file's ``digest``. Without it, the file is replaced as before.
+        """
 
         s = _state(request.app)
         denied = _gate_state_change(request, s)
@@ -5429,10 +5520,24 @@ def create_app(
             return JSONResponse({"detail": "invalid body"}, status_code=400)
         if not isinstance(payload, dict):
             return JSONResponse({"detail": "invalid body"}, status_code=400)
-        body = payload.get("policy", payload)
+        has_digest = "expected_digest" in payload
+        expected_digest = payload.get("expected_digest")
+        if has_digest and not isinstance(expected_digest, str):
+            return JSONResponse({"detail": "invalid body"}, status_code=400)
+        if "policy" in payload:
+            body = payload["policy"]
+        elif has_digest:
+            # An unwrapped policy carries the digest beside its own fields.
+            body = {key: value for key, value in payload.items() if key != "expected_digest"}
+        else:
+            body = payload
         now = _app_now(s)
-        result = user_policy_app.save_policy(s.home, body, clock=lambda: now)
-        status = 200 if result.ok else 400
+        # No await between the digest check and the write: no other request runs in between.
+        result = user_policy_app.save_policy(s.home, body, clock=lambda: now, expected_digest=expected_digest)
+        if result.code == user_policy_app.CODE_POLICY_CHANGED:
+            status = 409
+        else:
+            status = 200 if result.ok else 400
         out: dict = {
             "schema_version": SCHEMA_VERSION,
             "ok": result.ok,
@@ -5444,7 +5549,40 @@ def create_app(
         }
         if result.policy is not None:
             out["policy"] = result.policy.to_dict()
+        if has_digest and result.digest is not None:
+            out["digest"] = result.digest
         return JSONResponse(out, status_code=status, headers={"Cache-Control": "no-store"})
+
+    # ---- MCP client setup (M38.10) --------------------------------------
+
+    @app.get("/api/v1/agents/mcp-setup")
+    async def get_mcp_setup(request: Request) -> Response:
+        """How an MCP client launches ``krellbot mcp`` here, for the setup snippets.
+
+        Only the command, its args and ``KRELLBOT_HOME``; ``claude_code`` is
+        the Claude Code line built from them, quoted for this computer's shell.
+        """
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+        command, args = _mcp_launch()
+        home = str(s.home.absolute())
+        claude_code = _claude_code_line(command, args, home, windows=sys.platform == "win32")
+        return JSONResponse(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "ok": True,
+                "effect": "unchanged",
+                "command": command,
+                "args": args,
+                "env": {"KRELLBOT_HOME": home},
+                "claude_code": claude_code,
+            },
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
 
     # ---- strategy drafts (NS08a) --------------------------------------
 

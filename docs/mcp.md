@@ -35,8 +35,20 @@ Each client starts the server itself with `krellbot mcp`. If `krellbot` is
 not on the client's `PATH`, use the full path to the installed `krellbot`
 executable. The server uses `$KRELLBOT_HOME` (default `~/.krellbot`); to
 point it at another home, add `"env": {"KRELLBOT_HOME": "/path/to/home"}`
-to the server entry. Where each config file lives is the client's own
+to the server entry (for Claude Code, `--env KRELLBOT_HOME=/path/to/home`
+before the `--`). Where each config file lives is the client's own
 documentation to confirm.
+
+**Settings → Agents & limits** in the workstation shows these snippets
+filled in for this computer, ready to copy: the full launch command
+(`GET /api/v1/agents/mcp-setup`) and the workstation's own
+`KRELLBOT_HOME`, with the Claude Code line quoted for this computer's
+shell. The launch command is the frozen build's own executable, else the
+`krellbot` script installed beside the engine's Python interpreter (so the
+client runs the same install as the engine), else the `krellbot` script on
+`PATH`, else the Python interpreter with `-m krellbot.cli mcp`. On Windows
+the Claude Code line always double-quotes the command and the `--env`
+value; PowerShell still expands `$` and backticks inside double quotes.
 
 **Claude Desktop** (`claude_desktop_config.json`):
 
@@ -52,6 +64,8 @@ documentation to confirm.
 
 ```sh
 claude mcp add krellbot -- krellbot mcp
+# with another home:
+claude mcp add krellbot --env KRELLBOT_HOME=/path/to/home -- krellbot mcp
 ```
 
 **Cursor** (`.cursor/mcp.json` in a project, or `~/.cursor/mcp.json`):
@@ -147,7 +161,12 @@ pairs, a maximum paper balance (10,000) and risk cap (2%), a required
 daily-loss limit, at most 3 agent arms at once, and per-actor flags for
 pause/resume and disarm (off for external MCP agents by default). Over a
 limit, a call is refused with an `agent_limit_*` or
-`agent_change_not_allowed` code and journaled.
+`agent_change_not_allowed` code and journaled. Edit the limits in
+Settings → Agents & limits; an invalid policy file locks that form until
+you reset it to the default limits. If the file changes while that page is
+open (for example, you edit it by hand), the page's save and reset are
+refused (`user_policy_changed`) until you reload it, so an old page never
+writes over a newer policy.
 
 ## Cursor client
 
