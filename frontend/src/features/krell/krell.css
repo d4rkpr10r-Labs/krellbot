@@ -411,6 +411,19 @@
   color: var(--muted);
 }
 
+.kbot-krell__plan-limit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-tight);
+}
+
+/* A provider error's request id, for support: kept with the stored notice. */
+.kbot-krell__request-id {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
 /* Manage usage is a link styled as the state's action button. */
 .kbot-krell a.kbot-krell__go,
 .kbot-krell a.kbot-krell__btn {

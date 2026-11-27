@@ -21,8 +21,11 @@
  * not probed, and the form explains the API-key alternative. The first
  * plan-enabled sign-in of a connection shows "You're using your ChatGPT
  * plan" once; the engine remembers that it was shown. With `reauth`, the form
- * signs an existing ChatGPT connection in again. The button is a text label:
- * no OpenAI logo asset ships with Krellbot (owner branding review).
+ * signs an existing ChatGPT connection in again. Saved ChatGPT accounts with
+ * no connection are offered as "Continue as <email>", which reuses that
+ * account's registration; "Use a different ChatGPT account" registers anew.
+ * The buttons are text labels: no OpenAI logo asset ships with Krellbot
+ * (owner branding review).
  */
 import { useEffect, useId, useRef, useState, type JSX } from "react";
 import {
@@ -346,7 +349,7 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
     }
   }
 
-  async function startSignin(kind: SigninKind): Promise<void> {
+  async function startSignin(kind: SigninKind, account?: string): Promise<void> {
     if ((!provider && !reauth) || busy || signin) return;
     setBusy(true);
     setError(null);
@@ -356,7 +359,7 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
       const started =
         kind === "chatgpt"
           ? await startChatgptSignin(
-              reauth ? { connectionId: reauth.id } : { model: model.trim() },
+              reauth ? { connectionId: reauth.id } : { model: model.trim(), account },
             )
           : await startOpenRouterSignin(model.trim());
       if (!started.ok) {
@@ -462,7 +465,6 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
     <div
       className="kbot-settings__welcome"
       role="dialog"
-      aria-modal="true"
       aria-labelledby={`${ids}-welcome-title`}
       data-testid="ai-chatgpt-welcome"
     >
@@ -589,6 +591,7 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
   const keyOptional = provider.credential === "optional";
   const offersSignin = provider.signin === "openrouter";
   const offersChatgpt = provider.signin === "chatgpt";
+  const savedAccounts = offersChatgpt ? provider.chatgptAccounts : [];
 
   if (welcomeDialog) {
     return <div className="kbot-settings__card">{welcomeDialog}</div>;
@@ -747,6 +750,18 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
             Sign in with OpenRouter
           </button>
         ) : null}
+        {savedAccounts.map((account) => (
+          <button
+            key={account.id}
+            type="button"
+            className="kbot-settings__btn"
+            data-oai-siwc-button=""
+            onClick={() => void startSignin("chatgpt", account.id)}
+            disabled={locked || unavailable.chatgpt !== undefined}
+          >
+            Continue as {account.email ?? "your saved ChatGPT account"}
+          </button>
+        ))}
         {offersChatgpt ? (
           <button
             type="button"
@@ -755,7 +770,7 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
             onClick={() => void startSignin("chatgpt")}
             disabled={locked || unavailable.chatgpt !== undefined}
           >
-            Continue with ChatGPT
+            {savedAccounts.length > 0 ? "Use a different ChatGPT account" : "Continue with ChatGPT"}
           </button>
         ) : null}
         {onCancel ? (

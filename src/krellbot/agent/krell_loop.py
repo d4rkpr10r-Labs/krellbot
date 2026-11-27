@@ -412,10 +412,15 @@ def _connection_view(conn: Connection) -> dict:
     return {"id": conn.id, "label": conn.label, "host": provider_host(conn.base_url), "model": conn.model}
 
 
-def _provider_diagnostics(failure: ProviderError) -> dict:
-    """Machine-readable facts a provider error kept (status, code, param, request id), for the live error event.
+MAX_PROVIDER_DETAIL_CHARS = 300
 
-    Never the provider's body text, which is diagnostic only.
+
+def _provider_diagnostics(failure: ProviderError) -> dict:
+    """What a provider error kept: ``provider`` (status, code, param, request id) for the event and the
+    stored notice, and ``stored`` (a short body excerpt) for the stored notice only.
+
+    The body is diagnostic text from the provider: never the message, never
+    on the live event. A provider error body never carries Krellbot's tokens.
     """
     facts = {
         "status": failure.status,
@@ -424,7 +429,12 @@ def _provider_diagnostics(failure: ProviderError) -> dict:
         "request_id": failure.request_id,
     }
     kept = {key: value for key, value in facts.items() if value is not None}
-    return {"provider": kept} if kept else {}
+    if not kept:
+        return {}
+    out: dict[str, Any] = {"provider": kept}
+    if failure.detail:
+        out["stored"] = {"detail": failure.detail[:MAX_PROVIDER_DETAIL_CHARS]}
+    return out
 
 
 def _call_record(call: ToolCall) -> dict:
@@ -876,9 +886,18 @@ class KrellLoop:
         yield self._budget_event()
 
     def _fail(self, code: str, message: str | None, **extra: Any) -> Iterator[dict]:
-        """End a turn with a typed error, kept in the conversation so a reload shows it."""
+        """End a turn with a typed error, kept in the conversation so a reload shows it.
+
+        A provider error's diagnostics (status, code, param, request id, and a
+        short excerpt of the body) are kept with it, so the request id survives
+        a reload. The excerpt is stored only, never shown as the message.
+        """
+        stored_extra = extra.pop("stored", {})
         event = error_event(code, message, **extra)
-        self._store.append("notice", {"kind": "error", "code": code, "message": event["message"]})
+        payload: dict[str, Any] = {"kind": "error", "code": code, "message": event["message"]}
+        if "provider" in extra:
+            payload["provider"] = {**extra["provider"], **stored_extra}
+        self._store.append("notice", payload)
         yield event
 
     def _connection(self) -> Connection | dict:

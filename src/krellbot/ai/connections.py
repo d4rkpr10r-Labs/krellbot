@@ -10,6 +10,9 @@ that shape before it reaches a path or the keychain.
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -108,6 +111,7 @@ REFUSAL_MESSAGES: dict[str, str] = {
         "ai/chatgpt.json in the Krellbot home folder."
     ),
     "ai_chatgpt_not_chatgpt": "That connection is not a ChatGPT sign-in.",
+    "ai_chatgpt_account_unknown": "That saved ChatGPT account is no longer known. Choose Continue with ChatGPT.",
 }
 
 
@@ -203,6 +207,109 @@ def _service(conn_id: str) -> str:
     return KEYRING_SERVICE_PREFIX + conn_id
 
 
+# ---- chunked keychain values ----------------------------------------------------------
+#
+# Windows Credential Manager holds at most 2560 bytes (1280 UTF-16 characters)
+# per secret, and a sign-in's credential record carries two JWTs and a refresh
+# token. A value longer than _CHUNK_CHARS is stored in pieces under the SAME
+# service: ``credential.<generation>.<i>`` hold the pieces and ``credential``
+# holds a header naming the generation, the count and a SHA-256 of the whole.
+# Pieces are written first and the header last; the previous generation's
+# pieces are deleted only after the new value reads back whole. A reader so
+# sees the old value or the new one, never a mix, and a short value (an API
+# key) stays one plain ``credential`` entry, exactly as before.
+
+_CHUNK_CHARS = 1000
+_MAX_CHUNKS = 128
+_CHUNK_HEADER_RE = re.compile(r"krellbot-chunked-v1:([0-9a-f]{8}):([1-9][0-9]{0,2}):([0-9a-f]{64})")
+
+
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _parse_chunk_header(value: object) -> tuple[str, int, str] | None:
+    match = _CHUNK_HEADER_RE.fullmatch(value) if isinstance(value, str) else None
+    if match is None or int(match.group(2)) > _MAX_CHUNKS:
+        return None
+    return match.group(1), int(match.group(2)), match.group(3)
+
+
+def _chunk_names(header: tuple[str, int, str] | None) -> list[str]:
+    if header is None:
+        return []
+    generation, count, _digest_hex = header
+    return [f"{KEYRING_USERNAME}.{generation}.{index}" for index in range(1, count + 1)]
+
+
+def _read_secret(backend: object, service: str) -> str | None:
+    """A plain entry, or its chunks joined and verified. Missing or mismatched chunks read as None."""
+
+    value = backend.get_password(service, KEYRING_USERNAME)  # type: ignore[attr-defined]
+    header = _parse_chunk_header(value)
+    if header is None:
+        return value
+    parts = []
+    for name in _chunk_names(header):
+        part = backend.get_password(service, name)  # type: ignore[attr-defined]
+        if not isinstance(part, str):
+            return None
+        parts.append(part)
+    whole = "".join(parts)
+    return whole if hmac.compare_digest(_digest(whole), header[2]) else None
+
+
+def _write_secret(backend: object, service: str, secret: str, previous: str | None) -> None:
+    """Write ``secret`` (chunked when long), header last. Raises on any backend failure, cleaning up its pieces."""
+
+    if len(secret) <= _CHUNK_CHARS and _parse_chunk_header(secret) is None:
+        backend.set_password(service, KEYRING_USERNAME, secret)  # type: ignore[attr-defined]
+        return
+    pieces = [secret[i : i + _CHUNK_CHARS] for i in range(0, len(secret), _CHUNK_CHARS)]
+    if len(pieces) > _MAX_CHUNKS:
+        raise ValueError("value too long")
+    old = _parse_chunk_header(previous)
+    generation = stdlib_secrets.token_hex(4)
+    while old is not None and generation == old[0]:
+        generation = stdlib_secrets.token_hex(4)
+    header = (generation, len(pieces), _digest(secret))
+    names = _chunk_names(header)
+    try:
+        for name, piece in zip(names, pieces, strict=True):
+            backend.set_password(service, name, piece)  # type: ignore[attr-defined]
+        backend.set_password(service, KEYRING_USERNAME, f"krellbot-chunked-v1:{generation}:{len(pieces)}:{header[2]}")  # type: ignore[attr-defined]
+    except BaseException:
+        _delete_names(backend, service, names)
+        raise
+
+
+def _delete_names(backend: object, service: str, names: list[str]) -> None:
+    for name in names:
+        with contextlib.suppress(Exception):  # best effort; a stale piece is unreadable without its header
+            backend.delete_password(service, name)  # type: ignore[attr-defined]
+
+
+def _delete_chunks(backend: object, service: str, header_value: str | None) -> None:
+    """Delete the pieces a (previous) header names. Best effort."""
+
+    _delete_names(backend, service, _chunk_names(_parse_chunk_header(header_value)))
+
+
+def _restore_secret(backend: object, service: str, previous: str | None) -> None:
+    """Put a replacement back as it was: the previous header (its pieces were never touched), or nothing."""
+
+    current = None
+    with contextlib.suppress(Exception):
+        current = backend.get_password(service, KEYRING_USERNAME)  # type: ignore[attr-defined]
+    with contextlib.suppress(Exception):
+        if previous is None:
+            backend.delete_password(service, KEYRING_USERNAME)  # type: ignore[attr-defined]
+        else:
+            backend.set_password(service, KEYRING_USERNAME, previous)  # type: ignore[attr-defined]
+    if current != previous:
+        _delete_chunks(backend, service, current)
+
+
 def keychain_is_safe(backend: object, *, allow_injected_fake_backend: bool = False) -> bool:
     """The exchange-key allow-list: a native OS keychain, verified by class identity.
 
@@ -275,9 +382,14 @@ class ConnectionStore:
         return found
 
     def credential(self, conn_id: str) -> str | None:
+        """The stored value: a single entry, or chunks reassembled and checked against their digest.
+
+        Chunks that are missing or do not match the digest read as no value.
+        """
+
         service = _service(conn_id)
         try:
-            return keyring.get_keyring().get_password(service, KEYRING_USERNAME)
+            return _read_secret(keyring.get_keyring(), service)
         except Exception:  # noqa: BLE001 — backend errors can carry arbitrary text; never surfaced
             raise ConnectionRefused("ai_keychain_unavailable") from None
 
@@ -514,26 +626,47 @@ class ConnectionStore:
         return value
 
     def _store_secret(self, conn_id: str, secret: str, *, keep_on_failure: bool = False) -> None:
-        """Write and read back. A failed new entry is deleted; a failed replacement (``keep_on_failure``) is left."""
+        """Write and read back (chunked when long). A failed new entry is deleted; a failed replacement
+        (``keep_on_failure``) is put back as it was."""
 
         service = _service(conn_id)
         backend = keyring.get_keyring()
         if not keychain_is_safe(backend, allow_injected_fake_backend=self._allow_fake):
             raise ConnectionRefused("ai_keychain_unavailable")
+        previous: str | None = None
+        if keep_on_failure:
+            # A replacement: the value it replaces names the chunks to delete, or to keep on failure.
+            # A new connection's id is fresh, so it has no previous value to read.
+            try:
+                previous = backend.get_password(service, KEYRING_USERNAME)
+            except Exception:  # noqa: BLE001 — backend errors can carry arbitrary text; never surfaced
+                raise ConnectionRefused("ai_keychain_unavailable") from None
         try:
-            backend.set_password(service, KEYRING_USERNAME, secret)
-            stored = backend.get_password(service, KEYRING_USERNAME)
-        except Exception:  # noqa: BLE001 — backend errors can carry arbitrary text; never surfaced
+            _write_secret(backend, service, secret, previous)
+            stored = _read_secret(backend, service)
+        except Exception:  # noqa: BLE001
             stored = None
         if stored != secret:
-            if not keep_on_failure:
+            if keep_on_failure:
+                _restore_secret(backend, service, previous)
+            else:
                 self._forget_secret(conn_id, strict=False)
             raise ConnectionRefused("ai_keychain_unavailable")
+        # Only now that the new value reads back whole: drop the previous generation's chunks.
+        _delete_chunks(backend, service, previous)
 
     @staticmethod
     def _forget_secret(conn_id: str, *, strict: bool) -> None:
+        """Delete the entry and any chunks under its service."""
+
         service = _service(conn_id)
         backend = keyring.get_keyring()
+        try:
+            header = backend.get_password(service, KEYRING_USERNAME)
+        except Exception:  # noqa: BLE001
+            if strict:
+                raise ConnectionRefused("ai_keychain_unavailable") from None
+            header = None
         try:
             backend.delete_password(service, KEYRING_USERNAME)
         except keyring.errors.PasswordDeleteError:
@@ -542,13 +675,22 @@ class ConnectionStore:
             if strict:
                 raise ConnectionRefused("ai_keychain_unavailable") from None
             return
+        chunks = _chunk_names(_parse_chunk_header(header))
+        for name in chunks:
+            try:
+                backend.delete_password(service, name)
+            except keyring.errors.PasswordDeleteError:
+                pass
+            except Exception:  # noqa: BLE001
+                if strict:
+                    raise ConnectionRefused("ai_keychain_unavailable") from None
         if not strict:
             return
         try:
-            leftover = backend.get_password(service, KEYRING_USERNAME)
+            leftovers = [backend.get_password(service, name) for name in (KEYRING_USERNAME, *chunks)]
         except Exception:  # noqa: BLE001
             raise ConnectionRefused("ai_keychain_unavailable") from None
-        if leftover is not None:
+        if any(value is not None for value in leftovers):
             raise ConnectionRefused("ai_keychain_unavailable")
 
     # ---- file -------------------------------------------------------------

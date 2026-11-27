@@ -20,6 +20,11 @@
  * conversation read, a mode press whose stream ended with no error (after an
  * error, a re-read), or a `set_profile` result that ran. Krell's words alone
  * never change it.
+ *
+ * M38.23: an error item carries the provider's request id when the engine
+ * kept one, live or from the stored notice, so it survives a reload. After a
+ * ChatGPT usage limit, Krell stays paused until the person chooses Try again:
+ * `resumedLimit` is the key of the usage-limit error they resumed from.
  */
 import {
   createContext,
@@ -54,8 +59,8 @@ export type KrellItem =
   | { key: string; kind: "user"; text: string; sending?: boolean }
   | { key: string; kind: "krell"; text: string; question?: string; streaming: boolean }
   | { key: string; kind: "notice"; text: string }
-  /** `callId`: the confirm card whose press this error answered. */
-  | { key: string; kind: "error"; code: string; text: string; callId?: string }
+  /** `callId`: the confirm card whose press this error answered. `requestId`: the provider's, when kept. */
+  | { key: string; kind: "error"; code: string; text: string; callId?: string; requestId?: string }
   /** `ended`: the stream that started the call has ended (with no result, it may or may not have run). */
   | { key: string; kind: "tool"; callId: string; name: string; result: KrellToolResult | null; ended?: boolean }
   | { key: string; kind: "confirm"; callId: string; tool: string; confirm: Record<string, unknown> }
@@ -85,6 +90,10 @@ export type KrellContextValue = {
   clear(): void;
   /** Read the conversation again, e.g. after a model was connected. */
   reload(): void;
+  /** The usage-limit error the person resumed from with Try again; null until then. */
+  resumedLimit: string | null;
+  /** Try again after a ChatGPT usage limit: end the pause that error started. */
+  resumeAfterLimit(key: string): void;
 };
 
 const CODE_NO_MODEL = "krell_no_model";
@@ -100,6 +109,12 @@ function str(value: unknown, fallback = ""): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** The provider's request id from an error's `provider` diagnostics, if it is a plain short string. */
+function requestIdOf(provider: unknown): string | undefined {
+  const id = isRecord(provider) ? provider.request_id : undefined;
+  return typeof id === "string" && id.length > 0 && id.length <= 200 && /^[\x21-\x7e]+$/.test(id) ? id : undefined;
 }
 
 /** A copy without any `ticket_id` or `confirm_ticket` key, at any depth. */
@@ -166,7 +181,8 @@ function itemsFromHistory(messages: KrellStoredMessage[]): KrellItem[] {
       } else if (p.kind === "disclosure") {
         items.push({ key, kind: "notice", text: str(p.text) });
       } else if (p.kind === "error") {
-        items.push({ key, kind: "error", code: str(p.code), text: str(p.message) });
+        const requestId = requestIdOf(p.provider);
+        items.push({ key, kind: "error", code: str(p.code), text: str(p.message), ...(requestId ? { requestId } : {}) });
       } else if (p.kind === "confirm_decision") {
         const tool = str(p.tool);
         const callId = str(p.call_id) || cardOf.get(str(p.ticket_id)) || "";
@@ -276,8 +292,13 @@ function applyEvent(items: KrellItem[], event: KrellEvent, key: string, callId?:
           confirm: withoutTickets(event.confirm),
         },
       ];
-    case "error":
-      return [...settle(items), { key, kind: "error", code: event.code, text: event.message, callId }];
+    case "error": {
+      const requestId = requestIdOf(event.provider);
+      return [
+        ...settle(items),
+        { key, kind: "error", code: event.code, text: event.message, callId, ...(requestId ? { requestId } : {}) },
+      ];
+    }
     case "done":
       return settle(items);
     default:
@@ -297,6 +318,7 @@ type State = {
   messages: KrellItem[];
   pending: boolean;
   draft: string;
+  resumedLimit: string | null;
 };
 
 /** What a conversation read sets. */
@@ -321,7 +343,9 @@ type Action =
   /** Drop the unanswered message (the thread could not be read to check it). */
   | { type: "unsend" }
   /** The mode the engine stored: a mode press's stream ended cleanly, or a re-read said so. */
-  | { type: "mode"; mode: KrellMode | null };
+  | { type: "mode"; mode: KrellMode | null }
+  /** Try again after a ChatGPT usage limit. */
+  | { type: "resume_after_limit"; key: string };
 
 const INITIAL: State = {
   status: "idle",
@@ -333,6 +357,7 @@ const INITIAL: State = {
   messages: [],
   pending: false,
   draft: "",
+  resumedLimit: null,
 };
 
 /**
@@ -405,6 +430,8 @@ function reduce(state: State, action: Action): State {
       return { ...state, messages: state.messages.filter((item) => !isSending(item)) };
     case "mode":
       return { ...state, mode: action.mode };
+    case "resume_after_limit":
+      return { ...state, resumedLimit: action.key };
   }
 }
 
@@ -665,6 +692,10 @@ export function KrellConversationProvider({
     void load();
   }, [load]);
 
+  const resumeAfterLimit = useCallback((key: string): void => {
+    dispatch({ type: "resume_after_limit", key });
+  }, []);
+
   const value = useMemo<KrellContextValue>(
     () => ({
       messages: state.messages,
@@ -681,8 +712,10 @@ export function KrellConversationProvider({
       setMode,
       clear,
       reload,
+      resumedLimit: state.resumedLimit,
+      resumeAfterLimit,
     }),
-    [state, setDraft, send, confirm, setMode, clear, reload],
+    [state, setDraft, send, confirm, setMode, clear, reload, resumeAfterLimit],
   );
 
   return <KrellContext.Provider value={value}>{children}</KrellContext.Provider>;

@@ -16,9 +16,12 @@
  *
  * On a Sign in with ChatGPT connection (M38.23) "Using ChatGPT plan" sits
  * near the composer with a Manage usage link to ChatGPT settings. When the
- * latest turn ended on a ChatGPT usage limit, a compact "Usage limit reached"
- * state takes its place, with Manage usage as its primary action (secondary
- * while a confirm card's Confirm is the conversation's one primary).
+ * latest turn on that connection ended on a ChatGPT usage limit, Krell is
+ * paused: a compact "Usage limit reached" state takes its place with Manage
+ * usage as the conversation's one primary, Send, the quick replies and every
+ * confirm card are disabled (each card says why), and only Try again ends
+ * the pause. Switching to another connection, or signing out, clears it. An
+ * error that kept the provider's request id shows it, after a reload too.
  */
 import { useEffect, useId, useRef, type FormEvent, type JSX } from "react";
 import krellAvatar from "../../assets/character/krell-pfp-160.webp";
@@ -37,34 +40,47 @@ export const CHATGPT_USAGE_URL = "https://chatgpt.com/settings/usage";
 /** The engine's code for a ChatGPT usage-limit error. */
 const CODE_USAGE_LIMIT = "provider_usage_limit";
 
-/** The latest turn ended on a ChatGPT usage limit: no answer or tool call from Krell since that error. */
-function usageLimited(items: KrellItem[]): boolean {
+/** Why a confirm card cannot be answered while Krell is paused. */
+export const PAUSED_CARD_REASON = "Paused: ChatGPT usage limit reached. Choose Try again to answer this card.";
+
+/**
+ * The key of the usage-limit error that pauses Krell, or null: the latest
+ * turn on a ChatGPT-plan connection ended on a usage limit (no answer or tool
+ * call from Krell since that error), and the person has not chosen Try again.
+ */
+function pausingLimit(
+  items: KrellItem[],
+  plan: string | null | undefined,
+  resumed: string | null,
+): string | null {
+  if (plan !== "chatgpt") return null;
   for (let i = items.length - 1; i >= 0; i -= 1) {
     const item = items[i];
-    if (item.kind === "error") return item.code === CODE_USAGE_LIMIT;
-    if (item.kind === "krell" || item.kind === "tool") return false;
+    if (item.kind === "error") return item.code === CODE_USAGE_LIMIT && item.key !== resumed ? item.key : null;
+    if (item.kind === "krell" || item.kind === "tool") return null;
   }
-  return false;
+  return null;
 }
 
-/** "Using ChatGPT plan", or the usage-limit state, near the composer. */
-function ChatgptPlan({ limited, primary }: { limited: boolean; primary: boolean }): JSX.Element {
-  if (limited) {
+/** "Using ChatGPT plan", or, while paused, the usage-limit state, near the composer. */
+function ChatgptPlan({ paused, resume }: { paused: boolean; resume(): void }): JSX.Element {
+  if (paused) {
     return (
       <div className="kbot-krell__plan-limit" role="status" data-testid="krell-usage-limit">
         <p className="kbot-krell__plan-limit-head">ChatGPT</p>
         <p className="kbot-krell__plan-limit-title">Usage limit reached</p>
         <p className="kbot-krell__plan-limit-copy">
-          Review your plan's limit, or Krellbot's, in ChatGPT settings. Krell paused and retried nothing.
+          Review your plan's limit, or Krellbot's, in ChatGPT settings. Krell paused and retried nothing; she
+          sends nothing more until you choose Try again.
         </p>
-        <a
-          className={primary ? "kbot-krell__go" : "kbot-krell__btn"}
-          href={CHATGPT_USAGE_URL}
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Manage usage
-        </a>
+        <div className="kbot-krell__plan-limit-actions">
+          <a className="kbot-krell__go" href={CHATGPT_USAGE_URL} target="_blank" rel="noopener noreferrer">
+            Manage usage
+          </a>
+          <button type="button" className="kbot-krell__btn" onClick={resume}>
+            Try again
+          </button>
+        </div>
       </div>
     );
   }
@@ -107,6 +123,8 @@ type Cards = {
   /** The card whose Confirm is the one sage primary: the newest that can still be pressed. */
   primary: string | null;
   busy: boolean;
+  /** Krell is paused by a ChatGPT usage limit: no card can be answered, and none is the primary. */
+  paused: boolean;
   decide(callId: string, decision: KrellDecision): void;
 };
 
@@ -178,6 +196,12 @@ function KrellRow({ item, avatar, cards }: Row & { cards: Cards }): JSX.Element 
       return (
         <li className="kbot-krell__line kbot-krell__line--error" data-testid="krell-item-error">
           {item.text}
+          {item.requestId ? (
+            <span className="kbot-krell__request-id" data-testid="krell-request-id">
+              {" "}
+              Request ID: {item.requestId}
+            </span>
+          ) : null}
         </li>
       );
     case "tool":
@@ -192,11 +216,16 @@ function KrellRow({ item, avatar, cards }: Row & { cards: Cards }): JSX.Element 
           <ConfirmCard
             request={item.confirm}
             outcome={cards.outcomes.get(item.callId)}
-            busy={cards.busy}
-            primary={item.callId === cards.primary}
+            busy={cards.busy || cards.paused}
+            primary={item.callId === cards.primary && !cards.paused}
             onConfirm={() => cards.decide(item.callId, "confirm")}
             onDecline={() => cards.decide(item.callId, "decline")}
           />
+          {cards.paused && isPressable(cards.outcomes.get(item.callId)) ? (
+            <p className="kbot-krell__line" data-testid="krell-confirm-paused">
+              {PAUSED_CARD_REASON}
+            </p>
+          ) : null}
         </li>
       );
     case "decision":
@@ -238,7 +267,10 @@ export function KrellConversation(): JSX.Element {
     );
   }
 
-  const canSend = !krell.pending && krell.draft.trim() !== "";
+  const limit = pausingLimit(krell.messages, krell.connection?.plan, krell.resumedLimit);
+  const paused = limit !== null;
+  // Paused by a usage limit: nothing is sent until the person chooses Try again.
+  const canSend = !krell.pending && !paused && krell.draft.trim() !== "";
   const submit = (event?: FormEvent): void => {
     event?.preventDefault();
     if (canSend) krell.send(krell.draft);
@@ -248,9 +280,9 @@ export function KrellConversation(): JSX.Element {
     outcomes,
     primary: primaryCard(krell.messages, outcomes),
     busy: krell.pending,
+    paused,
     decide: krell.confirm,
   };
-  const limited = usageLimited(krell.messages);
 
   return (
     <div className="kbot-krell__conversation" data-testid="krell-conversation">
@@ -268,10 +300,10 @@ export function KrellConversation(): JSX.Element {
         </p>
       ) : null}
       {krell.mode === null && modeAsked(krell.messages) ? (
-        <ModeQuickReplies busy={krell.pending} choose={krell.setMode} />
+        <ModeQuickReplies busy={krell.pending || paused} choose={krell.setMode} />
       ) : null}
-      {limited || krell.connection?.plan === "chatgpt" ? (
-        <ChatgptPlan limited={limited} primary={cards.primary === null} />
+      {krell.connection?.plan === "chatgpt" ? (
+        <ChatgptPlan paused={paused} resume={() => limit !== null && krell.resumeAfterLimit(limit)} />
       ) : null}
       <form className="kbot-krell__composer" onSubmit={submit}>
         <label className="kbot-krell__sr" htmlFor={inputId}>

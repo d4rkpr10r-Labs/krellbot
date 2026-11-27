@@ -168,22 +168,95 @@ describe("ChatGPT plan use in the Krell conversation", () => {
     expect(screen.getByText(LIMIT_MESSAGE)).toBeTruthy();
   });
 
-  it("shows the stored usage limit after a reload, until Krell answers again", async () => {
-    installFetch((path) =>
-      path === "/api/v1/krell/messages"
-        ? sseResponse([{ type: "message_done", text: "Back again." }, { type: "done" }])
-        : jsonResponse(conversation([...greeted(CHATGPT), stored("user", { text: "hi" }), limitError()])),
+  it("pauses Krell after a reload until the person chooses Try again", async () => {
+    const posted: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === "/api/v1/krell/messages") {
+          posted.push(path);
+          return sseResponse([{ type: "message_done", text: "Back again." }, { type: "done" }]);
+        }
+        return jsonResponse(conversation([...greeted(CHATGPT), stored("user", { text: "hi" }), limitError()]));
+      }),
     );
     renderTab();
     await screen.findByTestId("krell-usage-limit");
 
-    await send("Try again");
-    await screen.findByText("Back again.");
-    await waitFor(() => expect(screen.queryByTestId("krell-usage-limit")).toBeNull());
+    // Paused: the composer takes text, but nothing can be sent.
+    fireEvent.change(screen.getByTestId("krell-input"), { target: { value: "Are you there?" } });
+    const sendButton = screen.getByTestId("krell-send") as HTMLButtonElement;
+    expect(sendButton.disabled).toBe(true);
+    fireEvent.keyDown(screen.getByTestId("krell-input"), { key: "Enter" });
+    expect(posted).toEqual([]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(screen.queryByTestId("krell-usage-limit")).toBeNull();
     expect(screen.getByTestId("krell-chatgpt-plan")).toBeTruthy();
+    expect((screen.getByTestId("krell-send") as HTMLButtonElement).disabled).toBe(false);
+
+    fireEvent.click(screen.getByTestId("krell-send"));
+    await screen.findByText("Back again.");
+    expect(posted).toEqual(["/api/v1/krell/messages"]);
+    expect(screen.queryByTestId("krell-usage-limit")).toBeNull();
   });
 
-  it("keeps Manage usage secondary while a confirm card's Confirm is the one primary", async () => {
+  it("clears the pause on an API-key connection and pauses only a ChatGPT-plan one", async () => {
+    installFetch(() =>
+      jsonResponse(conversation([...greeted(KEYED), stored("user", { text: "hi" }), limitError()], KEYED)),
+    );
+    renderTab();
+    await screen.findByText(LIMIT_MESSAGE);
+    expect(screen.queryByTestId("krell-usage-limit")).toBeNull();
+    expect(screen.queryByRole("link", { name: "Manage usage" })).toBeNull();
+    fireEvent.change(screen.getByTestId("krell-input"), { target: { value: "hello" } });
+    expect((screen.getByTestId("krell-send") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("shows the provider's request id with the error, live and after a reload", async () => {
+    let reloads = 0;
+    installFetch((path) => {
+      if (path === "/api/v1/krell/messages") {
+        return sseResponse([
+          { type: "text_delta", text: "Let me" },
+          {
+            type: "error",
+            code: "provider_usage_limit",
+            message: LIMIT_MESSAGE,
+            provider: { status: 429, code: "subscription_sharing_usage_limit_exceeded", request_id: "req_LIVE42" },
+          },
+          { type: "done" },
+        ]);
+      }
+      reloads += 1;
+      const messages =
+        reloads === 1
+          ? greeted(CHATGPT)
+          : [
+              ...greeted(CHATGPT),
+              stored("notice", {
+                kind: "error",
+                code: "provider_usage_limit",
+                message: LIMIT_MESSAGE,
+                provider: { status: 429, request_id: "req_STORED7", detail: "{\"error\": {}}" },
+              }),
+            ];
+      return jsonResponse(conversation(messages));
+    });
+    const view = renderTab();
+    await screen.findByText(OPENING);
+    await send("hello");
+    expect((await screen.findByTestId("krell-request-id")).textContent).toContain("Request ID: req_LIVE42");
+    view.unmount();
+
+    renderTab();
+    expect((await screen.findByTestId("krell-request-id")).textContent).toContain("Request ID: req_STORED7");
+    // The stored body excerpt is never shown.
+    expect(screen.queryByText(/"error"/)).toBeNull();
+  });
+
+  it("makes Manage usage the one primary and holds every confirm card while paused", async () => {
     const card = stored("tool", {
       tool_call_id: "call_arm",
       name: "paper_arm",
@@ -218,7 +291,20 @@ describe("ChatGPT plan use in the Krell conversation", () => {
     renderTab();
     const state = await screen.findByTestId("krell-usage-limit");
     const link = within(state).getByRole("link", { name: "Manage usage" });
-    expect(link.className).toContain("kbot-krell__btn");
-    expect(link.className).not.toContain("kbot-krell__go");
+    expect(link.className).toContain("kbot-krell__go");
+    // The card's Confirm is demoted and disabled, with the reason beside it.
+    const row = screen.getByTestId("krell-item-confirm");
+    const confirm = within(row).getByRole("button", { name: /confirm/i }) as HTMLButtonElement;
+    expect(confirm.disabled).toBe(true);
+    expect(confirm.className).not.toContain("kbot-krell__go");
+    expect(within(row).getByTestId("krell-confirm-paused").textContent).toContain("Try again");
+    expect(document.querySelectorAll(".kbot-krell__go")).toHaveLength(1);
+
+    // Try again lets the card be answered again, and it is the primary once more.
+    fireEvent.click(within(state).getByRole("button", { name: "Try again" }));
+    const again = within(screen.getByTestId("krell-item-confirm")).getByRole("button", { name: /confirm/i }) as HTMLButtonElement;
+    expect(again.disabled).toBe(false);
+    expect(again.className).toContain("kbot-krell__go");
+    expect(screen.queryByTestId("krell-confirm-paused")).toBeNull();
   });
 });

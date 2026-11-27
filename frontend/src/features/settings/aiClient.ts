@@ -11,6 +11,9 @@ export type AiCapability = "tools" | "chat_only" | "failed" | "unprobed";
 export type AiFormat = "openai_compatible" | "anthropic_messages";
 export type AiSignin = "none" | "openrouter" | "chatgpt";
 
+/** A saved ChatGPT account with no connection now: "Continue as" reuses its registration. */
+export type AiChatgptAccount = { id: string; email: string | null };
+
 export type AiProvider = {
   id: string;
   label: string;
@@ -20,6 +23,8 @@ export type AiProvider = {
   credential: "required" | "optional";
   /** A browser sign-in the engine offers for this provider, besides a key. */
   signin: AiSignin;
+  /** ChatGPT sign-in only: saved accounts to continue as. */
+  chatgptAccounts: AiChatgptAccount[];
 };
 
 /**
@@ -116,6 +121,14 @@ function toChatgpt(raw: unknown): AiChatgptState | null {
     welcome: r.welcome === true,
     account: typeof r.account === "string" ? r.account : null,
   };
+}
+
+function toAccounts(raw: unknown): AiChatgptAccount[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => (item ?? {}) as Record<string, unknown>)
+    .filter((r) => typeof r.id === "string" && /^[0-9a-f]{16}$/.test(r.id))
+    .map((r) => ({ id: String(r.id), email: typeof r.email === "string" ? r.email : null }));
 }
 
 function asPlan(value: unknown): "enabled" | "disabled" | null {
@@ -225,6 +238,7 @@ export async function listProviders(): Promise<
           custom: r.custom === true,
           credential: r.credential === "optional" ? "optional" : "required",
           signin: asSignin(r.signin),
+          chatgptAccounts: toAccounts(r.chatgpt_accounts),
         };
       }),
     };
@@ -391,12 +405,14 @@ export async function startOpenRouterSignin(
  * straight to the keychain and never reaches the browser.
  */
 export async function startChatgptSignin(
-  input: { model: string } | { connectionId: string },
+  input: { model: string; account?: string } | { connectionId: string },
 ): Promise<AiResult<{ flowId: string; authorizeUrl: string }>> {
   const body =
     "connectionId" in input
       ? { connection_id: input.connectionId }
-      : { model: input.model };
+      : input.account
+        ? { model: input.model, account: input.account }
+        : { model: input.model };
   try {
     const parsed = await send("POST", "/api/v1/ai/signin/chatgpt", body);
     if (parsed.ok === false) return refusal(parsed);

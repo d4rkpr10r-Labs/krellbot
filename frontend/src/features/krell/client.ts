@@ -51,7 +51,8 @@ export type KrellEvent =
   | { type: "tool_result"; id: string; name: string; result: KrellToolResult }
   | { type: "highlight"; test_id: string }
   | { type: "confirm_request"; id: string; confirm: Record<string, unknown> }
-  | { type: "error"; code: string; message: string }
+  /** `provider`: a provider error's status, code, param and request id (M38.23); never its body. */
+  | { type: "error"; code: string; message: string; provider?: Record<string, unknown> }
   | { type: "done" };
 
 /** One stored conversation row: `role` is user, assistant, tool or notice. */

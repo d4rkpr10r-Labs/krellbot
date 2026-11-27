@@ -40,7 +40,7 @@ import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from krellbot.ai import oauth
+from krellbot.ai import connections, oauth
 from krellbot.ai.connections import ConnectionRefused, ConnectionStore
 from krellbot.ai.http import TransportError
 from krellbot.ai.openai_compat import RESPONSES_UNSUPPORTED_FIELDS, OpenAICompatAdapter
@@ -357,7 +357,19 @@ class Env:
 
 
 def keychain_record(fresh_keyring, conn_id: str) -> dict:
-    return json.loads(fresh_keyring._store[(f"krellbot-ai:{conn_id}", "credential")])
+    """The credential record, reassembled from its chunks and checked against its digest."""
+
+    raw = connections._read_secret(fresh_keyring, f"krellbot-ai:{conn_id}")
+    assert raw is not None
+    return json.loads(raw)
+
+
+def keychain_entries(fresh_keyring, conn_id: str) -> dict[str, str]:
+    """Every keychain entry under the connection's service, by username."""
+
+    return {
+        user: value for (service, user), value in fresh_keyring._store.items() if service == f"krellbot-ai:{conn_id}"
+    }
 
 
 def chatgpt_state(home: Path) -> dict:
@@ -493,7 +505,8 @@ def test_first_registration_saves_the_issued_client_id_not_dynamic_agent_client(
     assert record["expires_at"] == NOW + 3600
     assert record["scopes"] == sorted(GRANTED.split())
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", record["saved_at"])
-    assert list(fresh_keyring._store) == [(f"krellbot-ai:{conn_id}", "credential")]
+    # Only this connection's service: one header plus its chunks.
+    assert {service for service, _user in fresh_keyring._store} == {f"krellbot-ai:{conn_id}"}
 
     [conn] = env.store().list()
     assert (conn.id, conn.preset, conn.auth, conn.model, conn.capability) == (
@@ -507,7 +520,7 @@ def test_first_registration_saves_the_issued_client_id_not_dynamic_agent_client(
 
     # The non-secret state maps the account to its issued client; no token, no dynamic id.
     state = chatgpt_state(home)
-    assert state["accounts"] == [{"client_id": CLIENT, "issuer": ISSUER, "subject": SUBJECT}]
+    assert state["accounts"] == [{"client_id": CLIENT, "issuer": ISSUER, "subject": SUBJECT, "email": EMAIL}]
     assert state["connections"][conn_id]["client_id"] == CLIENT
     written = everything_written(home)
     assert "dynamic_agent_client" not in written
@@ -912,7 +925,7 @@ def test_removing_a_chatgpt_connection_revokes_its_refresh_token(home, fresh_key
     assert fresh_keyring._store == {}
     state = chatgpt_state(home)
     assert state["ext_agent_host_id"] == host_id
-    assert state["accounts"] == [{"client_id": CLIENT, "issuer": ISSUER, "subject": SUBJECT}]
+    assert state["accounts"] == [{"client_id": CLIENT, "issuer": ISSUER, "subject": SUBJECT, "email": EMAIL}]
     assert conn_id not in state.get("connections", {})
 
 
@@ -1523,3 +1536,432 @@ def test_every_chatgpt_request_goes_only_to_openai_hosts(home, fresh_keyring):
     assert hosts == {"auth.openai.com", "api.openai.com"}
     assert all(url.startswith("https://") for url in env.openai.all_outbound())
     assert oauth.CHATGPT_EGRESS_HOSTS == frozenset({"auth.openai.com", "api.openai.com"})
+
+
+# ---- 12. a keychain that holds 1280 characters per secret (Windows Credential Manager) -------------
+
+WINDOWS_LIMIT = 1280  # 2560 bytes of UTF-16
+
+
+@pytest.fixture
+def windows_keyring(fresh_keyring):
+    """The in-tree fake, refusing any value longer than Windows' CredWrite blob holds."""
+
+    original = fresh_keyring.set_password
+
+    def set_password(service, username, password):
+        if len(password) > WINDOWS_LIMIT:
+            raise RuntimeError("CredWrite: the stub received bad data")
+        original(service, username, password)
+
+    fresh_keyring.set_password = set_password
+    return fresh_keyring
+
+
+LONG_ACCESS = "oai-ACCESS-long-" + "a" * 2600
+LONG_REFRESH = "oai-REFRESH-long-" + "r" * 1900
+
+
+def _chunk_entries(entries: dict[str, str]) -> dict[str, str]:
+    return {user: value for user, value in entries.items() if user != "credential"}
+
+
+def _assert_one_generation(entries: dict[str, str]) -> None:
+    """The header names exactly the chunks present: no stale piece of an older generation is left."""
+
+    header = connections._parse_chunk_header(entries["credential"])
+    assert header is not None
+    assert set(_chunk_entries(entries)) == set(connections._chunk_names(header))
+
+
+def test_a_chatgpt_record_is_stored_in_chunks_a_1280_character_keychain_accepts(home, windows_keyring):
+    env = Env(home)
+    conn_id = env.sign_in()
+    entries = keychain_entries(windows_keyring, conn_id)
+    assert len(_chunk_entries(entries)) >= 2
+    assert all(len(value) <= WINDOWS_LIMIT for value in entries.values())
+    assert re.fullmatch(r"krellbot-chunked-v1:[0-9a-f]{8}:\d+:[0-9a-f]{64}", entries["credential"])
+    assert all(re.fullmatch(r"credential\.[0-9a-f]{8}\.\d+", user) for user in _chunk_entries(entries))
+    _assert_one_generation(entries)
+    record = keychain_record(windows_keyring, conn_id)
+    assert (record["client_id"], record["access_token"], record["refresh_token"]) == (CLIENT, ACCESS, REFRESH)
+    # The token set never sits in the header.
+    assert ACCESS not in entries["credential"] and REFRESH not in entries["credential"]
+
+
+def test_a_refresh_to_a_token_set_of_another_size_replaces_every_chunk(home, windows_keyring):
+    env = Env(home)
+    conn_id = env.sign_in()
+    store = env.store()
+    before = set(_chunk_entries(keychain_entries(windows_keyring, conn_id)))
+
+    env.clock.now = NOW + 3590
+    env.openai.token_replies.append(refresh_reply(LONG_ACCESS, LONG_REFRESH))
+    assert oauth.chatgpt_access_token(store, store.get(conn_id), transport=env.openai, clock=env.clock) == LONG_ACCESS
+    grown = keychain_entries(windows_keyring, conn_id)
+    _assert_one_generation(grown)
+    assert len(_chunk_entries(grown)) > len(before)
+    assert not before & set(grown)  # the previous generation is gone
+    assert all(len(value) <= WINDOWS_LIMIT for value in grown.values())
+
+    env.clock.now += 3590
+    env.openai.token_replies.append(refresh_reply())
+    assert oauth.chatgpt_access_token(store, store.get(conn_id), transport=env.openai, clock=env.clock) == ACCESS_2
+    shrunk = keychain_entries(windows_keyring, conn_id)
+    _assert_one_generation(shrunk)
+    assert len(_chunk_entries(shrunk)) < len(_chunk_entries(grown))
+    record = keychain_record(windows_keyring, conn_id)
+    assert (record["access_token"], record["refresh_token"]) == (ACCESS_2, REFRESH_2)
+
+
+def test_sign_out_and_removal_leave_no_stale_chunks(home, windows_keyring):
+    env = Env(home)
+    conn_id = env.sign_in()
+    store = env.store()
+    oauth.chatgpt_sign_out(store, store.get(conn_id), transport=env.openai, sleep=lambda s: None)
+    entries = keychain_entries(windows_keyring, conn_id)
+    # The cleared record is short: one plain entry, every old chunk deleted.
+    assert set(entries) == {"credential"}
+    assert keychain_record(windows_keyring, conn_id)["client_id"] == CLIENT
+
+    other = env.sign_in()
+    assert _chunk_entries(keychain_entries(windows_keyring, other))
+    oauth.remove_chatgpt_connection(store, store.get(other), transport=env.openai, sleep=lambda s: None)
+    assert keychain_entries(windows_keyring, other) == {}
+
+
+def test_a_legacy_single_entry_api_key_still_loads_and_a_long_key_is_chunked(home, windows_keyring):
+    store = ConnectionStore(home, allow_injected_fake_backend=True)
+    short = store.add("openai", model="gpt-x", credential="sk-legacy-SINGLE-0001")
+    assert keychain_entries(windows_keyring, short.id) == {"credential": "sk-legacy-SINGLE-0001"}
+    assert store.credential(short.id) == "sk-legacy-SINGLE-0001"
+    # An entry written before chunking existed reads exactly as before.
+    windows_keyring._store[(f"krellbot-ai:{short.id}", "credential")] = "sk-written-by-an-older-krellbot"
+    assert store.credential(short.id) == "sk-written-by-an-older-krellbot"
+
+    long_key = "sk-long-" + "k" * 3000
+    keyed = store.add("custom_openai", model="m", credential=long_key[:4096], base_url="https://llm.example/v1")
+    assert len(_chunk_entries(keychain_entries(windows_keyring, keyed.id))) == 4
+    assert store.credential(keyed.id) == long_key
+    store.remove(keyed.id)
+    assert keychain_entries(windows_keyring, keyed.id) == {}
+
+
+def test_tampered_or_missing_chunks_read_as_no_credential(home, windows_keyring):
+    env = Env(home)
+    conn_id = env.sign_in()
+    store = env.store()
+    entries = keychain_entries(windows_keyring, conn_id)
+    first_chunk = min(_chunk_entries(entries))
+    windows_keyring._store[(f"krellbot-ai:{conn_id}", first_chunk)] = "x" * len(entries[first_chunk])
+    assert store.credential(conn_id) is None
+    with pytest.raises(ConnectionRefused) as refused:
+        oauth.chatgpt_access_token(store, store.get(conn_id), transport=env.openai, clock=env.clock)
+    assert refused.value.code == "ai_chatgpt_signin_required"
+    del windows_keyring._store[(f"krellbot-ai:{conn_id}", first_chunk)]
+    assert store.credential(conn_id) is None
+
+
+def test_a_replacement_that_fails_part_way_keeps_the_previous_record(home, windows_keyring):
+    env = Env(home)
+    conn_id = env.sign_in()
+    store = env.store()
+    before = keychain_entries(windows_keyring, conn_id)
+    written = windows_keyring.set_password
+    calls = {"n": 0}
+
+    def flaky(service, username, password):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the second chunk of the new generation
+            raise RuntimeError("keychain busy")
+        written(service, username, password)
+
+    windows_keyring.set_password = flaky
+    with pytest.raises(ConnectionRefused) as refused:
+        store.replace_record(
+            conn_id, json.dumps({**keychain_record(windows_keyring, conn_id), "access_token": LONG_ACCESS})
+        )
+    assert refused.value.code == "ai_keychain_unavailable"
+    assert keychain_entries(windows_keyring, conn_id) == before
+    assert keychain_record(windows_keyring, conn_id)["access_token"] == ACCESS
+
+
+# ---- 13. "Continue as": every later sign-in of an account reuses its issued client -----------------
+
+
+def test_readding_a_removed_account_reuses_its_issued_client_id(home, fresh_keyring):
+    env = Env(home)
+    first = env.sign_in()
+    store = env.store()
+    oauth.remove_chatgpt_connection(store, store.get(first), transport=env.openai, sleep=lambda s: None)
+    [saved] = oauth.chatgpt_saved_accounts(home)
+    assert saved["email"] == EMAIL and re.fullmatch(r"[0-9a-f]{16}", saved["id"])
+    assert CLIENT not in json.dumps(saved)
+
+    env.openai.form_requests.clear()
+    flow = oauth.start_chatgpt_signin(
+        home,
+        model="gpt-plan-a",
+        clock=env.clock,
+        transport=env.openai,
+        listener_factory=env.factory,
+        registry=env.registry,
+        account=saved["id"],
+        allow_injected_fake_backend=True,
+    )
+    listener = env.factory.last
+    params = env.authorize(flow, listener)
+    assert params["client_id"] == CLIENT
+    assert "agent_name_hint" not in params
+    assert params["login_hint"] == EMAIL
+    assert "id_token_hint" not in params  # no ID token outlives the removed connection's record
+    assert params["ext_agent_host_id"] == oauth.chatgpt_host_id(home)
+
+    env.openai.token_replies.append(token_reply(env.nonce))
+    listener.request(f"/auth/callback?code={CODE}&state={params['state']}")
+    status = env.status(flow)
+    assert status["state"] == "connected" and status["connection_id"] != first
+    assert [f["client_id"] for f in env.openai.forms_to(TOKEN_URL)] == [CLIENT]
+    assert keychain_record(fresh_keyring, status["connection_id"])["client_id"] == CLIENT
+    assert chatgpt_state(home)["accounts"] == [
+        {"client_id": CLIENT, "issuer": ISSUER, "subject": SUBJECT, "email": EMAIL}
+    ]
+    assert oauth.chatgpt_saved_accounts(home) == []  # in use again
+
+
+def test_continue_as_refuses_a_sign_in_to_another_account(home, fresh_keyring):
+    env = Env(home)
+    first = env.sign_in()
+    store = env.store()
+    oauth.remove_chatgpt_connection(store, store.get(first), transport=env.openai, sleep=lambda s: None)
+    [saved] = oauth.chatgpt_saved_accounts(home)
+    flow = oauth.start_chatgpt_signin(
+        home,
+        model="m",
+        clock=env.clock,
+        transport=env.openai,
+        listener_factory=env.factory,
+        registry=env.registry,
+        account=saved["id"],
+        allow_injected_fake_backend=True,
+    )
+    params = env.authorize(flow, env.factory.last)
+    env.openai.token_replies.append(
+        lambda fields: {
+            **token_reply(env.nonce)(fields),
+            "id_token": signer().sign(claims(env.nonce["nonce"], sub="someone-else")),
+        }
+    )
+    env.factory.last.request(f"/auth/callback?code={CODE}&state={params['state']}")
+    assert env.status(flow)["code"] == "ai_chatgpt_account_mismatch"
+    assert env.store().list() == []
+
+    with pytest.raises(ConnectionRefused) as refused:
+        oauth.start_chatgpt_signin(
+            home,
+            model="m",
+            clock=env.clock,
+            transport=env.openai,
+            listener_factory=env.factory,
+            registry=env.registry,
+            account="0" * 16,
+            allow_injected_fake_backend=True,
+        )
+    assert refused.value.code == "ai_chatgpt_account_unknown"
+
+
+def test_a_different_account_registers_a_new_client_and_a_mapped_account_updates_its_own(home, fresh_keyring):
+    env = Env(home)
+    env.sign_in()
+    # "Use a different ChatGPT account": dynamic registration, another verified account.
+    flow, listener = env.start()
+    params = env.authorize(flow, listener)
+    assert params["client_id"] == "dynamic_agent_client" and params["agent_name_hint"] == "Krellbot"
+    env.openai.token_replies.append(
+        token_reply(
+            env.nonce,
+            client=OTHER_CLIENT,
+            id_claims=claims(env.nonce["nonce"], aud=OTHER_CLIENT, sub="second-user", email="second@example.com"),
+        )
+    )
+    listener.request(f"/auth/callback?code={CODE}&state={params['state']}&client_id={OTHER_CLIENT}")
+    assert env.status(flow)["state"] == "connected"
+    accounts = chatgpt_state(home)["accounts"]
+    assert sorted((a["client_id"], a["subject"]) for a in accounts) == sorted(
+        [(CLIENT, SUBJECT), (OTHER_CLIENT, "second-user")]
+    )
+
+    # A new registration for an account already mapped replaces its client id instead of duplicating it.
+    third = "oaiapp_THIRD-client-9d9d"
+    flow, listener = env.start()
+    params = env.authorize(flow, listener)
+    env.openai.token_replies.append(token_reply(env.nonce, client=third))
+    listener.request(f"/auth/callback?code={CODE}&state={params['state']}&client_id={third}")
+    assert env.status(flow)["state"] == "connected"
+    accounts = chatgpt_state(home)["accounts"]
+    assert sorted((a["client_id"], a["subject"]) for a in accounts) == sorted(
+        [(third, SUBJECT), (OTHER_CLIENT, "second-user")]
+    )
+
+
+def test_the_providers_route_offers_saved_accounts_and_the_start_route_continues_as_one(home, fresh_keyring):
+    env = Env(home)
+    client = Client(env)
+    conn_id = client.sign_in()
+    openai = next(p for p in client.json("GET", "/api/v1/ai/providers")["providers"] if p["id"] == "openai")
+    assert openai["chatgpt_accounts"] == []  # the account has a connection
+    client.json("DELETE", f"/api/v1/ai/connections/{conn_id}")
+    providers = client.json("GET", "/api/v1/ai/providers")["providers"]
+    [saved] = next(p for p in providers if p["id"] == "openai")["chatgpt_accounts"]
+    assert saved["email"] == EMAIL
+    assert all("chatgpt_accounts" not in p for p in providers if p["id"] != "openai")
+    assert CLIENT.encode() not in client.raw[-1]
+
+    started = client.json("POST", "/api/v1/ai/signin/chatgpt", {"model": "gpt-plan-a", "account": saved["id"]})
+    flow = oauth.SigninFlow(id=started["flow_id"], authorize_url=started["authorize_url"], state="")
+    assert env.authorize(flow, env.factory.last)["client_id"] == CLIENT
+    for bad in ({"model": "m", "account": 3}, {"connection_id": conn_id, "account": saved["id"]}):
+        status, raw = client.call("POST", "/api/v1/ai/signin/chatgpt", bad)
+        assert status == 400 and json.loads(raw)["code"] == "ai_body_invalid"
+    status, raw = client.call("POST", "/api/v1/ai/signin/chatgpt", {"model": "m", "account": "f" * 16})
+    assert status == 404 and json.loads(raw)["code"] == "ai_chatgpt_account_unknown"
+
+
+def test_an_invalid_grant_first_exchange_keeps_the_issued_client_for_the_next_attempt(home, fresh_keyring):
+    env = Env(home)
+    flow, listener = env.start()
+    params = env.authorize(flow, listener)
+    env.openai.token_replies.append(TransportError(400, json.dumps({"error": "invalid_grant"})))
+    listener.request(f"/auth/callback?code={CODE}&state={params['state']}&client_id={CLIENT}")
+    assert env.status(flow)["code"] == "ai_chatgpt_rejected"
+    assert chatgpt_state(home)["pending_client"] == CLIENT
+    assert fresh_keyring._store == {}
+
+    flow, listener = env.start()
+    params = env.authorize(flow, listener)
+    assert params["client_id"] == CLIENT and "agent_name_hint" not in params
+    env.openai.token_replies.append(token_reply(env.nonce))
+    listener.request(f"/auth/callback?code={CODE}&state={params['state']}")
+    status = env.status(flow)
+    assert status["state"] == "connected"
+    assert env.openai.forms_to(TOKEN_URL)[-1]["client_id"] == CLIENT
+    state = chatgpt_state(home)
+    assert state["pending_client"] is None
+    assert state["accounts"] == [{"client_id": CLIENT, "issuer": ISSUER, "subject": SUBJECT, "email": EMAIL}]
+
+
+def test_a_pending_client_that_openai_refuses_otherwise_is_dropped(home, fresh_keyring):
+    env = Env(home)
+    flow, listener = env.start()
+    params = env.authorize(flow, listener)
+    env.openai.token_replies.append(TransportError(400, json.dumps({"error": "invalid_grant"})))
+    listener.request(f"/auth/callback?code={CODE}&state={params['state']}&client_id={CLIENT}")
+    flow, listener = env.start()
+    params = env.authorize(flow, listener)
+    env.openai.token_replies.append(TransportError(401, json.dumps({"error": "invalid_client"})))
+    listener.request(f"/auth/callback?code={CODE}&state={params['state']}")
+    assert chatgpt_state(home)["pending_client"] is None
+    flow, listener = env.start()
+    assert env.authorize(flow, listener)["client_id"] == "dynamic_agent_client"
+
+
+# ---- 14. mid-turn refresh failures, revocation causes, the lock during revocation --------------------
+
+
+def test_a_mid_turn_refresh_failure_is_temporary_unless_the_signin_ended(home, fresh_keyring):
+    env = Env(home)
+    conn_id = env.sign_in()
+    store = env.store()
+    adapter = oauth.chatgpt_adapter(store, store.get(conn_id), transport=env.openai, clock=env.clock)
+    env.openai.stream_replies.append(text_stream())
+    assert isinstance(
+        list(adapter.stream(model="m", system="", messages=HISTORY[:1], tools=(), max_tokens=1))[-1], Done
+    )
+
+    env.clock.now = NOW + 3590
+    env.openai.token_replies.append(TransportError(None, "URLError"))
+    [blip] = list(adapter.stream(model="m", system="", messages=HISTORY[:1], tools=(), max_tokens=1))
+    assert blip.code == "provider_unavailable"
+
+    env.openai.token_replies.append(TransportError(400, json.dumps({"error": "invalid_grant"})))
+    [ended] = list(adapter.stream(model="m", system="", messages=HISTORY[:1], tools=(), max_tokens=1))
+    assert ended.code == "provider_auth_failed"
+    assert len(env.openai.requests) == 1  # no inference ran without a token
+
+
+@pytest.mark.parametrize(
+    ("script", "cause"),
+    [
+        ({"revoke": [TransportError(400, json.dumps({"error": "unsupported_token_type"}))]}, "refused the revocation"),
+        ({"revoke": [TransportError(None, "reset")] * 3}, "could not be reached"),
+        ({"no_endpoint": True}, "no usable revocation address"),
+    ],
+)
+def test_an_unconfirmed_revocation_says_why(home, fresh_keyring, script, cause):
+    env = Env(home)
+    conn_id = env.sign_in()
+    store = env.store()
+    env.openai.revoke_replies.extend(script.get("revoke", []))
+    if script.get("no_endpoint"):
+        del env.openai.discovery["revocation_endpoint"]
+    result = oauth.chatgpt_sign_out(store, store.get(conn_id), transport=env.openai, sleep=lambda s: None)
+    assert result.revocation == "not_confirmed"
+    assert cause in result.message and "ChatGPT settings" in result.message
+    assert keychain_record(fresh_keyring, conn_id)["refresh_token"] is None
+
+
+def test_revocation_runs_outside_the_record_lock_and_no_refresh_rotates_meanwhile(home, fresh_keyring):
+    env = Env(home)
+    conn_id = env.sign_in()
+    seen: dict = {}
+
+    def revoke(fields):
+        # Another thread asks for a token while OpenAI is answering the revocation.
+        def ask() -> None:
+            store = env.store()
+            try:
+                oauth.chatgpt_access_token(store, store.get(conn_id), transport=env.openai, clock=env.clock)
+            except ConnectionRefused as exc:
+                seen["code"] = exc.code
+
+        worker = threading.Thread(target=ask)
+        worker.start()
+        worker.join(2)
+        seen["blocked"] = worker.is_alive()
+        return 200, b""
+
+    env.openai.revoke_replies.append(revoke)
+    store = env.store()
+    result = oauth.chatgpt_sign_out(store, store.get(conn_id), transport=env.openai, sleep=lambda s: None)
+    assert result.revocation == "confirmed"
+    assert seen == {"blocked": False, "code": "ai_chatgpt_signin_required"}
+    assert [f["grant_type"] for f in env.openai.forms_to(TOKEN_URL)] == ["authorization_code"]
+
+
+def test_a_usage_limit_notice_keeps_its_diagnostics_across_a_reload(home, fresh_keyring):
+    from tests.test_krell_loop_api import Client as KrellClient
+
+    env = Env(home)
+    env.clock.now = time.time()
+    conn_id = env.sign_in()
+    store = env.store()
+    store.set_capability(conn_id, "tools")
+    store.activate(conn_id)
+    krell = KrellClient(home, env.openai)
+    body = _error_body("subscription_sharing_usage_limit_exceeded", message="x" * 1000)
+    exc = TransportError(429, body)
+    exc.request_id = "req_KEEP"
+    env.openai.stream_replies.append(exc)
+    krell.stream("/api/v1/krell/messages", {"text": "hello"})
+
+    convo = krell.json("GET", "/api/v1/krell/conversation")
+    [notice] = [m["payload"] for m in convo["messages"] if m["payload"].get("kind") == "error"]
+    assert notice["code"] == "provider_usage_limit"
+    provider = notice["provider"]
+    assert (provider["status"], provider["code"], provider["request_id"]) == (
+        429,
+        "subscription_sharing_usage_limit_exceeded",
+        "req_KEEP",
+    )
+    assert provider["detail"] == body[:300]
+    assert ACCESS not in json.dumps(convo) and REFRESH not in json.dumps(convo)

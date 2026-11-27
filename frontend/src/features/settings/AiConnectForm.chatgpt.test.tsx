@@ -258,6 +258,8 @@ describe("AiConnectForm Continue with ChatGPT", () => {
 
     const dialog = screen.getByRole("dialog", { name: "You're using your ChatGPT plan" });
     expect(dialog.textContent).toContain("ChatGPT settings");
+    // An inline dialog, not a modal without a focus trap.
+    expect(dialog.hasAttribute("aria-modal")).toBe(false);
     const gotIt = screen.getByRole("button", { name: "Got it" });
     expect(gotIt.className).toContain("kbot-settings__btn--primary");
     // The dialog is the surface's only primary, and the form waits behind it.
@@ -282,6 +284,34 @@ describe("AiConnectForm Continue with ChatGPT", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(calls.some((c) => c.path.endsWith("/welcome"))).toBe(false);
     expect(onConnected).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers saved accounts as Continue as <email>, reusing the account; another account registers anew", async () => {
+    const ACCOUNT = "0123456789abcdef";
+    const withAccounts = PROVIDERS.map((p) =>
+      p.id === "openai" ? { ...p, chatgpt_accounts: [{ id: ACCOUNT, email: "trader@example.com" }] } : p,
+    );
+    const calls = installFetch((c) =>
+      c.path === "/api/v1/ai/providers" ? ok({ providers: withAccounts }) : engine("enabled", { welcome: false })(c),
+    );
+    await renderForm();
+    expect(continueButton()).toBeNull();
+    const continueAs = screen.getByRole("button", { name: "Continue as trader@example.com" }) as HTMLButtonElement;
+    const different = screen.getByRole("button", { name: "Use a different ChatGPT account" }) as HTMLButtonElement;
+    expect(continueAs.textContent).toBe("Continue as trader@example.com");
+
+    fireEvent.change(screen.getByLabelText(/^model$/i), { target: { value: "gpt-plan-a" } });
+    fireEvent.click(continueAs);
+    await advance(0);
+    const starts = (): Call[] => calls.filter((c) => c.path === "/api/v1/ai/signin/chatgpt");
+    expect(starts()[0].body).toEqual({ model: "gpt-plan-a", account: ACCOUNT });
+    expect(openSpy).toHaveBeenCalledWith(LAUNCH_URL, "_blank", "noopener,noreferrer");
+    await advance(2000);
+
+    fireEvent.click(screen.getByRole("button", { name: "Use a different ChatGPT account" }));
+    await advance(0);
+    expect(starts()[1].body).toEqual({ model: "gpt-plan-a" });
+    expect(different).toBeTruthy();
   });
 
   it("signs an existing ChatGPT connection in again by its connection id", async () => {

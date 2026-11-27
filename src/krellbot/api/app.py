@@ -4893,6 +4893,7 @@ def create_app(
         "ai_signin_local_only": 403,
         "ai_chatgpt_local_only": 403,
         "ai_chatgpt_not_chatgpt": 404,
+        "ai_chatgpt_account_unknown": 404,
         "ai_chatgpt_signin_required": 409,
         "ai_chatgpt_plan_disabled": 409,
         "ai_chatgpt_client_invalid": 409,
@@ -5031,6 +5032,12 @@ def create_app(
             }
             for p in PRESETS.values()
         ]
+        from krellbot.ai.oauth import chatgpt_saved_accounts
+
+        for provider in providers:
+            if provider["signin"] == "chatgpt":
+                # Saved ChatGPT accounts with no connection now ("Continue as"); no token, no client id.
+                provider["chatgpt_accounts"] = chatgpt_saved_accounts(s.home)
         return _ai_json({"ok": True, "effect": "unchanged", "providers": providers})
 
     @app.get("/api/v1/ai/connections")
@@ -5309,7 +5316,12 @@ def create_app(
 
     @app.post("/api/v1/ai/signin/chatgpt")
     async def ai_signin_chatgpt(request: Request) -> Response:
-        """Start Continue with ChatGPT. Body: ``model`` (new sign-in) or ``connection_id`` (sign in again)."""
+        """Start Continue with ChatGPT.
+
+        Body: ``model`` for a new connection, optionally with ``account`` (a
+        saved account's id: "Continue as", reusing its issued client), or
+        ``connection_id`` to sign that connection in again.
+        """
 
         from krellbot.ai.connections import ConnectionRefused
         from krellbot.ai.http import UrllibTransport
@@ -5328,8 +5340,10 @@ def create_app(
             return _ai_invalid_body()
         if not isinstance(payload, dict):
             return _ai_invalid_body()
-        model, connection_id = payload.get("model"), payload.get("connection_id")
-        if connection_id is not None and not isinstance(connection_id, str):
+        model, connection_id, account = payload.get("model"), payload.get("connection_id"), payload.get("account")
+        if any(v is not None and not isinstance(v, str) for v in (connection_id, account)):
+            return _ai_invalid_body()
+        if connection_id is not None and account is not None:
             return _ai_invalid_body()
         if connection_id is None and not isinstance(model, str):
             return _ai_invalid_body()
@@ -5343,6 +5357,7 @@ def create_app(
                 listener_factory=s.ai_signin_listener_factory,
                 registry=_ai_signins(s),
                 connection_id=connection_id,
+                account=account,
                 allow_injected_fake_backend=s.keys_allow_fake_backend,
             )
         except (ConnectionRefused, SigninRefused) as exc:

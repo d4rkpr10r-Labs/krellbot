@@ -700,10 +700,22 @@ CHATGPT_STATE_FILE = "chatgpt.json"
 if PRESETS[CHATGPT_PRESET].base_url != CHATGPT_RESOURCE:  # pragma: no cover — a preset edit must update both
     raise RuntimeError("the OpenAI preset and the ChatGPT resource disagree")
 
-REVOCATION_NOT_CONFIRMED = (
-    "Signed out on this computer, but remote revocation was not confirmed: OpenAI could not be reached. "
-    "You can disconnect Krellbot in ChatGPT settings."
-)
+_DISCONNECT_HINT = "You can disconnect Krellbot in ChatGPT settings."
+# Why OpenAI did not confirm a revocation; the tokens are cleared on this computer in every case.
+REVOCATION_NOT_CONFIRMED: dict[str, str] = {
+    "unreachable": (
+        "Signed out on this computer, but remote revocation was not confirmed: OpenAI could not be reached. "
+        + _DISCONNECT_HINT
+    ),
+    "refused": (
+        "Signed out on this computer, but remote revocation was not confirmed: OpenAI refused the revocation "
+        "request. " + _DISCONNECT_HINT
+    ),
+    "no_endpoint": (
+        "Signed out on this computer, but remote revocation was not confirmed: OpenAI's sign-in configuration "
+        "offered no usable revocation address. " + _DISCONNECT_HINT
+    ),
+}
 
 _HOST_ID_RE = re.compile(r"urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 _STATE_SCHEMA = "1"
@@ -770,7 +782,15 @@ def _state_path(home: Path) -> Path:
 
 
 def _empty_state() -> dict:
-    return {"schema_version": _STATE_SCHEMA, "ext_agent_host_id": None, "accounts": [], "connections": {}}
+    return {
+        "schema_version": _STATE_SCHEMA,
+        "ext_agent_host_id": None,
+        "accounts": [],
+        "connections": {},
+        # A first registration's issued client id whose code exchange returned invalid_grant: the next
+        # sign-in reauthorizes with it instead of registering again (OpenAI, Registration and sign-in §3).
+        "pending_client": None,
+    }
 
 
 def _load_state(home: Path) -> dict:
@@ -793,11 +813,15 @@ def _load_state(home: Path) -> dict:
         raise ConnectionRefused("ai_chatgpt_state_unreadable")
     state = _empty_state()
     state["ext_agent_host_id"] = host_id
+    pending = data.get("pending_client")
+    state["pending_client"] = pending if _plausible_client_id(pending) else None
     for account in data.get("accounts") or []:
         if isinstance(account, dict) and all(
             isinstance(account.get(k), str) for k in ("client_id", "issuer", "subject")
         ):
-            state["accounts"].append({k: account[k] for k in ("client_id", "issuer", "subject")})
+            entry = {k: account[k] for k in ("client_id", "issuer", "subject")}
+            entry["email"] = _email(account.get("email"))
+            state["accounts"].append(entry)
     connections = data.get("connections")
     for conn_id, entry in connections.items() if isinstance(connections, dict) else []:
         if (
@@ -907,14 +931,55 @@ def mark_chatgpt_welcome_shown(home: Path, conn_id: str) -> bool:
         return True
 
 
-def _upsert_account(state: dict, client_id: str, issuer: str, subject: str) -> None:
-    """Keep the account-to-client mapping (it outlives sign-out and removal)."""
+def _upsert_account(state: dict, client_id: str, issuer: str, subject: str, email: str | None) -> None:
+    """Keep the account-to-client mapping (it outlives sign-out and removal), one entry per verified account.
+
+    A new registration for an account already mapped (same ``iss`` and
+    ``sub``) updates that entry's client id rather than adding a duplicate.
+    """
 
     for account in state["accounts"]:
-        if account["client_id"] == client_id:
-            account.update(issuer=issuer, subject=subject)
-            return
-    state["accounts"].append({"client_id": client_id, "issuer": issuer, "subject": subject})
+        if (account["issuer"], account["subject"]) == (issuer, subject) or account["client_id"] == client_id:
+            account.update(client_id=client_id, issuer=issuer, subject=subject, email=email or account.get("email"))
+            break
+    else:
+        state["accounts"].append({"client_id": client_id, "issuer": issuer, "subject": subject, "email": email})
+    # One entry per account and per client: drop any other entry left holding either.
+    seen: set[tuple[str, str]] = set()
+    kept = []
+    for account in state["accounts"]:
+        key = (account["issuer"], account["subject"])
+        if key in seen or (account["client_id"] == client_id and key != (issuer, subject)):
+            continue
+        seen.add(key)
+        kept.append(account)
+    state["accounts"] = kept
+    if state.get("pending_client") == client_id:
+        state["pending_client"] = None
+
+
+def account_id(client_id: str) -> str:
+    """An opaque handle for a saved account, so the browser never needs the client id itself."""
+
+    return hashlib.sha256(client_id.encode("utf-8")).hexdigest()[:16]
+
+
+def chatgpt_saved_accounts(home: Path) -> list[dict]:
+    """Saved ChatGPT accounts with no connection now: each can be signed in again with its issued client.
+
+    ``[{"id": <opaque>, "email": <str or None>}]``. Reads ``chatgpt.json`` only.
+    """
+
+    try:
+        state = _load_state(home)
+    except ConnectionRefused:
+        return []
+    in_use = {entry["client_id"] for entry in state["connections"].values()}
+    return [
+        {"id": account_id(account["client_id"]), "email": account.get("email")}
+        for account in state["accounts"]
+        if account["client_id"] not in in_use
+    ]
 
 
 # ---- the credential record (keychain) ---------------------------------------------------------
@@ -1220,12 +1285,15 @@ def _email(value: object) -> str | None:
 
 @dataclass(frozen=True)
 class _Reauth:
-    """A sign-in again for one existing connection, with that account's issued client."""
+    """A sign-in with an already issued client: for an existing connection, a saved account, or a
+    first registration whose code exchange returned invalid_grant (no identity known yet)."""
 
-    conn_id: str
+    # The connection to update; None makes a new connection on success.
+    conn_id: str | None
     client_id: str
-    issuer: str
-    subject: str
+    # The verified account this client belongs to; None only for a pending registration.
+    issuer: str | None
+    subject: str | None
     email: str | None = field(repr=False)
     id_token: str | None = field(repr=False)
     # Plan use was not granted before: ask for consent again (OpenAI's "enable plan usage" path).
@@ -1335,6 +1403,10 @@ class _ChatGPTFlow(_Flow):
                     "resource": CHATGPT_RESOURCE,
                 },
             )
+        except TransportError as exc:
+            self._note_exchange_failure(client_id, exc)
+            raise _signin_failure(exc) from None
+        try:
             tokens = _parse_token_set(raw, need_id_token=True)
             discovery = _discovery(transport)
             jwks = transport.get_json(discovery["jwks_uri"], {"accept": "application/json"}, _DISCOVERY_TIMEOUT)
@@ -1347,7 +1419,8 @@ class _ChatGPTFlow(_Flow):
         plan: PlanState = "enabled" if CHATGPT_PLAN_SCOPE in scopes else "disabled"
         email = _email(claims.get("email"))
         if self.target is not None:
-            if claims["sub"] != self.target.subject or claims["iss"] != self.target.issuer:
+            known = self.target.subject is not None
+            if known and (claims["sub"] != self.target.subject or claims["iss"] != self.target.issuer):
                 raise SigninRefused("ai_chatgpt_account_mismatch")
             email = email or self.target.email
         record = {
@@ -1367,13 +1440,13 @@ class _ChatGPTFlow(_Flow):
             "saved_at": _iso(now),
         }
         home = self.store.home
-        if self.target is None:
+        if self.target is None or self.target.conn_id is None:
             conn = self.store.add_record(
                 CHATGPT_PRESET, model=self.model, record=json.dumps(record, sort_keys=True), label=CHATGPT_LABEL
             )
             try:
                 with _state_change(home) as state:
-                    _upsert_account(state, client_id, record["issuer"], record["subject"])
+                    _upsert_account(state, client_id, record["issuer"], record["subject"], email)
                     state["connections"][conn.id] = {
                         "client_id": client_id,
                         "plan": plan,
@@ -1392,12 +1465,31 @@ class _ChatGPTFlow(_Flow):
                 raise ConnectionRefused("ai_chatgpt_not_chatgpt")
             _write_record(self.store, conn_id, record)
             with _state_change(home) as state:
-                _upsert_account(state, client_id, record["issuer"], record["subject"])
+                _upsert_account(state, client_id, record["issuer"], record["subject"], email)
                 entry = state["connections"].setdefault(
                     conn_id, {"client_id": client_id, "welcome_shown": False, "account": None}
                 )
                 entry.update(client_id=client_id, plan=plan, signed_in=True, account=email)
         return conn_id, plan
+
+    def _note_exchange_failure(self, client_id: str, exc: TransportError) -> None:
+        """Keep an issued client whose code exchange returned invalid_grant, so the next attempt reuses it.
+
+        OpenAI: "If code exchange returns invalid_grant, discard that code and
+        start a fresh authorization with the issued client ID retained for
+        this attempt." A pending client that OpenAI refuses for another reason
+        is dropped, so the next attempt registers afresh.
+        """
+
+        code = _oauth_error_code(exc.body) if exc.status is not None and 400 <= exc.status < 500 else None
+        if code is None:
+            return  # a network or server failure says nothing about the client
+        # Best effort: the attempt has failed either way.
+        with contextlib.suppress(Exception), _state_change(self.store.home) as state:
+            if code == "invalid_grant" and (self.target is None or self.target.subject is None):
+                state["pending_client"] = client_id
+            elif code != "invalid_grant" and state.get("pending_client") == client_id:
+                state["pending_client"] = None
 
     def status(self) -> dict:
         out = super().status()
@@ -1417,23 +1509,34 @@ def start_chatgpt_signin(
     listener_factory: ListenerFactory | None = None,
     registry: SigninRegistry | None = None,
     connection_id: str | None = None,
+    account: str | None = None,
     allow_injected_fake_backend: bool = False,
 ) -> SigninFlow:
     """Open the loopback callback and return the address the browser should open.
 
-    Without ``connection_id`` this registers a new client for the account the
-    person picks (``dynamic_agent_client``, ``agent_name_hint=Krellbot``).
-    With it, it signs that connection in again with its saved issued client
-    id, no ``agent_name_hint``, and ``id_token_hint`` / ``login_hint`` when
-    retained. The returned ``authorize_url`` is the listener's launch address
-    on ``127.0.0.1``, which redirects to OpenAI; the OpenAI URL itself stays in
-    the engine. The model, the connection, the keychain and the host id are
-    checked first, so a bad request never opens a listener. Blocks briefly on
-    the keychain: async callers use a worker thread.
+    Every sign-in that already has an issued client id reuses it, with no
+    ``agent_name_hint`` and with ``id_token_hint`` / ``login_hint`` when
+    retained:
+
+    - ``connection_id``: sign that connection in again;
+    - ``account`` (an id from :func:`chatgpt_saved_accounts`): "Continue as"
+      a saved account, making a new connection;
+    - neither, while a first registration's client is pending after an
+      ``invalid_grant`` exchange: retry with that client.
+
+    Otherwise it registers a new client for the account the person picks
+    (``dynamic_agent_client``, ``agent_name_hint=Krellbot``). The returned
+    ``authorize_url`` is the listener's launch address on ``127.0.0.1``,
+    which redirects to OpenAI; the OpenAI URL itself stays in the engine. The
+    model, the connection, the keychain and the host id are checked first, so
+    a bad request never opens a listener. Blocks briefly on the keychain:
+    async callers use a worker thread.
     """
 
     store = ConnectionStore(home, allow_injected_fake_backend=allow_injected_fake_backend)
     conn: Connection | None = None
+    if connection_id is not None and account is not None:
+        raise ConnectionRefused("ai_body_invalid")
     if connection_id is not None:
         conn = store.get(connection_id)
         if not is_chatgpt(conn):
@@ -1459,6 +1562,24 @@ def start_chatgpt_signin(
             id_token=_token_value(record.get("id_token")),
             enable_plan=CHATGPT_PLAN_SCOPE not in record["scopes"],
         )
+    else:
+        state = _load_state(home)
+        if account is not None:
+            saved = next((a for a in state["accounts"] if account_id(a["client_id"]) == account), None)
+            if saved is None or not isinstance(account, str):
+                raise ConnectionRefused("ai_chatgpt_account_unknown")
+            target = _Reauth(
+                conn_id=None,
+                client_id=saved["client_id"],
+                issuer=saved["issuer"],
+                subject=saved["subject"],
+                email=saved.get("email"),
+                id_token=None,  # an ID token is retained only with a connection's record
+            )
+        elif state["pending_client"] is not None:
+            target = _Reauth(
+                conn_id=None, client_id=state["pending_client"], issuer=None, subject=None, email=None, id_token=None
+            )
     host_id = chatgpt_host_id(home)  # persisted before the first sign-in; an unreadable file refuses here
 
     verifier = stdlib_secrets.token_urlsafe(_VERIFIER_BYTES)
@@ -1603,6 +1724,8 @@ def chatgpt_access_token(
     if not is_chatgpt(conn):
         raise ConnectionRefused("ai_chatgpt_not_chatgpt")
     with _record_lock(store.home, conn.id):
+        if _signing_out(store.home, conn.id):
+            raise ConnectionRefused("ai_chatgpt_signin_required")  # its tokens are being revoked
         record = _read_record(store, conn)  # re-read under the lock: another thread may have rotated it
         if not record.get("access_token"):
             raise ConnectionRefused("ai_chatgpt_signin_required")
@@ -1637,12 +1760,37 @@ def chatgpt_adapter(
         try:
             return chatgpt_access_token(store, conn, transport=form, clock=clock)
         except ConnectionRefused as exc:
-            raise StreamFailure(ProviderError("provider_auth_failed", exc.message)) from None
+            # Only an ended sign-in is "sign in again"; OpenAI being unreachable is a temporary failure.
+            code = "provider_unavailable" if exc.code in _TEMPORARY_REFUSALS else "provider_auth_failed"
+            raise StreamFailure(ProviderError(code, exc.message)) from None
 
     return OpenAICompatAdapter(conn.base_url, None, transport, api="responses", token_source=token)
 
 
-def _revoke(transport: FormTransport, record: dict, sleep: Callable[[float], None]) -> bool:
+_TEMPORARY_REFUSALS = frozenset({"ai_chatgpt_refresh_unavailable", "ai_keychain_unavailable"})
+
+# Connections whose refresh token is being revoked: no refresh may rotate it meanwhile.
+_SIGNING_OUT: set[tuple[str, str]] = set()
+
+
+def _signing_out(home: Path, conn_id: str) -> bool:
+    with _LOCKS_GUARD:
+        return (os.path.abspath(home), conn_id) in _SIGNING_OUT
+
+
+def _mark_signing_out(home: Path, conn_id: str, on: bool) -> None:
+    key = (os.path.abspath(home), conn_id)
+    with _LOCKS_GUARD:
+        if on:
+            _SIGNING_OUT.add(key)
+        else:
+            _SIGNING_OUT.discard(key)
+
+
+RevokeOutcome = Literal["confirmed", "unreachable", "refused", "no_endpoint"]
+
+
+def _revoke(transport: FormTransport, record: dict, sleep: Callable[[float], None]) -> RevokeOutcome:
     """Revoke the refresh token at the discovery ``revocation_endpoint``; retry network and 5xx failures."""
 
     fields = {
@@ -1658,16 +1806,16 @@ def _revoke(transport: FormTransport, record: dict, sleep: Callable[[float], Non
             if endpoint is None:
                 endpoint = _discovery(transport)["revocation_endpoint"]
                 if endpoint is None:
-                    return False
+                    return "no_endpoint"
             _post_form(transport, endpoint, fields, timeout=_REVOKE_TIMEOUT)
         except TransportError as exc:
             if exc.status is not None and exc.status < 500:
-                return False  # a refusal will not change on retry
+                return "refused"  # a refusal will not change on retry
             continue
         except SigninRefused:
-            return False
-        return True  # an empty 200 (also for an already-invalid token)
-    return False
+            return "no_endpoint"  # discovery could not be used
+        return "confirmed"  # an empty 200 (also for an already-invalid token)
+    return "unreachable"
 
 
 def chatgpt_sign_out(
@@ -1679,9 +1827,11 @@ def chatgpt_sign_out(
 ) -> RevocationResult:
     """Revoke the refresh token, then clear the tokens locally.
 
-    The account-to-client mapping and the host id are kept, so a later
-    sign-in reuses the issued client. When revocation is not confirmed, the
-    tokens are still cleared and the result says so.
+    The record is read under the connection's lock, revoked outside it (no
+    refresh can run meanwhile: the connection is marked as signing out), and
+    cleared under the lock again. The account-to-client mapping and the host
+    id are kept, so a later sign-in reuses the issued client. When revocation
+    is not confirmed, the tokens are still cleared and the result says why.
     """
 
     if not is_chatgpt(conn):
@@ -1693,13 +1843,28 @@ def chatgpt_sign_out(
             if exc.code != "ai_chatgpt_signin_required":
                 raise
             record = None
-        revocation: Revocation = "none"
+        _mark_signing_out(store.home, conn.id, True)
+    try:
+        outcome: RevokeOutcome | None = None
         if record is not None and record.get("refresh_token"):
-            revocation = "confirmed" if _revoke(transport, record, sleep) else "not_confirmed"
-        if record is not None:
-            _write_record(store, conn.id, _cleared(record, keep_id_token=False))
-        _set_connection_state(store.home, conn.id, signed_in=False)
-    return RevocationResult(revocation, REVOCATION_NOT_CONFIRMED if revocation == "not_confirmed" else "")
+            outcome = _revoke(transport, record, sleep)
+        with _record_lock(store.home, conn.id):
+            try:
+                current: dict | None = _read_record(store, conn)
+            except ConnectionRefused as exc:
+                if exc.code != "ai_chatgpt_signin_required":
+                    raise
+                current = None
+            if current is not None:
+                _write_record(store, conn.id, _cleared(current, keep_id_token=False))
+            _set_connection_state(store.home, conn.id, signed_in=False)
+    finally:
+        _mark_signing_out(store.home, conn.id, False)
+    if outcome is None:
+        return RevocationResult("none")
+    if outcome == "confirmed":
+        return RevocationResult("confirmed")
+    return RevocationResult("not_confirmed", REVOCATION_NOT_CONFIRMED[outcome])
 
 
 def remove_chatgpt_connection(
