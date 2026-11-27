@@ -5002,32 +5002,39 @@ def create_app(
 
         An invalid file reads as the fail-closed snapshot the engine enforces,
         with ``code`` ``user_policy_invalid`` and the engine's message, so the
-        editor never shows that snapshot as the operator's choice.
+        editor never shows that snapshot as the operator's choice. ``digest``
+        names the exact file bytes the snapshot came from (``absent`` for no
+        file); an editor sends it back as ``expected_digest`` when it saves.
         """
 
         s = _state(request.app)
         denied = _gate_get(request, s)
         if denied is not None:
             return denied
-        # ``check`` reads the file once and never journals, unlike ``ensure_allowed``.
-        decision = user_policy_app.check(s.home, user_policy_app.ACTION_PAPER_ARM)
-        policy = decision.policy or user_policy_app.load_policy(s.home)
+        # One read of the file, so the snapshot and its digest always match.
+        read = user_policy_app.read_policy(s.home)
         out: dict = {
             "schema_version": SCHEMA_VERSION,
             "ok": True,
             "effect": "unchanged",
-            "code": user_policy_app.CODE_OK,
-            "policy": policy.to_dict(),
+            "code": user_policy_app.CODE_POLICY_INVALID if read.invalid else user_policy_app.CODE_OK,
+            "policy": read.policy.to_dict(),
             "path": user_policy_app.POLICY_FILENAME,
+            "digest": read.digest,
         }
-        if decision.code == user_policy_app.CODE_POLICY_INVALID:
-            out["code"] = decision.code
-            out["message"] = decision.message
+        if read.invalid:
+            out["message"] = user_policy_app.MESSAGE_INVALID
         return JSONResponse(out, status_code=200, headers={"Cache-Control": "no-store"})
 
     @app.put("/api/v1/user-policy")
     async def put_user_policy(request: Request) -> Response:
-        """Replace the operator user-policy file; audits the change."""
+        """Replace the operator user-policy file; audits the change.
+
+        With ``expected_digest`` (the ``digest`` a GET returned), the save is
+        refused with 409 ``user_policy_changed``, and nothing is written, if
+        the file changed since that read; a successful save then also returns
+        the new file's ``digest``. Without it, the file is replaced as before.
+        """
 
         s = _state(request.app)
         denied = _gate_state_change(request, s)
@@ -5039,10 +5046,24 @@ def create_app(
             return JSONResponse({"detail": "invalid body"}, status_code=400)
         if not isinstance(payload, dict):
             return JSONResponse({"detail": "invalid body"}, status_code=400)
-        body = payload.get("policy", payload)
+        has_digest = "expected_digest" in payload
+        expected_digest = payload.get("expected_digest")
+        if has_digest and not isinstance(expected_digest, str):
+            return JSONResponse({"detail": "invalid body"}, status_code=400)
+        if "policy" in payload:
+            body = payload["policy"]
+        elif has_digest:
+            # An unwrapped policy carries the digest beside its own fields.
+            body = {key: value for key, value in payload.items() if key != "expected_digest"}
+        else:
+            body = payload
         now = _app_now(s)
-        result = user_policy_app.save_policy(s.home, body, clock=lambda: now)
-        status = 200 if result.ok else 400
+        # No await between the digest check and the write: no other request runs in between.
+        result = user_policy_app.save_policy(s.home, body, clock=lambda: now, expected_digest=expected_digest)
+        if result.code == user_policy_app.CODE_POLICY_CHANGED:
+            status = 409
+        else:
+            status = 200 if result.ok else 400
         out: dict = {
             "schema_version": SCHEMA_VERSION,
             "ok": result.ok,
@@ -5054,6 +5075,8 @@ def create_app(
         }
         if result.policy is not None:
             out["policy"] = result.policy.to_dict()
+        if has_digest and result.digest is not None:
+            out["digest"] = result.digest
         return JSONResponse(out, status_code=status, headers={"Cache-Control": "no-store"})
 
     # ---- MCP client setup (M38.10) --------------------------------------

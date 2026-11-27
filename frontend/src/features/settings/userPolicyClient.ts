@@ -5,6 +5,11 @@
  *
  * The policy keeps its wire shape (snake_case keys, decimals as strings) so
  * the editor sends back exactly what it loaded apart from the user's edits.
+ *
+ * Each read carries the engine's `digest` of the policy file, and each save
+ * or reset sends it back as `expected_digest`. The engine refuses the write
+ * (`user_policy_changed`) if the file changed since that read, so a page
+ * showing an old read can never write it back over a newer policy.
  */
 import { getCsrf } from "../../session";
 
@@ -44,12 +49,23 @@ export type McpSetup = {
 
 export type PolicyRefusal = { ok: false; code: string; message: string };
 
+/**
+ * The engine's digest of the policy file a read or save saw, sent back as
+ * `expected_digest`. `null` only when the reply carried none.
+ */
+export type PolicyDigest = string | null;
+
 export type PolicyRead =
-  | { ok: true; policy: UserPolicy; invalid: PolicyInvalid | null }
+  | {
+      ok: true;
+      policy: UserPolicy;
+      invalid: PolicyInvalid | null;
+      digest: PolicyDigest;
+    }
   | PolicyRefusal;
 
 export type PolicySave =
-  | { ok: true; policy: UserPolicy; changed: boolean }
+  | { ok: true; policy: UserPolicy; changed: boolean; digest: PolicyDigest }
   | PolicyRefusal;
 
 export type McpSetupRead = { ok: true; setup: McpSetup } | PolicyRefusal;
@@ -58,6 +74,10 @@ const POLICY_URL = "/api/v1/user-policy";
 const MCP_SETUP_URL = "/api/v1/agents/mcp-setup";
 const CODE_POLICY_INVALID = "user_policy_invalid";
 const CODE_POLICY_UPDATED = "user_policy_updated";
+/** The engine refused a save: the policy file changed since it was read. */
+export const CODE_POLICY_CHANGED = "user_policy_changed";
+/** A reply this screen cannot read (for example, a count above 2^53). */
+export const CODE_BAD_RESPONSE = "bad_response";
 const GENERIC_MESSAGE = "Krellbot could not complete that request.";
 const UNREADABLE_MESSAGE = "Krellbot returned a reply this screen cannot read.";
 
@@ -145,7 +165,15 @@ function refusalOf(status: number, body: Body): PolicyRefusal {
 }
 
 function unreadable(): PolicyRefusal {
-  return { ok: false, code: "bad_response", message: UNREADABLE_MESSAGE };
+  return { ok: false, code: CODE_BAD_RESPONSE, message: UNREADABLE_MESSAGE };
+}
+
+/** The reply's digest: `null` when it has none, `undefined` for a bad one. */
+function digestOf(body: Body): PolicyDigest | undefined {
+  if (!("digest" in body) || body.digest === undefined) return null;
+  return typeof body.digest === "string" && body.digest !== ""
+    ? body.digest
+    : undefined;
 }
 
 function networkFailure(): PolicyRefusal {
@@ -179,23 +207,40 @@ async function request(
   return { ok: true, body };
 }
 
-async function put(payload: unknown): Promise<PolicySave> {
+async function put(
+  payload: unknown,
+  expectedDigest: PolicyDigest,
+): Promise<PolicySave> {
+  const body =
+    expectedDigest === null
+      ? { policy: payload }
+      : { policy: payload, expected_digest: expectedDigest };
   const result = await request(POLICY_URL, {
     method: "PUT",
     headers: { "Content-Type": "application/json", "X-Krellbot-CSRF": getCsrf() },
-    body: JSON.stringify({ policy: payload }),
+    body: JSON.stringify(body),
   });
   if (!result.ok) return result;
   const policy = toPolicy(result.body.policy);
-  if (policy === null) return unreadable();
-  return { ok: true, policy, changed: result.body.code === CODE_POLICY_UPDATED };
+  const digest = digestOf(result.body);
+  // A save checked against a digest must name the file it wrote, or the
+  // next save could not be checked.
+  if (policy === null || digest === undefined) return unreadable();
+  if (expectedDigest !== null && digest === null) return unreadable();
+  return {
+    ok: true,
+    policy,
+    changed: result.body.code === CODE_POLICY_UPDATED,
+    digest,
+  };
 }
 
 export async function loadUserPolicy(): Promise<PolicyRead> {
   const result = await request(POLICY_URL);
   if (!result.ok) return result;
   const policy = toPolicy(result.body.policy);
-  if (policy === null) return unreadable();
+  const digest = digestOf(result.body);
+  if (policy === null || digest === undefined) return unreadable();
   const invalid =
     result.body.code === CODE_POLICY_INVALID
       ? {
@@ -203,11 +248,15 @@ export async function loadUserPolicy(): Promise<PolicyRead> {
           message: str(result.body.message, "The policy file is invalid."),
         }
       : null;
-  return { ok: true, policy, invalid };
+  return { ok: true, policy, invalid, digest };
 }
 
-export function saveUserPolicy(policy: UserPolicy): Promise<PolicySave> {
-  return put(policy);
+/** Save `policy` over the file `digest` names (from the read or last save). */
+export function saveUserPolicy(
+  policy: UserPolicy,
+  digest: PolicyDigest,
+): Promise<PolicySave> {
+  return put(policy, digest);
 }
 
 /**
@@ -217,15 +266,22 @@ export function saveUserPolicy(policy: UserPolicy): Promise<PolicySave> {
  * defaults (it does for a file it reads as invalid) and the defaults live in
  * one place. Paper arming goes back to its default (allowed). Live and key
  * export are sent exactly as the engine reported them: this screen never
- * changes either.
+ * changes either. Like a save, it is refused if the file changed since
+ * `digest` was read.
  */
-export function resetUserPolicy(current: UserPolicy): Promise<PolicySave> {
-  return put({
-    schema_version: "1",
-    allow_paper_arm: true,
-    allow_live: current.allow_live,
-    allow_key_export: current.allow_key_export,
-  });
+export function resetUserPolicy(
+  current: UserPolicy,
+  digest: PolicyDigest,
+): Promise<PolicySave> {
+  return put(
+    {
+      schema_version: "1",
+      allow_paper_arm: true,
+      allow_live: current.allow_live,
+      allow_key_export: current.allow_key_export,
+    },
+    digest,
+  );
 }
 
 export async function loadMcpSetup(): Promise<McpSetupRead> {

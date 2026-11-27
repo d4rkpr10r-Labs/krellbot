@@ -6,16 +6,21 @@
  * It sends back every field exactly as loaded apart from the user's edits,
  * and never changes live trading or key export: this release is paper-only.
  * When the engine reads the file as invalid, the form shows the engine's
- * message and stays locked until the user resets it.
+ * message and stays locked until the user resets it. Every save and reset
+ * names the file it was read from, so the engine refuses it if the file has
+ * changed since: an old page can never write back over a newer policy.
  */
 import { useEffect, useId, useState, type FormEvent, type JSX } from "react";
+import { McpSetupPanel } from "./McpSetupPanel";
 import {
-  loadMcpSetup,
+  CODE_BAD_RESPONSE,
+  CODE_POLICY_CHANGED,
   loadUserPolicy,
   resetUserPolicy,
   saveUserPolicy,
-  type McpSetup,
+  type PolicyDigest,
   type PolicyInvalid,
+  type PolicyRefusal,
   type UserPolicy,
 } from "./userPolicyClient";
 
@@ -54,8 +59,26 @@ type TextField =
 
 type Loaded =
   | { status: "loading" }
-  | { status: "failed"; message: string }
-  | { status: "ready"; policy: UserPolicy; invalid: PolicyInvalid | null };
+  | { status: "failed"; code: string; message: string }
+  | {
+      status: "ready";
+      policy: UserPolicy;
+      invalid: PolicyInvalid | null;
+      digest: PolicyDigest;
+    };
+
+/** What the form is waiting on, so each button names its own request. */
+type Busy = "saving" | "resetting" | null;
+
+/** A value the engine would refuse, found before sending it. */
+type FieldError = { field: TextField; message: string };
+
+const CHANGED_MESSAGE =
+  "The policy changed since this page loaded. Reload to see the current limits.";
+
+// Shown when the policy cannot be read: there is no Reset button then.
+const UNREADABLE_ADVICE =
+  "Fix or remove user-policy.json in your Krellbot folder, then reload this page.";
 
 // The engine's own formats (application/user_policy.py): plain decimals with
 // no sign or exponent, and whole numbers of 0 or more.
@@ -108,7 +131,9 @@ function atMostHundred(value: string): boolean {
   return n < 100 || (n === 100 && /^0*$/.test(fraction));
 }
 
-type Built = { ok: true; policy: UserPolicy } | { ok: false; message: string };
+type Built =
+  | { ok: true; policy: UserPolicy }
+  | ({ ok: false } & FieldError);
 
 /** The policy to send, or the first field the engine would refuse. */
 function build(draft: Draft, loaded: UserPolicy): Built {
@@ -116,6 +141,7 @@ function build(draft: Draft, loaded: UserPolicy): Built {
   if (!PLAIN_DECIMAL.test(balance)) {
     return {
       ok: false,
+      field: "max_paper_balance",
       message:
         "Largest paper balance must be a plain number, such as 10000 or 2500.50.",
     };
@@ -124,6 +150,7 @@ function build(draft: Draft, loaded: UserPolicy): Built {
   if (!PLAIN_DECIMAL.test(risk) || !atMostHundred(risk)) {
     return {
       ok: false,
+      field: "max_risk_cap_pct",
       message:
         "Largest risk cap must be a plain number from 0 to 100, such as 2 or 1.5.",
     };
@@ -134,6 +161,7 @@ function build(draft: Draft, loaded: UserPolicy): Built {
     if (!COUNT.test(raw) || !Number.isSafeInteger(Number(raw))) {
       return {
         ok: false,
+        field,
         message: `${label} must be a whole number of 0 or more.`,
       };
     }
@@ -164,45 +192,6 @@ function build(draft: Draft, loaded: UserPolicy): Built {
       },
     },
   };
-}
-
-export type McpSnippet = {
-  id: "claude-desktop" | "claude-code" | "cursor" | "vscode";
-  client: string;
-  where: string;
-  text: string;
-};
-
-/** Setup for each client, from the engine-reported launch command. */
-export function mcpSnippets(setup: McpSetup): McpSnippet[] {
-  const entry = { command: setup.command, args: setup.args, env: setup.env };
-  const json = (value: unknown): string => JSON.stringify(value, null, 2);
-  return [
-    {
-      id: "claude-desktop",
-      client: "Claude Desktop",
-      where: "claude_desktop_config.json",
-      text: json({ mcpServers: { krellbot: entry } }),
-    },
-    {
-      id: "claude-code",
-      client: "Claude Code",
-      where: "run in a terminal",
-      text: setup.claudeCode,
-    },
-    {
-      id: "cursor",
-      client: "Cursor",
-      where: ".cursor/mcp.json in a project, or ~/.cursor/mcp.json",
-      text: json({ mcpServers: { krellbot: entry } }),
-    },
-    {
-      id: "vscode",
-      client: "VS Code",
-      where: ".vscode/mcp.json",
-      text: json({ servers: { krellbot: { type: "stdio", ...entry } } }),
-    },
-  ];
 }
 
 export type AgentsSectionProps = {
@@ -247,8 +236,11 @@ function LimitsEditor({ enabled }: { enabled: boolean }): JSX.Element {
   const ids = useId();
   const [loaded, setLoaded] = useState<Loaded>({ status: "loading" });
   const [draft, setDraft] = useState<Draft | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<Busy>(null);
+  // An engine refusal of the last save or reset.
   const [error, setError] = useState<string | null>(null);
+  // A value refused here before sending; editing any field clears it.
+  const [fieldError, setFieldError] = useState<FieldError | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   useEffect(() => {
@@ -257,13 +249,18 @@ function LimitsEditor({ enabled }: { enabled: boolean }): JSX.Element {
     void loadUserPolicy().then((result) => {
       if (cancelled) return;
       if (!result.ok) {
-        setLoaded({ status: "failed", message: result.message });
+        setLoaded({
+          status: "failed",
+          code: result.code,
+          message: result.message,
+        });
         return;
       }
       setLoaded({
         status: "ready",
         policy: result.policy,
         invalid: result.invalid,
+        digest: result.digest,
       });
       setDraft(draftOf(result.policy));
     });
@@ -273,9 +270,11 @@ function LimitsEditor({ enabled }: { enabled: boolean }): JSX.Element {
   }, [enabled]);
 
   if (loaded.status === "failed") {
+    const advice =
+      loaded.code === CODE_BAD_RESPONSE ? ` ${UNREADABLE_ADVICE}` : "";
     return (
       <p className="kbot-settings__error" role="alert">
-        The agent limits could not be loaded: {loaded.message}
+        {`The agent limits could not be loaded: ${loaded.message}${advice}`}
       </p>
     );
   }
@@ -287,61 +286,98 @@ function LimitsEditor({ enabled }: { enabled: boolean }): JSX.Element {
     );
   }
 
-  const { policy, invalid } = loaded;
-  const off = invalid !== null || busy;
+  const { policy, invalid, digest } = loaded;
+  const off = invalid !== null || busy !== null;
+  const errorId = `${ids}-field-error`;
 
-  function adopt(next: UserPolicy, message: string): void {
-    setLoaded({ status: "ready", policy: next, invalid: null });
+  function adopt(
+    next: UserPolicy,
+    nextDigest: PolicyDigest,
+    message: string,
+  ): void {
+    setLoaded({
+      status: "ready",
+      policy: next,
+      invalid: null,
+      digest: nextDigest,
+    });
     setDraft(draftOf(next));
     setNotice(message);
+  }
+
+  /** The engine's refusal; a changed file always gets the reload advice. */
+  function refused(result: PolicyRefusal, prefix: string): string {
+    return result.code === CODE_POLICY_CHANGED
+      ? CHANGED_MESSAGE
+      : `${prefix}: ${result.message}`;
   }
 
   async function save(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     if (off || draft === null) return;
     setNotice(null);
+    setError(null);
     const built = build(draft, policy);
     if (!built.ok) {
-      setError(built.message);
+      setFieldError({ field: built.field, message: built.message });
       return;
     }
-    setError(null);
-    setBusy(true);
+    setFieldError(null);
+    setBusy("saving");
     try {
-      const result = await saveUserPolicy(built.policy);
+      const result = await saveUserPolicy(built.policy, digest);
       if (result.ok) {
-        adopt(result.policy, result.changed ? "Saved." : "No changes to save.");
+        adopt(
+          result.policy,
+          result.digest,
+          result.changed ? "Saved." : "No changes to save.",
+        );
       } else {
-        setError(`Not saved: ${result.message}`);
+        setError(refused(result, "Not saved"));
       }
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   }
 
   async function reset(): Promise<void> {
-    if (busy) return;
-    setBusy(true);
+    if (busy !== null) return;
+    setBusy("resetting");
     setError(null);
+    setFieldError(null);
     setNotice(null);
     try {
-      const result = await resetUserPolicy(policy);
+      const result = await resetUserPolicy(policy, digest);
       if (result.ok) {
-        adopt(result.policy, "Reset to the default limits.");
+        adopt(result.policy, result.digest, "Reset to the default limits.");
       } else {
-        setError(`Not reset: ${result.message}`);
+        setError(refused(result, "Not reset"));
       }
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   }
 
-  const setFlag = (field: FlagField, value: boolean): void =>
+  /** An edit makes the last notice and any value refused here out of date. */
+  function edited(): void {
+    setNotice(null);
+    setFieldError(null);
+  }
+  const setFlag = (field: FlagField, value: boolean): void => {
+    edited();
     setDraft((d) => (d ? { ...d, [field]: value } : d));
-  const setText = (field: TextField, value: string): void =>
+  };
+  const setText = (field: TextField, value: string): void => {
+    edited();
     setDraft((d) => (d ? { ...d, [field]: value } : d));
-  const setList = (field: "venues" | "pairs", next: Partial<Allowlist>): void =>
+  };
+  const setList = (
+    field: "venues" | "pairs",
+    next: Partial<Allowlist>,
+  ): void => {
+    edited();
     setDraft((d) => (d ? { ...d, [field]: { ...d[field], ...next } } : d));
+  };
 
   const toggle = (
     field: FlagField,
@@ -364,6 +400,11 @@ function LimitsEditor({ enabled }: { enabled: boolean }): JSX.Element {
       hint={hint}
       value={draft[field]}
       disabled={off}
+      error={
+        fieldError?.field === field
+          ? { id: errorId, message: fieldError.message }
+          : undefined
+      }
       onChange={(value) => setText(field, value)}
     />
   );
@@ -438,10 +479,10 @@ function LimitsEditor({ enabled }: { enabled: boolean }): JSX.Element {
           <button
             type="button"
             className="kbot-settings__btn"
-            disabled={busy}
+            disabled={busy !== null}
             onClick={() => void reset()}
           >
-            Reset to default limits
+            {busy === "resetting" ? "Resetting…" : "Reset to default limits"}
           </button>
         </div>
       ) : null}
@@ -547,7 +588,7 @@ function LimitsEditor({ enabled }: { enabled: boolean }): JSX.Element {
       ) : null}
       <div className="kbot-settings__inline-actions">
         <button type="submit" className="kbot-settings__btn" disabled={off}>
-          {busy ? "Saving…" : "Save limits"}
+          {busy === "saving" ? "Saving…" : "Save limits"}
         </button>
       </div>
     </form>
@@ -587,8 +628,11 @@ function TextInput(props: {
   hint: string;
   value: string;
   disabled: boolean;
+  /** A value refused before sending: marks the input and describes it. */
+  error?: { id: string; message: string };
   onChange(value: string): void;
 }): JSX.Element {
+  const hintId = `${props.id}-hint`;
   return (
     <div className="kbot-settings__field">
       <label className="kbot-settings__field-label" htmlFor={props.id}>
@@ -600,121 +644,22 @@ function TextInput(props: {
         type="text"
         autoComplete="off"
         spellCheck={false}
-        aria-describedby={`${props.id}-hint`}
+        aria-invalid={props.error ? true : undefined}
+        aria-describedby={
+          props.error ? `${hintId} ${props.error.id}` : hintId
+        }
         value={props.value}
         disabled={props.disabled}
         onChange={(event) => props.onChange(event.target.value)}
       />
-      <p className="kbot-settings__status-line" id={`${props.id}-hint`}>
+      <p className="kbot-settings__status-line" id={hintId}>
         {props.hint}
       </p>
-    </div>
-  );
-}
-
-function McpSetupPanel({ enabled }: { enabled: boolean }): JSX.Element {
-  const [setup, setSetup] = useState<McpSetup | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [copied, setCopied] = useState<string | null>(null);
-  const [copyFailed, setCopyFailed] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!enabled) return;
-    let cancelled = false;
-    void loadMcpSetup().then((result) => {
-      if (cancelled) return;
-      if (result.ok) {
-        setSetup(result.setup);
-        setError(null);
-      } else {
-        setError(result.message);
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [enabled]);
-
-  function copy(snippet: McpSnippet): void {
-    setCopied(null);
-    setCopyFailed(null);
-    const fail = (): void => setCopyFailed(snippet.id);
-    try {
-      const clipboard = navigator.clipboard;
-      if (!clipboard || typeof clipboard.writeText !== "function") {
-        fail();
-        return;
-      }
-      void clipboard
-        .writeText(snippet.text)
-        .then(() => setCopied(snippet.id), fail);
-    } catch {
-      fail();
-    }
-  }
-
-  return (
-    <div className="kbot-settings__card" data-testid="agents-mcp-setup">
-      <h3 className="kbot-settings__subhead">Connect an MCP client</h3>
-      <p className="kbot-settings__card-copy">
-        Claude Desktop, Claude Code, Cursor and VS Code can use Krellbot&apos;s
-        agent tools over MCP. The client starts Krellbot with the command below,
-        on this computer, and talks to it over stdio. Nothing listens on the
-        network, and nothing runs until a client starts it.
-      </p>
-      <p className="kbot-settings__card-copy">
-        Through MCP, Krellbot controls only what its tools return. It cannot
-        police what your client&apos;s model writes around those results.
-      </p>
-      <p className="kbot-settings__card-copy">
-        MCP agents obey the limits above. Your client asks you before each tool
-        call unless you told it not to; keep that on for changes.
-      </p>
-      {error ? (
-        <p className="kbot-settings__error" role="alert">
-          The launch command could not be loaded: {error}
+      {props.error ? (
+        <p className="kbot-settings__error" role="alert" id={props.error.id}>
+          {props.error.message}
         </p>
       ) : null}
-      {setup === null && error === null ? (
-        <p className="kbot-settings__status-line" role="status">
-          Loading the launch command…
-        </p>
-      ) : null}
-      {setup
-        ? mcpSnippets(setup).map((snippet) => (
-            <div key={snippet.id} className="kbot-settings__field">
-              <p className="kbot-settings__field-label">
-                {snippet.client} · {snippet.where}
-              </p>
-              <pre
-                className="kbot-settings__code"
-                data-testid={`mcp-snippet-${snippet.id}`}
-              >
-                {snippet.text}
-              </pre>
-              <div className="kbot-settings__inline-actions">
-                <button
-                  type="button"
-                  className="kbot-settings__btn"
-                  aria-label={`Copy ${snippet.client} setup`}
-                  onClick={() => copy(snippet)}
-                >
-                  Copy
-                </button>
-                {copied === snippet.id ? (
-                  <span className="kbot-settings__status-line" role="status">
-                    Copied
-                  </span>
-                ) : null}
-              </div>
-              {copyFailed === snippet.id ? (
-                <p className="kbot-settings__error" role="alert">
-                  Could not copy. Select the text and copy it yourself.
-                </p>
-              ) : null}
-            </div>
-          ))
-        : null}
     </div>
   );
 }

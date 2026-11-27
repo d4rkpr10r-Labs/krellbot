@@ -160,7 +160,10 @@ pause/resume and disarm (off for external MCP agents by default). Over a
 limit, a call is refused with an `agent_limit_*` or
 `agent_change_not_allowed` code and journaled. Edit the limits in
 Settings → Agents & limits; an invalid policy file locks that form until
-you reset it to the default limits.
+you reset it to the default limits. If the file changes while that page is
+open (for example, you edit it by hand), the page's save and reset are
+refused (`user_policy_changed`) until you reload it, so an old page never
+writes over a newer policy.
 
 ## Cursor client
 

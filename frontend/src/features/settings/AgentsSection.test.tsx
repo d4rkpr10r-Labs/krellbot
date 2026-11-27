@@ -431,3 +431,325 @@ describe("Settings navigation", () => {
     expect(onSectionChange).toHaveBeenCalledWith("ai");
   });
 });
+
+const CHANGED_MESSAGE =
+  "The policy changed since this page loaded. Reload to see the current limits.";
+
+type FileState = { policy: Json; digest: string; invalid: boolean };
+
+type PolicyServer = {
+  calls: Call[];
+  /** Every policy the fake engine accepted and wrote. */
+  written: Json[];
+  file(): FileState;
+  /** The operator edits user-policy.json by hand while the page is open. */
+  editByHand(policy: Json, digest: string): void;
+  /** Hold the next PUT reply until the returned function is called. */
+  holdNextPut(): () => void;
+};
+
+/**
+ * A fake engine that checks `expected_digest` the way the real one does:
+ * a PUT naming a digest other than the file's is refused with 409 and
+ * writes nothing; a write gives the file a new digest.
+ */
+function policyServer(start: FileState): PolicyServer {
+  let state = start;
+  let writes = 0;
+  let held: Promise<void> | null = null;
+  const calls: Call[] = [];
+  const written: Json[] = [];
+  const reply = (status: number, json: unknown): Response =>
+    new Response(JSON.stringify(json), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const call: Call = {
+        method: init?.method ?? "GET",
+        path: String(input),
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        headers: new Headers(init?.headers),
+      };
+      calls.push(call);
+      if (call.path === "/api/v1/agents/mcp-setup") return reply(200, SETUP);
+      if (call.path !== "/api/v1/user-policy") {
+        throw new Error(`unexpected ${call.method} ${call.path}`);
+      }
+      if (call.method === "GET") {
+        return reply(
+          200,
+          read(state.policy, {
+            digest: state.digest,
+            ...(state.invalid
+              ? { code: "user_policy_invalid", message: INVALID_MESSAGE }
+              : {}),
+          }).json,
+        );
+      }
+      if (held) {
+        const wait = held;
+        held = null;
+        await wait;
+      }
+      const sent = call.body as { policy: Json; expected_digest?: string };
+      if (
+        sent.expected_digest !== undefined &&
+        sent.expected_digest !== state.digest
+      ) {
+        return reply(409, {
+          schema_version: "1",
+          ok: false,
+          code: "user_policy_changed",
+          message:
+            "user policy changed since it was read; read it again before saving",
+          effect: "refused",
+        });
+      }
+      const next =
+        sent.policy.schema_version === "1"
+          ? {
+              ...sent.policy,
+              schema_version: "2",
+              agents: state.invalid
+                ? DEFAULT_AGENTS
+                : (state.policy.agents as Json),
+            }
+          : sent.policy;
+      writes += 1;
+      state = { policy: next, digest: `written-${writes}`, invalid: false };
+      written.push(next);
+      return reply(200, {
+        ...(saved(next).json as Json),
+        digest: state.digest,
+      });
+    }),
+  );
+  return {
+    calls,
+    written,
+    file: () => state,
+    editByHand(policy: Json, digest: string): void {
+      state = { policy, digest, invalid: false };
+    },
+    holdNextPut(): () => void {
+      let release: () => void = () => undefined;
+      held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return release;
+    },
+  };
+}
+
+function sentDigest(call: Call): unknown {
+  return (call.body as { expected_digest?: unknown }).expected_digest;
+}
+
+describe("AgentsSection when the policy file changes under the page", () => {
+  it("checks each save against the file it read and then the file it wrote", async () => {
+    const server = policyServer({
+      policy: policy(),
+      digest: "read-1",
+      invalid: false,
+    });
+    render(<AgentsSection />);
+    await loaded();
+
+    const balance = screen.getByLabelText(/largest paper balance/i);
+    fireEvent.change(balance, { target: { value: "5000" } });
+    fireEvent.click(screen.getByRole("button", { name: /save limits/i }));
+    await screen.findByText("Saved.");
+    fireEvent.change(balance, { target: { value: "4000" } });
+    fireEvent.click(screen.getByRole("button", { name: /save limits/i }));
+    await screen.findByText("Saved.");
+
+    const sent = puts(server.calls);
+    expect(sent.map(sentDigest)).toEqual(["read-1", "written-1"]);
+    expect(server.written).toHaveLength(2);
+    expect((server.file().policy.agents as Json).max_paper_balance).toBe(
+      "4000",
+    );
+  });
+
+  it("refuses a save from a page loaded before the policy changed", async () => {
+    const server = policyServer({
+      policy: policy({ allow_live: true }),
+      digest: "read-1",
+      invalid: false,
+    });
+    render(<AgentsSection />);
+    await loaded();
+
+    // The operator turns live off by hand while this page is open.
+    const tightened = policy({ allow_live: false }, { max_agent_arms: 1 });
+    server.editByHand(tightened, "by-hand");
+    fireEvent.change(screen.getByLabelText(/largest paper balance/i), {
+      target: { value: "5000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /save limits/i }));
+
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      CHANGED_MESSAGE,
+    );
+    expect(screen.queryByText("Saved.")).toBeNull();
+    expect(sentDigest(puts(server.calls)[0])).toBe("read-1");
+    // Saving again from the same page is refused again.
+    fireEvent.click(screen.getByRole("button", { name: /save limits/i }));
+    await waitFor(() => expect(puts(server.calls)).toHaveLength(2));
+    await screen.findByRole("button", { name: "Save limits" });
+    expect(screen.getByRole("alert").textContent).toBe(CHANGED_MESSAGE);
+
+    // Nothing was written: live stays off and the hand edit stands.
+    expect(server.written).toEqual([]);
+    expect(server.file().policy).toEqual(tightened);
+    expect(server.written.some((p) => p.allow_live === true)).toBe(false);
+  });
+
+  it("refuses a reset from a page loaded before the policy file was fixed", async () => {
+    const server = policyServer({
+      policy: policy(
+        { allow_paper_arm: false, allow_live: false },
+        LOCKED_AGENTS,
+      ),
+      digest: "read-invalid",
+      invalid: true,
+    });
+    render(<AgentsSection />);
+    await loaded();
+    expect(screen.getByTestId("agents-policy-invalid")).toBeTruthy();
+
+    // The operator fixes the file by hand, with paper arming and live off.
+    const fixed = policy({ allow_paper_arm: false, allow_live: false });
+    server.editByHand(fixed, "by-hand");
+    fireEvent.click(
+      screen.getByRole("button", { name: /reset to default limits/i }),
+    );
+
+    expect(await screen.findByText(CHANGED_MESSAGE)).toBeTruthy();
+    await screen.findByRole("button", { name: /reset to default limits/i });
+    expect(sentDigest(puts(server.calls)[0])).toBe("read-invalid");
+    // Nothing was written: paper arming and live stay off.
+    expect(server.written).toEqual([]);
+    expect(server.file().policy).toEqual(fixed);
+    expect(server.written.some((p) => p.allow_live === true)).toBe(false);
+    // The page still shows the read it has, locked, until it is reloaded.
+    expect(screen.getByTestId("agents-policy-invalid")).toBeTruthy();
+  });
+
+  it("labels a pending reset as resetting, not saving", async () => {
+    const server = policyServer({
+      policy: policy(
+        { allow_paper_arm: false, allow_live: false },
+        LOCKED_AGENTS,
+      ),
+      digest: "read-invalid",
+      invalid: true,
+    });
+    render(<AgentsSection />);
+    await loaded();
+
+    const release = server.holdNextPut();
+    fireEvent.click(
+      screen.getByRole("button", { name: /reset to default limits/i }),
+    );
+    expect(screen.getByRole("button", { name: "Resetting…" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Save limits" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Saving…" })).toBeNull();
+
+    release();
+    await screen.findByText("Reset to the default limits.");
+    expect(sentDigest(puts(server.calls)[0])).toBe("read-invalid");
+  });
+});
+
+describe("AgentsSection field feedback", () => {
+  it("clears the saved notice when a field is edited", async () => {
+    policyServer({ policy: policy(), digest: "read-1", invalid: false });
+    render(<AgentsSection />);
+    await loaded();
+
+    fireEvent.click(screen.getByRole("button", { name: /save limits/i }));
+    await screen.findByText("Saved.");
+    fireEvent.click(screen.getByLabelText(/krell may disarm/i));
+    expect(screen.queryByText("Saved.")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /save limits/i }));
+    await screen.findByText("Saved.");
+    fireEvent.change(screen.getByLabelText(/tokens per month/i), {
+      target: { value: "100" },
+    });
+    expect(screen.queryByText("Saved.")).toBeNull();
+  });
+
+  it("ties a refused number to its field and clears it when the field is edited", async () => {
+    const server = policyServer({
+      policy: policy(),
+      digest: "read-1",
+      invalid: false,
+    });
+    render(<AgentsSection />);
+    await loaded();
+
+    const risk = screen.getByLabelText(/largest risk cap/i);
+    const balance = screen.getByLabelText(/largest paper balance/i);
+    fireEvent.change(risk, { target: { value: "101" } });
+    fireEvent.click(screen.getByRole("button", { name: /save limits/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/risk cap/i);
+    expect(alert.id).not.toBe("");
+    expect(risk.getAttribute("aria-invalid")).toBe("true");
+    const describedBy = (risk.getAttribute("aria-describedby") ?? "").split(
+      " ",
+    );
+    expect(describedBy).toContain(alert.id);
+    // The hint still describes the field too.
+    expect(describedBy).toHaveLength(2);
+    expect(balance.getAttribute("aria-invalid")).toBeNull();
+    expect(balance.getAttribute("aria-describedby")).not.toContain(alert.id);
+
+    // Editing any field clears the client-side error and its marks.
+    fireEvent.change(balance, { target: { value: "9000" } });
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(risk.getAttribute("aria-invalid")).toBeNull();
+    expect(risk.getAttribute("aria-describedby")).not.toContain(alert.id);
+    expect(puts(server.calls)).toHaveLength(0);
+  });
+});
+
+describe("AgentsSection replies it cannot read", () => {
+  it("tells the user to fix or remove the policy file", async () => {
+    installFetch((call) =>
+      call.path === "/api/v1/user-policy"
+        ? read(policy({}, { max_agent_arms: 2 ** 53 }), { digest: "read-1" })
+        : undefined,
+    );
+    render(<AgentsSection />);
+
+    const alert = await screen.findByText(/could not be loaded/i);
+    expect(alert.textContent).toMatch(/fix or remove user-policy\.json/i);
+    expect(screen.queryByTestId("agents-limits-form")).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /reset to default limits/i }),
+    ).toBeNull();
+  });
+});
+
+describe("McpSetupPanel", () => {
+  it("warns that PowerShell expands $ and backticks in the Claude Code line", async () => {
+    installFetch((call) =>
+      call.path === "/api/v1/user-policy" ? read(policy()) : undefined,
+    );
+    render(<AgentsSection />);
+    await loaded();
+
+    await screen.findByTestId("mcp-snippet-claude-code");
+    const note = screen.getByTestId("mcp-claude-code-powershell-note");
+    expect(note.textContent).toMatch(/PowerShell/);
+    expect(note.textContent).toContain("$");
+    expect(note.textContent).toMatch(/backtick/i);
+  });
+});
