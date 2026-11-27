@@ -376,6 +376,18 @@ def chatgpt_state(home: Path) -> dict:
     return json.loads((home / "ai" / "chatgpt.json").read_text())
 
 
+def accounts(state: dict) -> list[dict]:
+    """The saved accounts without their ids, after checking each id is random 16-hex, not the client id."""
+
+    out = []
+    for account in state["accounts"]:
+        account = dict(account)
+        account_id = account.pop("id")
+        assert re.fullmatch(r"[0-9a-f]{16}", account_id) and account_id not in account["client_id"]
+        out.append(account)
+    return out
+
+
 def everything_written(home: Path) -> str:
     return "".join(p.read_text(errors="replace") for p in home.rglob("*") if p.is_file())
 
@@ -520,7 +532,7 @@ def test_first_registration_saves_the_issued_client_id_not_dynamic_agent_client(
 
     # The non-secret state maps the account to its issued client; no token, no dynamic id.
     state = chatgpt_state(home)
-    assert state["accounts"] == [{"client_id": CLIENT, "issuer": ISSUER, "subject": SUBJECT, "email": EMAIL}]
+    assert accounts(state) == [{"client_id": CLIENT, "issuer": ISSUER, "subject": SUBJECT, "email": EMAIL}]
     assert state["connections"][conn_id]["client_id"] == CLIENT
     written = everything_written(home)
     assert "dynamic_agent_client" not in written
@@ -925,7 +937,7 @@ def test_removing_a_chatgpt_connection_revokes_its_refresh_token(home, fresh_key
     assert fresh_keyring._store == {}
     state = chatgpt_state(home)
     assert state["ext_agent_host_id"] == host_id
-    assert state["accounts"] == [{"client_id": CLIENT, "issuer": ISSUER, "subject": SUBJECT, "email": EMAIL}]
+    assert accounts(state) == [{"client_id": CLIENT, "issuer": ISSUER, "subject": SUBJECT, "email": EMAIL}]
     assert conn_id not in state.get("connections", {})
 
 
@@ -1580,13 +1592,22 @@ def test_a_chatgpt_record_is_stored_in_chunks_a_1280_character_keychain_accepts(
     entries = keychain_entries(windows_keyring, conn_id)
     assert len(_chunk_entries(entries)) >= 2
     assert all(len(value) <= WINDOWS_LIMIT for value in entries.values())
-    assert re.fullmatch(r"krellbot-chunked-v1:[0-9a-f]{8}:\d+:[0-9a-f]{64}", entries["credential"])
-    assert all(re.fullmatch(r"credential\.[0-9a-f]{8}\.\d+", user) for user in _chunk_entries(entries))
+    # The header: a random 32-hex generation, the piece count and the total length. No digest of the record.
+    match = re.fullmatch(r"krellbot-chunked-v1:([0-9a-f]{32}):(\d+):(\d+)", entries["credential"])
+    assert match is not None
+    generation = match.group(1)
+    assert all(re.fullmatch(rf"credential\.{generation}\.\d+", user) for user in _chunk_entries(entries))
+    # Every piece starts with the same generation id.
+    assert all(value.startswith(generation + ":") for value in _chunk_entries(entries).values())
     _assert_one_generation(entries)
     record = keychain_record(windows_keyring, conn_id)
     assert (record["client_id"], record["access_token"], record["refresh_token"]) == (CLIENT, ACCESS, REFRESH)
-    # The token set never sits in the header.
+    assert int(match.group(3)) == len(connections._read_secret(windows_keyring, f"krellbot-ai:{conn_id}"))
+    # The token set never sits in the header, and the generation is not derived from it.
     assert ACCESS not in entries["credential"] and REFRESH not in entries["credential"]
+    oauth.chatgpt_sign_out(env.store(), env.store().get(conn_id), transport=env.openai, sleep=lambda s: None)
+    again = env.sign_in()
+    assert keychain_entries(windows_keyring, again)["credential"].split(":")[1] != generation
 
 
 def test_a_refresh_to_a_token_set_of_another_size_replaces_every_chunk(home, windows_keyring):
@@ -1647,19 +1668,48 @@ def test_a_legacy_single_entry_api_key_still_loads_and_a_long_key_is_chunked(hom
     assert keychain_entries(windows_keyring, keyed.id) == {}
 
 
-def test_tampered_or_missing_chunks_read_as_no_credential(home, windows_keyring):
+def _torn(entries: dict[str, str], how: str) -> tuple[str, str | None]:
+    """One chunk made torn or stale: ``(chunk name, new value or None to delete it)``."""
+
+    name = min(_chunk_entries(entries))
+    value = entries[name]
+    generation, piece = value.split(":", 1)
+    other = ("0" if generation[0] != "0" else "1") + generation[1:]
+    return name, {
+        "other_generation": f"{other}:{piece}",
+        "missing": None,
+        "short": f"{generation}:{piece[:-1]}",
+        "no_prefix": piece,
+    }[how]
+
+
+@pytest.mark.parametrize("how", ["other_generation", "missing", "short", "no_prefix"])
+def test_a_torn_or_stale_chunk_fails_closed_and_never_yields_a_partial_record(home, windows_keyring, how):
     env = Env(home)
     conn_id = env.sign_in()
     store = env.store()
-    entries = keychain_entries(windows_keyring, conn_id)
-    first_chunk = min(_chunk_entries(entries))
-    windows_keyring._store[(f"krellbot-ai:{conn_id}", first_chunk)] = "x" * len(entries[first_chunk])
-    assert store.credential(conn_id) is None
+    name, value = _torn(keychain_entries(windows_keyring, conn_id), how)
+    key = (f"krellbot-ai:{conn_id}", name)
+    if value is None:
+        del windows_keyring._store[key]
+    else:
+        windows_keyring._store[key] = value
+
+    with pytest.raises(connections.TornSecret):
+        connections._read_secret(windows_keyring, f"krellbot-ai:{conn_id}")
+    with pytest.raises(ConnectionRefused) as refused:
+        store.credential(conn_id)
+    assert refused.value.code == "ai_keychain_unavailable"
     with pytest.raises(ConnectionRefused) as refused:
         oauth.chatgpt_access_token(store, store.get(conn_id), transport=env.openai, clock=env.clock)
-    assert refused.value.code == "ai_chatgpt_signin_required"
-    del windows_keyring._store[(f"krellbot-ai:{conn_id}", first_chunk)]
-    assert store.credential(conn_id) is None
+    assert refused.value.code == "ai_keychain_unavailable"
+    assert env.openai.forms_to(REVOKE_URL) == []
+
+    # A torn record never blocks removal: every entry goes, and the person is told nothing was revoked.
+    result = oauth.remove_chatgpt_connection(store, store.get(conn_id), transport=env.openai, sleep=lambda s: None)
+    assert result.revocation == "not_confirmed" and "could not be read" in result.message
+    assert keychain_entries(windows_keyring, conn_id) == {}
+    assert store.list() == []
 
 
 def test_a_replacement_that_fails_part_way_keeps_the_previous_record(home, windows_keyring):
@@ -1723,7 +1773,7 @@ def test_readding_a_removed_account_reuses_its_issued_client_id(home, fresh_keyr
     assert status["state"] == "connected" and status["connection_id"] != first
     assert [f["client_id"] for f in env.openai.forms_to(TOKEN_URL)] == [CLIENT]
     assert keychain_record(fresh_keyring, status["connection_id"])["client_id"] == CLIENT
-    assert chatgpt_state(home)["accounts"] == [
+    assert accounts(chatgpt_state(home)) == [
         {"client_id": CLIENT, "issuer": ISSUER, "subject": SUBJECT, "email": EMAIL}
     ]
     assert oauth.chatgpt_saved_accounts(home) == []  # in use again
@@ -1847,7 +1897,7 @@ def test_an_invalid_grant_first_exchange_keeps_the_issued_client_for_the_next_at
     assert env.openai.forms_to(TOKEN_URL)[-1]["client_id"] == CLIENT
     state = chatgpt_state(home)
     assert state["pending_client"] is None
-    assert state["accounts"] == [{"client_id": CLIENT, "issuer": ISSUER, "subject": SUBJECT, "email": EMAIL}]
+    assert accounts(state) == [{"client_id": CLIENT, "issuer": ISSUER, "subject": SUBJECT, "email": EMAIL}]
 
 
 def test_a_pending_client_that_openai_refuses_otherwise_is_dropped(home, fresh_keyring):

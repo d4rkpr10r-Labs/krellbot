@@ -11,8 +11,6 @@ that shape before it reaches a path or the keychain.
 from __future__ import annotations
 
 import contextlib
-import hashlib
-import hmac
 import json
 import os
 import re
@@ -213,50 +211,60 @@ def _service(conn_id: str) -> str:
 # per secret, and a sign-in's credential record carries two JWTs and a refresh
 # token. A value longer than _CHUNK_CHARS is stored in pieces under the SAME
 # service: ``credential.<generation>.<i>`` hold the pieces and ``credential``
-# holds a header naming the generation, the count and a SHA-256 of the whole.
-# Pieces are written first and the header last; the previous generation's
-# pieces are deleted only after the new value reads back whole. A reader so
-# sees the old value or the new one, never a mix, and a short value (an API
-# key) stays one plain ``credential`` entry, exactly as before.
+# holds a header naming the generation, the piece count and the total length.
+# The generation is a random id made for each write (never derived from the
+# value), and every piece starts with it. Pieces are written first and the
+# header last; the previous generation's pieces are deleted only after the new
+# value reads back whole. A reader requires every piece 1..N to carry the
+# header's generation and the lengths to add up: anything else is a torn or
+# stale write and fails closed (``TornSecret``), never a partial value. A
+# short value (an API key) stays one plain ``credential`` entry, as before.
 
 _CHUNK_CHARS = 1000
 _MAX_CHUNKS = 128
-_CHUNK_HEADER_RE = re.compile(r"krellbot-chunked-v1:([0-9a-f]{8}):([1-9][0-9]{0,2}):([0-9a-f]{64})")
+_CHUNK_HEADER_RE = re.compile(r"krellbot-chunked-v1:([0-9a-f]{32}):([1-9][0-9]{0,2}):([1-9][0-9]{0,6})")
 
 
-def _digest(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+class TornSecret(Exception):
+    """A chunked keychain value whose pieces do not match its header: a torn or stale write."""
 
 
-def _parse_chunk_header(value: object) -> tuple[str, int, str] | None:
+def _parse_chunk_header(value: object) -> tuple[str, int, int] | None:
+    """``(generation, count, total_length)`` from a header, or None for a plain value."""
+
     match = _CHUNK_HEADER_RE.fullmatch(value) if isinstance(value, str) else None
     if match is None or int(match.group(2)) > _MAX_CHUNKS:
         return None
-    return match.group(1), int(match.group(2)), match.group(3)
+    return match.group(1), int(match.group(2)), int(match.group(3))
 
 
-def _chunk_names(header: tuple[str, int, str] | None) -> list[str]:
+def _chunk_names(header: tuple[str, int, int] | None) -> list[str]:
     if header is None:
         return []
-    generation, count, _digest_hex = header
+    generation, count, _total = header
     return [f"{KEYRING_USERNAME}.{generation}.{index}" for index in range(1, count + 1)]
 
 
 def _read_secret(backend: object, service: str) -> str | None:
-    """A plain entry, or its chunks joined and verified. Missing or mismatched chunks read as None."""
+    """A plain entry, or its pieces joined. Raises TornSecret when a piece is missing, carries another
+    generation, or the lengths do not add up."""
 
     value = backend.get_password(service, KEYRING_USERNAME)  # type: ignore[attr-defined]
     header = _parse_chunk_header(value)
     if header is None:
         return value
+    generation, _count, total = header
+    prefix = generation + ":"
     parts = []
     for name in _chunk_names(header):
         part = backend.get_password(service, name)  # type: ignore[attr-defined]
-        if not isinstance(part, str):
-            return None
-        parts.append(part)
+        if not isinstance(part, str) or not part.startswith(prefix) or len(part) == len(prefix):
+            raise TornSecret("a piece is missing or belongs to another write")
+        parts.append(part[len(prefix) :])
     whole = "".join(parts)
-    return whole if hmac.compare_digest(_digest(whole), header[2]) else None
+    if len(whole) != total:
+        raise TornSecret("the pieces do not add up to the recorded length")
+    return whole
 
 
 def _write_secret(backend: object, service: str, secret: str, previous: str | None) -> None:
@@ -269,15 +277,18 @@ def _write_secret(backend: object, service: str, secret: str, previous: str | No
     if len(pieces) > _MAX_CHUNKS:
         raise ValueError("value too long")
     old = _parse_chunk_header(previous)
-    generation = stdlib_secrets.token_hex(4)
+    # A random id for this write, never derived from the value.
+    generation = stdlib_secrets.token_hex(16)
     while old is not None and generation == old[0]:
-        generation = stdlib_secrets.token_hex(4)
-    header = (generation, len(pieces), _digest(secret))
+        generation = stdlib_secrets.token_hex(16)
+    header = (generation, len(pieces), len(secret))
     names = _chunk_names(header)
     try:
         for name, piece in zip(names, pieces, strict=True):
-            backend.set_password(service, name, piece)  # type: ignore[attr-defined]
-        backend.set_password(service, KEYRING_USERNAME, f"krellbot-chunked-v1:{generation}:{len(pieces)}:{header[2]}")  # type: ignore[attr-defined]
+            backend.set_password(service, name, f"{generation}:{piece}")  # type: ignore[attr-defined]
+        backend.set_password(  # type: ignore[attr-defined]
+            service, KEYRING_USERNAME, f"krellbot-chunked-v1:{generation}:{len(pieces)}:{len(secret)}"
+        )
     except BaseException:
         _delete_names(backend, service, names)
         raise
@@ -382,9 +393,11 @@ class ConnectionStore:
         return found
 
     def credential(self, conn_id: str) -> str | None:
-        """The stored value: a single entry, or chunks reassembled and checked against their digest.
+        """The stored value: a single entry, or its chunks reassembled.
 
-        Chunks that are missing or do not match the digest read as no value.
+        A torn or stale chunked value (a piece missing, from another write, or
+        lengths that do not add up) fails closed as ``ai_keychain_unavailable``;
+        a partial value is never returned.
         """
 
         service = _service(conn_id)

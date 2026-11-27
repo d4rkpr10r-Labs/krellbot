@@ -715,6 +715,10 @@ REVOCATION_NOT_CONFIRMED: dict[str, str] = {
         "Signed out on this computer, but remote revocation was not confirmed: OpenAI's sign-in configuration "
         "offered no usable revocation address. " + _DISCONNECT_HINT
     ),
+    "unreadable": (
+        "Removed from this computer, but remote revocation was not confirmed: the sign-in record could not be "
+        "read, so there was nothing to revoke with. " + _DISCONNECT_HINT
+    ),
 }
 
 _HOST_ID_RE = re.compile(r"urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
@@ -821,6 +825,8 @@ def _load_state(home: Path) -> dict:
         ):
             entry = {k: account[k] for k in ("client_id", "issuer", "subject")}
             entry["email"] = _email(account.get("email"))
+            account_id = account.get("id")
+            entry["id"] = account_id if isinstance(account_id, str) and _ACCOUNT_ID_RE.fullmatch(account_id) else None
             state["accounts"].append(entry)
     connections = data.get("connections")
     for conn_id, entry in connections.items() if isinstance(connections, dict) else []:
@@ -941,9 +947,18 @@ def _upsert_account(state: dict, client_id: str, issuer: str, subject: str, emai
     for account in state["accounts"]:
         if (account["issuer"], account["subject"]) == (issuer, subject) or account["client_id"] == client_id:
             account.update(client_id=client_id, issuer=issuer, subject=subject, email=email or account.get("email"))
+            account["id"] = account.get("id") or stdlib_secrets.token_hex(8)
             break
     else:
-        state["accounts"].append({"client_id": client_id, "issuer": issuer, "subject": subject, "email": email})
+        state["accounts"].append(
+            {
+                "id": stdlib_secrets.token_hex(8),
+                "client_id": client_id,
+                "issuer": issuer,
+                "subject": subject,
+                "email": email,
+            }
+        )
     # One entry per account and per client: drop any other entry left holding either.
     seen: set[tuple[str, str]] = set()
     kept = []
@@ -958,16 +973,14 @@ def _upsert_account(state: dict, client_id: str, issuer: str, subject: str, emai
         state["pending_client"] = None
 
 
-def account_id(client_id: str) -> str:
-    """An opaque handle for a saved account, so the browser never needs the client id itself."""
-
-    return hashlib.sha256(client_id.encode("utf-8")).hexdigest()[:16]
+_ACCOUNT_ID_RE = re.compile(r"[0-9a-f]{16}")
 
 
 def chatgpt_saved_accounts(home: Path) -> list[dict]:
     """Saved ChatGPT accounts with no connection now: each can be signed in again with its issued client.
 
-    ``[{"id": <opaque>, "email": <str or None>}]``. Reads ``chatgpt.json`` only.
+    ``[{"id": <random, stored with the account>, "email": <str or None>}]``.
+    The id is never derived from the client id. Reads ``chatgpt.json`` only.
     """
 
     try:
@@ -976,9 +989,9 @@ def chatgpt_saved_accounts(home: Path) -> list[dict]:
         return []
     in_use = {entry["client_id"] for entry in state["connections"].values()}
     return [
-        {"id": account_id(account["client_id"]), "email": account.get("email")}
+        {"id": account["id"], "email": account.get("email")}
         for account in state["accounts"]
-        if account["client_id"] not in in_use
+        if account["client_id"] not in in_use and account.get("id")
     ]
 
 
@@ -1257,7 +1270,9 @@ def verify_id_token(token: object, *, keys: object, client_id: str, nonce: str, 
     if exp is None or now >= exp + _ID_TOKEN_LEEWAY:
         raise invalid
     got_nonce = claims.get("nonce")
-    if not isinstance(got_nonce, str) or not hmac.compare_digest(got_nonce.encode("utf-8"), nonce.encode("utf-8")):
+    if not isinstance(got_nonce, str) or not stdlib_secrets.compare_digest(
+        got_nonce.encode("utf-8"), nonce.encode("utf-8")
+    ):
         raise invalid
     sub = claims.get("sub")
     if not isinstance(sub, str) or not sub or len(sub) > _MAX_SUBJECT or not sub.isprintable():
@@ -1330,7 +1345,7 @@ class _ChatGPTFlow(_Flow):
                 return CallbackReply(404, _NOT_FOUND_PAGE)
             path, _sep, query = target.partition("?")
             launch = (CHATGPT_LAUNCH_PREFIX + self.launch).encode("ascii")
-            if hmac.compare_digest(path.encode("utf-8", "replace"), launch):
+            if stdlib_secrets.compare_digest(path.encode("utf-8", "replace"), launch):
                 if query or self.authorize_url is None:
                     return CallbackReply(404, _NOT_FOUND_PAGE)
                 return CallbackReply(302, _REDIRECT_PAGE, location=self.authorize_url)
@@ -1341,7 +1356,7 @@ class _ChatGPTFlow(_Flow):
             except ValueError:
                 return CallbackReply(404, _NOT_FOUND_PAGE)
             states = fields.get("state", [])
-            if len(states) != 1 or not hmac.compare_digest(
+            if len(states) != 1 or not stdlib_secrets.compare_digest(
                 states[0].encode("utf-8", "replace"), self.state.encode("ascii")
             ):
                 return CallbackReply(404, _NOT_FOUND_PAGE)  # not this attempt's answer: keep waiting
@@ -1357,7 +1372,9 @@ class _ChatGPTFlow(_Flow):
                     return self._fail_locked("ai_chatgpt_registration_incomplete")
             else:
                 saved = self.target.client_id.encode("utf-8")
-                if len(issued) > 1 or (issued and not hmac.compare_digest(issued[0].encode("utf-8", "replace"), saved)):
+                if len(issued) > 1 or (
+                    issued and not stdlib_secrets.compare_digest(issued[0].encode("utf-8", "replace"), saved)
+                ):
                     return self._fail_locked("ai_chatgpt_client_mismatch")
                 client_id = self.target.client_id
             code = _code_from_query(query)
@@ -1565,7 +1582,7 @@ def start_chatgpt_signin(
     else:
         state = _load_state(home)
         if account is not None:
-            saved = next((a for a in state["accounts"] if account_id(a["client_id"]) == account), None)
+            saved = next((a for a in state["accounts"] if a.get("id") and a["id"] == account), None)
             if saved is None or not isinstance(account, str):
                 raise ConnectionRefused("ai_chatgpt_account_unknown")
             target = _Reauth(
@@ -1879,7 +1896,14 @@ def remove_chatgpt_connection(
     The account-to-client mapping and the host id stay in ``chatgpt.json``.
     """
 
-    result = chatgpt_sign_out(store, conn, transport=transport, sleep=sleep)
+    try:
+        result = chatgpt_sign_out(store, conn, transport=transport, sleep=sleep)
+    except ConnectionRefused as exc:
+        if exc.code != "ai_keychain_unavailable":
+            raise
+        # The record could not be read (a torn write, or the keychain refused): nothing to revoke with.
+        # Removal still deletes every entry, and fails here itself if the keychain is really unavailable.
+        result = RevocationResult("not_confirmed", REVOCATION_NOT_CONFIRMED["unreadable"])
     with _record_lock(store.home, conn.id):
         store.remove(conn.id)
         with _state_change(store.home) as state:
