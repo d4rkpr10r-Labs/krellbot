@@ -1,0 +1,264 @@
+/*
+ * Krell tab, side panel and conversation (M38.16).
+ * Contract: KRELL-SIGNAL-20261010. Colors come from tokens.css only.
+ *
+ * The side panel docks right at 340px (the shell makes room for it) and
+ * becomes a full-screen sheet at 720px and below. Krell's avatar is the
+ * only picture, and it appears only inside the conversation.
+ *
+ * Control rules are scoped under `.kbot-shell` or `.kbot-krell` so they
+ * outrank the shell's `.kbot-shell button { font: inherit; color: inherit }`.
+ */
+
+/* Header button: text only, like the command palette affordance. */
+.kbot-shell .kbot-krell__ask {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 5px 12px;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.kbot-shell .kbot-krell__ask:hover,
+.kbot-shell .kbot-krell__ask[aria-expanded="true"] {
+  border-color: var(--seafoam);
+  color: var(--seafoam);
+}
+
+/* Docked panel: the shell keeps its content clear of the panel. The
+ * doubled class outranks `.kbot-shell { padding }` whatever the bundle order. */
+.kbot-shell.kbot-shell--krell-docked {
+  padding-right: 340px;
+}
+
+.kbot-krell__panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 340px;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-stack);
+  padding: 12px 14px 14px;
+  background: var(--surface);
+  border-left: 1px solid var(--line);
+  color: var(--text);
+}
+
+.kbot-krell__panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-tight);
+  flex-wrap: wrap;
+}
+
+.kbot-krell__panel-title {
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.kbot-krell__panel-actions {
+  display: flex;
+  gap: var(--space-tight);
+}
+
+.kbot-krell .kbot-krell__btn {
+  min-height: 34px;
+  padding: 6px 12px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.kbot-krell .kbot-krell__btn:hover:not(:disabled) {
+  border-color: var(--seafoam);
+}
+
+.kbot-krell__connect {
+  display: grid;
+  gap: var(--space-stack);
+  max-width: 560px;
+}
+
+/* Conversation: log above, composer below. */
+.kbot-krell__conversation {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-stack);
+  min-height: 0;
+  padding: 14px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+}
+
+.kbot-krell__panel .kbot-krell__conversation {
+  flex: 1 1 auto;
+  padding: 0;
+  background: transparent;
+  border: 0;
+}
+
+.kbot-krell__log {
+  min-height: 160px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.kbot-krell__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-tight);
+}
+
+.kbot-krell__panel .kbot-krell__log {
+  flex: 1 1 auto;
+  max-height: none;
+  min-height: 0;
+}
+
+.kbot-krell__msg {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-tight);
+  min-width: 0;
+}
+
+.kbot-krell__msg--user {
+  justify-content: flex-end;
+}
+
+.kbot-krell__avatar,
+.kbot-krell__avatar-gap {
+  flex: none;
+  width: 32px;
+  height: 32px;
+}
+
+.kbot-krell__avatar {
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  object-fit: cover;
+}
+
+.kbot-krell__bubble {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 8px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.kbot-krell__msg--user .kbot-krell__bubble {
+  background: color-mix(in srgb, var(--seafoam) 12%, var(--surface));
+}
+
+.kbot-krell__line {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.kbot-krell__line--error {
+  color: var(--caution-text);
+}
+
+.kbot-krell__state {
+  display: grid;
+  gap: var(--space-tight);
+  justify-items: start;
+}
+
+.kbot-krell__composer {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-tight);
+}
+
+.kbot-krell .kbot-krell__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 44px;
+  padding: 8px 10px;
+  background: var(--navy);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  resize: vertical;
+}
+
+.kbot-krell .kbot-krell__send {
+  min-height: 44px;
+  padding: 8px 16px;
+  background: var(--action-primary-bg);
+  color: var(--action-primary-text);
+  border: 1px solid var(--action-primary-bg);
+  border-radius: var(--radius-control);
+  font-weight: 700;
+}
+
+.kbot-krell__sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Phones: the panel is a full-screen sheet and nothing is docked. */
+@media (max-width: 720px) {
+  .kbot-shell.kbot-shell--krell-docked {
+    padding-right: 0;
+  }
+
+  .kbot-krell__panel {
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    border-left: 0;
+  }
+}
+
+/* The header utilities flatten into the brand bar at 640px and below. */
+@media (max-width: 640px) {
+  .kbot-shell .kbot-shell__head-utils > .kbot-krell__ask {
+    order: 2;
+    min-height: 44px;
+    padding: 6px 8px;
+  }
+
+  /* Her name alone keeps the brand row on one line; "Ask" stays for screen readers. */
+  .kbot-krell__ask-verb {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+}

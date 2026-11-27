@@ -20,14 +20,15 @@ function openMore(): void {
 }
 
 describe("Navigation — workstation views", () => {
-  it("renders Workspace first among primary tabs and exposes More overflow", () => {
+  it("renders Krell first, then Workspace, among primary tabs and exposes More overflow", () => {
     render(<Navigation active="home" onChange={() => {}} />);
     const primary = screen.getByTestId("kbot-nav-primary");
     const primaryLabels = Array.from(
       primary.querySelectorAll<HTMLButtonElement>(".kbot-nav__item"),
     ).map((button) => button.textContent?.trim());
     expect(primaryLabels).toEqual(PRIMARY_VIEWS.map((view) => view.label));
-    expect(primaryLabels[0]).toBe("Workspace");
+    expect(primaryLabels[0]).toBe("Krell");
+    expect(primaryLabels[1]).toBe("Workspace");
     expect(screen.getByTestId("kbot-nav-more-toggle")).toBeDefined();
     expect(screen.getByTestId("kbot-nav-more").getAttribute("data-open")).toBe(
       "0",
