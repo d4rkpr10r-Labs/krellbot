@@ -12,6 +12,10 @@
  * arms in the same exit and is not mounted while this wizard is up.
  * A failed session start is retried on the wizard's next action, not
  * kept until reload (KQ-04).
+ *
+ * Meet Krell (M38.19): once the wizard is complete with a usable model,
+ * the shell opens on the Krell tab (`?view=krell`), where Krell takes over
+ * the first run, so the setup tour is not armed on that path.
  */
 import { useRef, useState, type JSX } from "react";
 import {
@@ -29,6 +33,7 @@ import {
   type StrategyClient,
 } from "./features/strategies/client";
 import { armWorkspaceSetupTour } from "./features/onboarding/workspaceSetupTourPersistence";
+import { syncViewToHistory } from "./shell/route";
 import { WorkstationShell } from "./shell/WorkstationShell";
 
 export function App(): JSX.Element {
@@ -67,6 +72,10 @@ export function App(): JSX.Element {
         }}
         onSkip={() => {
           armWorkspaceSetupTour();
+          setWizardDismissed(true);
+        }}
+        onMeetKrell={() => {
+          syncViewToHistory("krell", "replace");
           setWizardDismissed(true);
         }}
       />

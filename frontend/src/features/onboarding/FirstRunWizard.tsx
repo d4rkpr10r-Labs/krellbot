@@ -20,6 +20,13 @@
  * chosen venue and pair: the taker fee with the research fee-model label,
  * the slippage, the decision timeframe, the stop rule and the pretend
  * balance. A value the backend does not give reads 'unavailable'.
+ *
+ * Meet Krell (M38.19): the welcome step's secondary choice opens the AI
+ * connect form in the wizard frame. Only a usable, active connection
+ * (`onConnected`) marks the wizard complete and calls `onMeetKrell`; the
+ * App gate then opens the Krell tab, whose own start says the opening.
+ * Cancel, Back, or an add that is not usable leaves the wizard state as it
+ * was, and an answer that arrives after Back is ignored.
  */
 import {
   useCallback,
@@ -38,6 +45,7 @@ import type {
 } from "../paper/client";
 import { paperMarketAvailability } from "../paper/marketAvailability";
 import { paperHealthSentence, usePaperHealth } from "../paper/paperHealth";
+import { AiConnectForm } from "../settings/AiConnectForm";
 import type { StrategyClient } from "../strategies/client";
 import {
   CONSUMER_STARTER_CARD_ORDER,
@@ -103,6 +111,9 @@ const WIZARD_MARKETS = { kraken: "XXBTZUSD", coinbase: "BTC-USD" } as const;
 const WIZARD_PAPER_BALANCE = "1000";
 
 export const WIZARD_LIVE_TRADING_UNAVAILABLE = "Live trading unavailable";
+
+const MEET_KRELL_LABEL = "Meet Krell (connect your AI)";
+const MEET_KRELL_SENTENCE = "Connect your own AI model to meet Krell.";
 
 /** A stop rule as `GET /api/v1/paper/assumptions` serves it. */
 export type PaperAssumptionsStop =
@@ -311,6 +322,11 @@ export type FirstRunWizardProps = {
   onStepChange?: (stepId: FirstRunWizardStepId) => void;
   onSkip?: () => void;
   onComplete?: () => void;
+  /**
+   * Fired after Meet Krell connected a usable, active model and the wizard
+   * was marked complete. The App gate opens the Krell tab.
+   */
+  onMeetKrell?: () => void;
   /**
    * Fired when the step primary is pressed. Return false to keep the step.
    */
@@ -525,6 +541,7 @@ export function FirstRunWizard({
   onStepChange,
   onSkip,
   onComplete,
+  onMeetKrell,
   onPrimaryAction,
   onSelectStarter,
   syncKey = 0,
@@ -554,6 +571,12 @@ export function FirstRunWizard({
   });
   const [assumptionsPhase, setAssumptionsPhase] =
     useState<WizardAssumptionsPhase>({ kind: "loading" });
+  // Meet Krell's connect frame on the welcome step. Never persisted, so
+  // Cancel or Back leaves the wizard exactly as it was.
+  const [meetKrell, setMeetKrell] = useState(false);
+  const [meetKrellError, setMeetKrellError] = useState<string | null>(null);
+  // Read by the connect answer, which can arrive after Back.
+  const meetKrellOpen = useRef(false);
   const inFlight = useRef(false);
   const stepPrompt = useRef<HTMLParagraphElement>(null);
   const session = useRef(sessionReady);
@@ -592,7 +615,7 @@ export function FirstRunWizard({
 
   useEffect(() => {
     if (visible) stepPrompt.current?.focus({ preventScroll: true });
-  }, [activeStep.id, visible]);
+  }, [activeStep.id, visible, meetKrell]);
 
   useEffect(() => {
     if (!visible) {
@@ -661,14 +684,18 @@ export function FirstRunWizard({
     return null;
   }
 
-  const showSkip = state.status === "active" || activeStep.id !== "welcome";
+  const connecting = meetKrell && activeStep.id === "welcome";
+  const showSkip =
+    !connecting && (state.status === "active" || activeStep.id !== "welcome");
   const visual = WIZARD_STEP_VISUALS[activeStep.id];
   const stepNumber = stepIndexOf(steps, activeStep.id) + 1;
   const isWin = activeStep.id === "win";
   const statusWired = activeStep.id === "status" && paperClient !== undefined;
-  const sentence = statusWired
-    ? paperClient?.getHealth ? paperHealthSentence(health) : honestWizardStatusSentence(statusPhase)
-    : activeStep.sentence;
+  const sentence = connecting
+    ? MEET_KRELL_SENTENCE
+    : statusWired
+      ? paperClient?.getHealth ? paperHealthSentence(health) : honestWizardStatusSentence(statusPhase)
+      : activeStep.sentence;
   const statusLoading = statusWired && statusPhase.kind === "loading";
   const catalogueLoader = loadStarters ?? fetchStarters;
 
@@ -688,7 +715,9 @@ export function FirstRunWizard({
     );
   }
 
-  async function requireSession(kind: "choose" | "arm" | "check"): Promise<boolean> {
+  async function requireSession(
+    kind: "choose" | "arm" | "check" | "meet",
+  ): Promise<boolean> {
     const current = session.current;
     if (current === undefined) {
       return true;
@@ -704,17 +733,65 @@ export function FirstRunWizard({
       }
     }
     const control =
-      kind === "choose" ? "Use" : kind === "arm" ? "Start paper run" : "Check status";
+      kind === "choose"
+        ? "Use"
+        : kind === "arm"
+          ? "Start paper run"
+          : kind === "check"
+            ? "Check status"
+            : "Meet Krell";
     const message =
       retrySession === undefined
         ? "The local workstation session is unavailable. Reopen the workstation and try again."
         : `The local workstation session is unavailable. Press ${control} again to retry.`;
     if (kind === "choose") {
       setChooseError(`Could not save that strategy: ${message}`);
+    } else if (kind === "meet") {
+      setMeetKrellError(message);
     } else {
       setArmError(message);
     }
     return false;
+  }
+
+  /** Open the connect frame once the loopback session is ready. Persists nothing. */
+  async function openMeetKrell(): Promise<void> {
+    if (inFlight.current) {
+      return;
+    }
+    inFlight.current = true;
+    setMeetKrellError(null);
+    try {
+      if (!(await requireSession("meet"))) {
+        return;
+      }
+      meetKrellOpen.current = true;
+      setMeetKrell(true);
+    } finally {
+      inFlight.current = false;
+    }
+  }
+
+  function closeMeetKrell(): void {
+    meetKrellOpen.current = false;
+    setMeetKrell(false);
+  }
+
+  /** A usable, active model: complete the wizard and hand over to Krell. */
+  function handleKrellConnected(): void {
+    if (!meetKrellOpen.current) {
+      return;
+    }
+    closeMeetKrell();
+    persist(
+      persisted(
+        "completed",
+        "welcome",
+        state.selectedStarterId ?? null,
+        state.revisionId,
+      ),
+    );
+    onMeetKrell?.();
   }
 
   async function saveStarter(starterId: string): Promise<void> {
@@ -1022,7 +1099,9 @@ export function FirstRunWizard({
     ? "kbot-first-run-wizard kbot-first-run-wizard--win"
     : isChoose
       ? "kbot-first-run-wizard kbot-first-run-wizard--choose"
-      : "kbot-first-run-wizard";
+      : connecting
+        ? "kbot-first-run-wizard kbot-first-run-wizard--connect"
+        : "kbot-first-run-wizard";
 
   return (
     <div
@@ -1055,7 +1134,7 @@ export function FirstRunWizard({
 
         <div
           className="kbot-first-run-wizard__stage"
-          key={`${activeStep.id}-${enterKey}`}
+          key={`${activeStep.id}-${connecting ? "connect-" : ""}${enterKey}`}
           data-testid="first-run-wizard-stage"
         >
           <img
@@ -1137,7 +1216,24 @@ export function FirstRunWizard({
             </section>
           ) : null}
 
-          {activeStep.id === "choose" ? (
+          {connecting ? (
+            <>
+              <div className="kbot-first-run-wizard__connect">
+                <AiConnectForm
+                  onConnected={handleKrellConnected}
+                  onCancel={closeMeetKrell}
+                />
+              </div>
+              <button
+                type="button"
+                className="kbot-first-run-wizard__skip"
+                data-testid="first-run-wizard-meet-krell-back"
+                onClick={closeMeetKrell}
+              >
+                Back
+              </button>
+            </>
+          ) : activeStep.id === "choose" ? (
             <>
               <label className="kbot-first-run-wizard__market" htmlFor="wizard-market">
                 Exchange for simulated BTC/USD trades
@@ -1208,6 +1304,26 @@ export function FirstRunWizard({
               {primaryLabel}
             </button>
           )}
+
+          {activeStep.id === "welcome" && !connecting ? (
+            <button
+              type="button"
+              className="kbot-first-run-wizard__secondary"
+              data-testid="first-run-wizard-meet-krell"
+              onClick={() => void openMeetKrell()}
+            >
+              {MEET_KRELL_LABEL}
+            </button>
+          ) : null}
+          {activeStep.id === "welcome" && !connecting && meetKrellError !== null ? (
+            <p
+              className="kbot-first-run-wizard__alert"
+              data-testid="first-run-wizard-meet-krell-error"
+              role="alert"
+            >
+              {meetKrellError}
+            </p>
+          ) : null}
 
           {activeStep.id === "start_paper" && !armBusy && !checkBusy ? (
             <button type="button" className="kbot-first-run-wizard__skip"

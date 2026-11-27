@@ -167,6 +167,58 @@
   border-radius: 4px;
 }
 
+/*
+ * Meet Krell (M38.19): the welcome step's secondary choice uses the Signal
+ * control style (--panel fill, --line border) so the sage CTA stays the one
+ * primary. Its connect frame is left-aligned, and the form's Connect is
+ * that frame's one sage primary.
+ */
+.kbot-first-run-wizard__secondary {
+  appearance: none;
+  border: 1px solid var(--line, #22465d);
+  border-radius: var(--radius-control, 7px);
+  padding: 10px 18px;
+  min-height: 44px;
+  background: var(--panel, #18354a);
+  color: var(--text, #e9f0f5);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.kbot-first-run-wizard__secondary:hover {
+  border-color: var(--seafoam, #a8d8d1);
+}
+
+.kbot-first-run-wizard__secondary:focus-visible {
+  outline: 2px solid var(--focus-ring, var(--seafoam, #a8d8d1));
+  outline-offset: 2px;
+}
+
+.kbot-first-run-wizard--connect .kbot-first-run-wizard__visual {
+  width: min(48vw, 180px);
+  max-height: 24vh;
+}
+
+.kbot-first-run-wizard__connect {
+  width: 100%;
+  text-align: left;
+}
+
+/* The shell sizes its form controls border-box; the wizard sits outside it. */
+.kbot-first-run-wizard__connect,
+.kbot-first-run-wizard__connect *,
+.kbot-first-run-wizard__connect *::before,
+.kbot-first-run-wizard__connect *::after {
+  box-sizing: border-box;
+}
+
+.kbot-first-run-wizard__connect button[type="submit"] {
+  border-color: transparent;
+  background: var(--action-primary-bg, var(--sage, #b3dda8));
+  color: var(--action-primary-text, #172a1d);
+}
+
 .kbot-first-run-wizard__tiles {
   list-style: none;
   margin: 0;
