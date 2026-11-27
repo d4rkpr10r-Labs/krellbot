@@ -13,6 +13,7 @@ import {
   type FillLeg,
   type ResearchClient,
   type ResearchCosts,
+  type ResearchRunIdentity,
   type StoredResult,
 } from "./client";
 import {
@@ -83,6 +84,13 @@ type MetricCell = {
 type CostsLoad =
   | { status: "loading" }
   | { status: "loaded"; costs: ResearchCosts }
+  | { status: "unavailable" }
+  | { status: "failed"; message: string };
+
+/** The run record read for the result on screen (GET /api/v1/jobs/{id}/run). */
+type RunIdentityLoad =
+  | { status: "loading" }
+  | { status: "loaded"; identity: ResearchRunIdentity }
   | { status: "unavailable" }
   | { status: "failed"; message: string };
 
@@ -665,6 +673,16 @@ export function ResearchView({
     result: StoredResult;
     jobId: string;
   } | null>(null);
+  // The run record names the job behind the result on screen; like the cost
+  // figures it is read on request, and any change of that result drops it.
+  const [runLoad, setRunLoad] = useState<
+    { token: object; load: RunIdentityLoad } | null
+  >(null);
+  const [runResult, setRunResult] = useState<StoredResult | null>(null);
+  if (runResult !== storedResult) {
+    setRunResult(storedResult);
+    setRunLoad(null);
+  }
 
   // Fills are only shown in the selected-bar detail, so they are read once
   // per loaded result, when a bar is first selected. A run never selected
@@ -1063,6 +1081,28 @@ export function ResearchView({
       };
     }
     setCostsLoad((prev) => (prev !== null && prev.token === token ? { token, load } : prev));
+  };
+
+  const handleLoadRun = async (): Promise<void> => {
+    // Same job identity as the cost figures: jobIdRef names this result's job.
+    const id = jobIdRef.current;
+    const getRun = client.getRun;
+    if (storedResult === null || id === null || getRun === undefined) {
+      return;
+    }
+    const token = {};
+    setRunLoad({ token, load: { status: "loading" } });
+    let load: RunIdentityLoad;
+    try {
+      const identity = await getRun.call(client, id);
+      load = identity === null ? { status: "unavailable" } : { status: "loaded", identity };
+    } catch (err) {
+      load = {
+        status: "failed",
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+    setRunLoad((prev) => (prev !== null && prev.token === token ? { token, load } : prev));
   };
 
   const handleExport = async (): Promise<void> => {
@@ -1562,6 +1602,11 @@ export function ResearchView({
           selectedBar={selectedBar}
           selectedIndex={selectedIndex}
           fills={fills}
+          runLoad={runLoad?.load ?? null}
+          canLoadRun={client.getRun !== undefined}
+          onLoadRun={() => {
+            void handleLoadRun();
+          }}
           costs={costsLoad?.load ?? null}
           canLoadCosts={client.getCosts !== undefined}
           onLoadCosts={() => {
@@ -1652,6 +1697,9 @@ type ResultPanelProps = {
   selectedBar: TraceBar | null;
   selectedIndex: number;
   fills: FillsState;
+  runLoad: RunIdentityLoad | null;
+  canLoadRun: boolean;
+  onLoadRun: () => void;
   costs: CostsLoad | null;
   canLoadCosts: boolean;
   onLoadCosts: () => void;
@@ -1666,6 +1714,9 @@ function ResultPanel({
   selectedBar,
   selectedIndex,
   fills,
+  runLoad,
+  canLoadRun,
+  onLoadRun,
   costs,
   canLoadCosts,
   onLoadCosts,
@@ -1698,13 +1749,40 @@ function ResultPanel({
     trace as Array<Record<string, unknown>>,
   );
   // Result provenance: only what the stored receipt itself carries plus the
-  // job identity it was loaded under — never the (editable) setup fields.
+  // job identity it was loaded under and that job's run record — never the
+  // (editable) setup fields.
   const receiptDate = (value: unknown) => typeof value === "string" && value ? value : "unavailable";
+  const runValue = (read: (identity: ResearchRunIdentity) => string | null): string => {
+    if (!canLoadRun) {
+      return "unavailable";
+    }
+    if (runLoad === null) {
+      return "not loaded";
+    }
+    switch (runLoad.status) {
+      case "loading":
+        return "loading";
+      case "failed":
+        return "read failed";
+      case "unavailable":
+        return "unavailable";
+      case "loaded":
+        return read(runLoad.identity) ?? "unavailable";
+    }
+  };
+  const showRunButton =
+    canLoadRun &&
+    (runLoad === null || runLoad.status === "loading" || runLoad.status === "failed");
   const provenance: Array<{ label: string; value: string; testId: string }> = [
     {
       label: "Job",
       value: jobId ?? "unavailable",
       testId: "research-result-context-job",
+    },
+    {
+      label: "Run id",
+      value: runValue((identity) => identity.run_id),
+      testId: "research-result-context-run-id",
     },
     {
       label: "Fee (bps)",
@@ -1725,6 +1803,15 @@ function ResultPanel({
       label: "Data manifest sha256",
       value: formatMetric(receipt.data_manifest_sha256),
       testId: "research-result-context-sha",
+    },
+    {
+      // Distinct packs run for this strategy on this dataset, failed and
+      // cancelled runs included.
+      label: "Variants tried on this data",
+      value: runValue((identity) =>
+        identity.variants_tried === null ? null : String(identity.variants_tried),
+      ),
+      testId: "research-result-context-variants-tried",
     },
   ];
   return (
@@ -1754,6 +1841,28 @@ function ResultPanel({
           </div>
         ))}
       </div>
+      {runLoad?.status === "failed" ? (
+        <p
+          className="kbot-research__error"
+          role="alert"
+          data-testid="research-result-context-run-error"
+        >
+          Reading the run record failed ({runLoad.message}) — use Show run
+          identity to retry
+        </p>
+      ) : null}
+      {showRunButton ? (
+        <button
+          type="button"
+          className="kbot-research__action"
+          data-testid="research-result-context-run-load"
+          aria-busy={runLoad?.status === "loading"}
+          disabled={runLoad?.status === "loading"}
+          onClick={onLoadRun}
+        >
+          {runLoad?.status === "loading" ? RUN_LOADING_LABEL : "Show run identity"}
+        </button>
+      ) : null}
       <dl className="kbot-research__metrics">
         {metrics.map((metric) => (
           <div
@@ -1989,6 +2098,7 @@ const COSTS_NOTE =
   "fees or slippage and with twice both. Backtest reruns over the same data " +
   "— not live trading costs.";
 const COSTS_LOADING_LABEL = "Loading cost figures…";
+const RUN_LOADING_LABEL = "Loading run identity…";
 
 /** Two-decimal display of exact Decimal text; never a fabricated zero. */
 function formatDecimalAmount(value: string | null): string {

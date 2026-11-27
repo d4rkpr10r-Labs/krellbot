@@ -28,6 +28,7 @@ from krellbot.api.jobs import (
     JOB_ERROR_FILLS_UNAVAILABLE,
     JOB_ERROR_NOT_FOUND,
     JOB_ERROR_RESULT_UNAVAILABLE,
+    JOB_ERROR_RUN_UNAVAILABLE,
     JOB_KIND_RESEARCH_BACKTEST,
     JobManager,
     QueueFull,
@@ -2510,6 +2511,42 @@ def create_app(
         if costs is None:
             return JSONResponse({"code": JOB_ERROR_COSTS_UNAVAILABLE}, status_code=404)
         return JSONResponse(costs, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/jobs/{job_id}/run")
+    async def get_job_run(request: Request, job_id: str) -> Response:
+        """Serve a finished research job's run record and its variants-tried count.
+
+        Same session gate as the result route (``_gate_get``); read-only. The
+        record names the run id and the inputs it hashes; the stored
+        ``{legacy_receipt, trace}`` result is untouched. A job that has not
+        ended, or that was stored before run records were kept, is 404
+        ``run_unavailable``.
+        """
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+
+        snap = s.jobs.get(job_id)
+        if snap is None:
+            return JSONResponse(
+                {"code": JOB_ERROR_NOT_FOUND, "message": "job not found"},
+                status_code=404,
+            )
+        run = s.jobs.run_for(job_id)
+        if run is None:
+            return JSONResponse({"code": JOB_ERROR_RUN_UNAVAILABLE}, status_code=404)
+        return JSONResponse(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "job_id": job_id,
+                "run": run["run"],
+                "variants_tried": run["variants_tried"],
+            },
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/v1/events")
     async def events(request: Request) -> Response:
