@@ -223,6 +223,11 @@ describe("StatusPanel resting stop in force", () => {
       expect(screen.getByTestId("paper-status-pack").textContent).toContain("ETHUSD");
     });
     expect(screen.getByTestId("paper-resting-stop").textContent).toBe("Reading resting stop…");
+    // The details read starts in an effect after the ETHUSD status renders; wait
+    // for it so resolveEth is the real resolver, not the initial no-op.
+    await waitFor(() => {
+      expect(getDetails).toHaveBeenCalledWith({ venue: "kraken", pair: "ETHUSD" });
+    });
     await act(async () => {
       resolveEth(details({ pair: "ETHUSD", resting_stop: "1800" }));
     });
