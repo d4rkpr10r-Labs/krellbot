@@ -117,6 +117,9 @@ class _AppState:
     alert_notifier: object = None  # Notifier; tests inject FakeNotifier
     referral_transport: object = None  # referral.Transport; tests inject FakeTransport
     ai_transport: object = None  # ai.http.HttpTransport; tests inject FakeAiTransport
+    # Sign-in flows (ai.oauth.SigninRegistry), in engine memory only; built on first use.
+    ai_signins: object = None
+    ai_signin_listener_factory: object = None  # ai.oauth.ListenerFactory; tests inject a socket-free fake
     # Krell (M38.15), built once per app on first use: her agent tool core, the
     # engine's confirm ledger (same clock), a () -> KrellLoop factory, and a lock
     # so one Krell stream (or a clear) runs at a time on the shared conversation.
@@ -1487,9 +1490,14 @@ def create_app(
         try:
             yield
         finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            try:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            finally:
+                # Sign-in listeners close even if the rehearsal task ended with an error.
+                if state.ai_signins is not None:
+                    state.ai_signins.close_all()  # type: ignore[attr-defined]
 
     app = FastAPI(
         title="krellbot.api",
@@ -4804,6 +4812,9 @@ def create_app(
         "ai_connection_not_found": 404,
         "ai_connections_unreadable": 409,
         "ai_keychain_unavailable": 503,
+        "ai_signin_not_found": 404,
+        "ai_signin_listener_failed": 503,
+        "ai_signin_local_only": 403,
     }
 
     def _ai_json(body: dict, status_code: int = 200) -> Response:
@@ -5040,6 +5051,111 @@ def create_app(
         except ConnectionRefused as exc:
             return _ai_refused(exc)
         return await _ai_probe_and_record(s, store, conn)
+
+    # ---- Sign in with OpenRouter (M38.20) ------------------------------
+    #
+    # OAuth PKCE through a one-shot listener on 127.0.0.1 (a separate socket,
+    # not a route here). The browser polls the status route; the code, the
+    # verifier and the key never pass through these routes. Starting is
+    # local-only: OpenRouter redirects to 127.0.0.1, which from a remote
+    # (tailnet) browser is that device, not this one.
+
+    def _ai_signins(s: _AppState):
+        from krellbot.ai.oauth import SigninRegistry
+
+        if s.ai_signins is None:
+            s.ai_signins = SigninRegistry()
+        return s.ai_signins
+
+    def _ai_signin_view(flow_id: str, status: dict) -> dict:
+        body: dict = {"flow_id": flow_id, "state": status["state"]}
+        if "connection_id" in status:
+            body["connection_id"] = status["connection_id"]
+        if "code" in status:
+            body["code"] = status["code"]
+            body["detail"] = status["message"]
+        return body
+
+    @app.post("/api/v1/ai/signin/openrouter")
+    async def ai_signin_openrouter(request: Request) -> Response:
+        """Start a sign-in. Body: ``model``. Returns ``flow_id`` and the ``authorize_url`` to open."""
+
+        from krellbot.ai.connections import ConnectionRefused
+        from krellbot.ai.http import UrllibTransport
+        from krellbot.ai.oauth import SigninRefused, start_openrouter_signin
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        # A server started with Tailscale access admits only tailnet sessions (see remote_scope_put);
+        # the peer check is defence in depth for a loopback-only server.
+        peer = request.client.host if request.client is not None else None
+        if tailnet_access is not None or peer not in ("127.0.0.1", "::1"):
+            return _ai_refused(SigninRefused("ai_signin_local_only"))
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            return _ai_invalid_body()
+        if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
+            return _ai_invalid_body()
+        try:
+            flow = await asyncio.to_thread(
+                start_openrouter_signin,
+                s.home,
+                model=payload["model"],
+                clock=lambda: _app_now(s),
+                transport=s.ai_transport or UrllibTransport(),
+                listener_factory=s.ai_signin_listener_factory,
+                registry=_ai_signins(s),
+                allow_injected_fake_backend=s.keys_allow_fake_backend,
+            )
+        except (ConnectionRefused, SigninRefused) as exc:
+            return _ai_refused(exc)
+        return _ai_json({"ok": True, "effect": "changed", "flow_id": flow.id, "authorize_url": flow.authorize_url})
+
+    @app.get("/api/v1/ai/signin/{flow_id}")
+    async def ai_signin_status(flow_id: str, request: Request) -> Response:
+        """A sign-in's state: ``waiting``, ``connected`` (with ``connection_id``), ``failed`` or ``expired``."""
+
+        from krellbot.ai.oauth import SigninRefused, signin_status
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+        try:
+            status = signin_status(flow_id, registry=_ai_signins(s))
+        except SigninRefused as exc:
+            return _ai_refused(exc)
+        return _ai_json({"ok": True, "effect": "unchanged", **_ai_signin_view(flow_id, status)})
+
+    @app.delete("/api/v1/ai/signin/{flow_id}")
+    async def ai_signin_cancel(flow_id: str, request: Request) -> Response:
+        """Cancel a sign-in still waiting for OpenRouter: its listener closes and it can never add a connection.
+
+        A sign-in whose callback already arrived, or that finished, is left
+        alone; the reply says ``cancelled: false`` with its current state.
+        """
+
+        from krellbot.ai.oauth import SigninRefused, cancel_signin
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        try:
+            cancelled, status = cancel_signin(flow_id, registry=_ai_signins(s))
+        except SigninRefused as exc:
+            return _ai_refused(exc)
+        return _ai_json(
+            {
+                "ok": True,
+                "effect": "changed" if cancelled else "unchanged",
+                "cancelled": cancelled,
+                **_ai_signin_view(flow_id, status),
+            }
+        )
 
     # ---- Krell (M38.15) ---------------------------------------------------
     #
