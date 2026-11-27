@@ -15,7 +15,10 @@ result, and every call is audited:
    become filesystem paths (revision ids, a draft's pack id) must be in their
    exact on-disk format (:func:`path_id_refusal`, ``mcp_invalid_request``).
 4. Operator policy and agent limits: :meth:`AgentToolCore._policy_step`
-   (M38.3 plugs in here).
+   checks ``paper_arm`` and the paper change tools against the operator's
+   agent limits (:mod:`krellbot.agent.limits`, typed ``agent_limit_*`` and
+   ``agent_change_not_allowed`` refusals, journaled). A successful agent arm
+   is counted in ``agent-arms.json`` (:mod:`krellbot.agent.arm_registry`).
 5. Confirm tickets: :meth:`AgentToolCore._confirm_step` (M38.7 plugs in here).
 6. The tool's handler.
 7. One ``kind=agent_action`` journal record (:mod:`krellbot.agent.audit`).
@@ -45,11 +48,21 @@ from pathlib import Path
 from typing import Any, Literal
 
 from krellbot import sanitize
+from krellbot.agent import arm_registry, limits
 from krellbot.agent.actors import ACTOR_KINDS, Actor
 from krellbot.agent.audit import append_agent_record, is_secret_param_name
+from krellbot.agent.limits import (
+    CODE_AGENT_CHANGE_NOT_ALLOWED,
+    CODE_AGENT_LIMIT_BALANCE,
+    CODE_AGENT_LIMIT_DAILY_LOSS_REQUIRED,
+    CODE_AGENT_LIMIT_MAX_ARMS,
+    CODE_AGENT_LIMIT_PAIR,
+    CODE_AGENT_LIMIT_RISK_CAP,
+    CODE_AGENT_LIMIT_VENUE,
+)
 from krellbot.application import packs as packs_app
 from krellbot.application import user_policy
-from krellbot.application.paper import PaperService
+from krellbot.application.paper import PaperService, arm_terms, parse_daily_loss_limit_pct
 from krellbot.application.research import ResearchRequest, ResearchService
 from krellbot.application.strategy import (
     DraftNotRunnable,
@@ -57,7 +70,8 @@ from krellbot.application.strategy import (
     StrategyDraftService,
     StrategyIdMismatch,
 )
-from krellbot.config import load_config
+from krellbot.application.user_policy import PolicyDecision
+from krellbot.config import find_armed, load_config
 
 # ---- refusal vocabulary -------------------------------------------------
 #
@@ -182,6 +196,11 @@ def path_id_refusal(tool: str, params: dict) -> dict | None:
             if pack_id and not is_pack_id(pack_id):
                 return invalid_request(tool, f"{name}: {MESSAGE_BAD_PACK_ID}").to_dict()
     return None
+
+
+def limit_refused(tool: str, decision: PolicyDecision) -> dict:
+    """The tool result for an agent-limit refusal (already journaled)."""
+    return ToolRefusal(decision.code, decision.message, tool).to_dict()
 
 
 def _tool_error(tool: str, cause: str) -> dict:
@@ -422,12 +441,21 @@ class AgentToolCore:
         return result, ticket, False
 
     def _policy_step(self, ctx: ToolContext, spec: ToolSpec, params: dict) -> dict | None:
-        """Step 4: operator policy and agent limits.
+        """Step 4: operator policy and agent limits (:mod:`krellbot.agent.limits`).
 
         Return a refusal result to stop the call, or ``None`` to continue.
-        M38.3 adds the agent limits here. The existing paper-arm policy check
-        stays inside the ``paper_arm`` handler (``user_policy.ensure_allowed``).
+        ``paper_arm`` is checked against the agent limits with the values
+        ``PaperService.arm`` will use; the change tools against the per-actor
+        allow flags. The existing paper-arm policy check stays inside the
+        ``paper_arm`` handler (``user_policy.ensure_allowed``): when it would
+        refuse, this step steps aside so that refusal and its single journal
+        row are exactly as before.
         """
+        if spec.name == limits.TOOL_PAPER_ARM:
+            return _paper_arm_limits(ctx, params)
+        if spec.name in limits.CHANGE_TOOLS:
+            decision = limits.check_agent_call(ctx.home, ctx.actor, spec.name, params, resolved={}, clock=ctx.clock)
+            return None if decision is None else limit_refused(spec.name, decision)
         return None
 
     def _confirm_step(
@@ -609,28 +637,32 @@ def _backtest(ctx: ToolContext, params: dict) -> dict:
     }
 
 
-def _paper_arm(ctx: ToolContext, params: dict) -> dict:
-    pack_path = params.get("pack_path")
-    revision_id = params.get("revision_id")
+@dataclass(frozen=True)
+class _ArmRequest:
+    """A ``paper_arm`` call resolved to what ``PaperService.arm`` will use."""
+
+    venue: str
+    pack_path: Path
+    revision_id: str | None
+    balance: Decimal | None
+    daily_loss_limit_pct: Decimal | None
+
+
+MESSAGE_BAD_LOSS_LIMIT = "daily_loss_limit_pct must be a plain percent above 0 and at most 100, e.g. 5 or 2.5"
+
+
+def _arm_request(ctx: ToolContext, params: dict) -> _ArmRequest | dict:
+    """Resolve a ``paper_arm`` call, or return its ``mcp_invalid_request`` refusal.
+
+    Shared by the policy step and the handler, so both see the same pack,
+    balance and daily loss limit and refuse bad input identically.
+    """
     venue = params.get("venue")
-    mode = params.get("mode", "paper")
-    paper_balance = params.get("paper_balance")
-    correlation_id = params.get("correlation_id", "")
-
-    # Hard boundary: refuse before any paper/live service call.
-    if str(mode) != "paper":
-        return live_arm_refused("paper_arm").to_dict()
-
-    decision = user_policy.ensure_allowed(ctx.home, user_policy.ACTION_PAPER_ARM)
-    if not decision.ok:
-        body = policy_denied("paper_arm", decision.message).to_dict()
-        body["action"] = user_policy.ACTION_PAPER_ARM
-        return body
-
     if not venue:
         return invalid_request("paper_arm", "paper_arm requires venue").to_dict()
 
-    resolved_path: Path | None = None
+    revision_id = params.get("revision_id")
+    pack_path = params.get("pack_path")
     if revision_id:
         drafts = StrategyDraftService(ctx.home, clock=ctx.clock)
         try:
@@ -647,6 +679,7 @@ def _paper_arm(ctx: ToolContext, params: dict) -> dict:
             "paper_arm requires pack_path or revision_id",
         ).to_dict()
 
+    paper_balance = params.get("paper_balance")
     balance: Decimal | None
     if paper_balance is None:
         balance = None
@@ -656,17 +689,120 @@ def _paper_arm(ctx: ToolContext, params: dict) -> dict:
         except (InvalidOperation, ValueError):
             return invalid_request("paper_arm", "paper_balance must be a decimal").to_dict()
 
+    raw_limit = params.get("daily_loss_limit_pct")
+    loss_limit: Decimal | None = None
+    if raw_limit is not None:
+        try:
+            loss_limit = parse_daily_loss_limit_pct(raw_limit)
+        except ValueError:
+            return invalid_request("paper_arm", MESSAGE_BAD_LOSS_LIMIT).to_dict()
+
+    return _ArmRequest(
+        venue=str(venue),
+        pack_path=resolved_path,
+        revision_id=str(revision_id) if revision_id else None,
+        balance=balance,
+        daily_loss_limit_pct=loss_limit,
+    )
+
+
+def _paper_arm_limits(ctx: ToolContext, params: dict) -> dict | None:
+    """Policy step for ``paper_arm``: the agent limits, or ``None`` to go on.
+
+    A live mode, an operator policy that denies paper-arm (or is malformed),
+    and bad input are left to the handler, which refuses them exactly as it
+    did before the limits existed. Values are read from the pack the arm will
+    use (``arm_terms``); one that cannot be read is refused, never guessed.
+    """
+    if str(params.get("mode", "paper")) != "paper":
+        return None
+    if not user_policy.check(ctx.home, user_policy.ACTION_PAPER_ARM).ok:
+        return None
+    request = _arm_request(ctx, params)
+    if isinstance(request, dict):
+        return request
+    pair, risk_cap = arm_terms(request.pack_path, request.venue)
+    resolved = {
+        "venue": request.venue,
+        "pair": pair or None,
+        "paper_balance": request.balance,
+        "risk_cap_pct": risk_cap,
+        "daily_loss_limit_pct": request.daily_loss_limit_pct,
+    }
+    decision = limits.check_agent_call(
+        ctx.home, ctx.actor, limits.TOOL_PAPER_ARM, params, resolved=resolved, clock=ctx.clock
+    )
+    return None if decision is None else limit_refused(limits.TOOL_PAPER_ARM, decision)
+
+
+def _record_agent_arm(ctx: ToolContext, request: _ArmRequest, paper: PaperService, correlation_id: Any) -> dict | None:
+    """Count a successful agent arm in ``agent-arms.json``.
+
+    An arm that cannot be counted would slip past ``max_agent_arms``, so it
+    is disarmed again and refused (journaled) instead.
+    """
+    pair, _cap = arm_terms(request.pack_path, request.venue)
+    armed = find_armed(load_config(ctx.home), request.venue, pair) if pair else None
+    if armed is None or armed.mode != "paper":
+        return None
+    try:
+        arm_registry.record_agent_arm(
+            ctx.home,
+            venue=armed.venue,
+            pair=armed.pair,
+            actor=ctx.actor,
+            armed_at_ts=armed.armed_at_ts,
+            revision_id=request.revision_id,
+        )
+    except (OSError, arm_registry.AgentArmRegistryUnreadable):
+        paper.disarm(venue=armed.venue, pair=armed.pair, correlation_id=correlation_id)
+        decision = limits.refuse(
+            ctx.home,
+            ctx.actor,
+            limits.TOOL_PAPER_ARM,
+            CODE_AGENT_LIMIT_MAX_ARMS,
+            limits.MESSAGE_ARM_NOT_RECORDED,
+            clock=ctx.clock,
+        )
+        return limit_refused(limits.TOOL_PAPER_ARM, decision)
+    return None
+
+
+def _paper_arm(ctx: ToolContext, params: dict) -> dict:
+    mode = params.get("mode", "paper")
+    correlation_id = params.get("correlation_id", "") or ""
+
+    # Hard boundary: refuse before any paper/live service call.
+    if str(mode) != "paper":
+        return live_arm_refused("paper_arm").to_dict()
+
+    decision = user_policy.ensure_allowed(ctx.home, user_policy.ACTION_PAPER_ARM)
+    if not decision.ok:
+        body = policy_denied("paper_arm", decision.message).to_dict()
+        body["action"] = user_policy.ACTION_PAPER_ARM
+        return body
+
+    request = _arm_request(ctx, params)
+    if isinstance(request, dict):
+        return request
+
     paper = PaperService(home=ctx.home, clock=ctx.clock)
     result = paper.arm(
-        resolved_path,
-        venue=str(venue),
+        request.pack_path,
+        venue=request.venue,
         mode="paper",
-        paper_balance=balance,
-        correlation_id=correlation_id or "",
+        paper_balance=request.balance,
+        correlation_id=correlation_id,
+        daily_loss_limit_pct=request.daily_loss_limit_pct,
     )
-    if revision_id and result.ok:
+    if result.ok:
+        # Every core caller is an agent: count the arm toward max_agent_arms.
+        refused = _record_agent_arm(ctx, request, paper, correlation_id)
+        if refused is not None:
+            return refused
+    if request.revision_id and result.ok:
         try:
-            StrategyDraftService(ctx.home, clock=ctx.clock).mark_deployed(str(revision_id))
+            StrategyDraftService(ctx.home, clock=ctx.clock).mark_deployed(request.revision_id)
         except (RevisionNotFound, DraftNotRunnable):
             pass
     out = result.to_dict()
@@ -752,18 +888,35 @@ def _builtin_specs() -> tuple[ToolSpec, ...]:
                     "venue": {"type": "string"},
                     "mode": {"type": "string", "enum": ["paper"]},
                     "paper_balance": {"type": ["string", "number"], "description": "Decimal paper balance."},
+                    "daily_loss_limit_pct": {
+                        "type": ["string", "number"],
+                        "description": (
+                            "Daily loss limit, a percent of the paper balance above 0 and at most 100. "
+                            "The operator's agent limits require one by default."
+                        ),
+                    },
                     "correlation_id": {"type": "string"},
                 },
                 "required": ["venue"],
             },
             labels=(LABEL_PAPER,),
-            description="Arm a validated draft or pack on paper (simulated funds). Live arm is always refused.",
+            description=(
+                "Arm a validated draft or pack on paper (simulated funds) within the operator's agent limits. "
+                "Live arm is always refused."
+            ),
             handler=_paper_arm,
         ),
     )
 
 
 __all__ = [
+    "CODE_AGENT_CHANGE_NOT_ALLOWED",
+    "CODE_AGENT_LIMIT_BALANCE",
+    "CODE_AGENT_LIMIT_DAILY_LOSS_REQUIRED",
+    "CODE_AGENT_LIMIT_MAX_ARMS",
+    "CODE_AGENT_LIMIT_PAIR",
+    "CODE_AGENT_LIMIT_RISK_CAP",
+    "CODE_AGENT_LIMIT_VENUE",
     "CODE_INVALID_REQUEST",
     "CODE_KEY_READ_REFUSED",
     "CODE_LIVE_ARM_REFUSED",
@@ -800,6 +953,7 @@ __all__ = [
     "is_pack_id",
     "is_revision_id",
     "key_read_refused",
+    "limit_refused",
     "live_arm_refused",
     "normalize_tool_name",
     "path_id_refusal",
