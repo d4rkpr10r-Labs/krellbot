@@ -11,7 +11,9 @@ result, and every call is audited:
    ``mcp_live_arm_refused``).
 2. Unknown tool, or a tool not offered to this actor (``mcp_unknown_tool``).
 3. Params: an object with string names. Secret-shaped names are refused
-   (``agent_secret_param_refused``) before anything else sees them.
+   (``agent_secret_param_refused``) before anything else sees them. Ids that
+   become filesystem paths (revision ids, a draft's pack id) must be in their
+   exact on-disk format (:func:`path_id_refusal`, ``mcp_invalid_request``).
 4. Operator policy and agent limits: :meth:`AgentToolCore._policy_step`
    (M38.3 plugs in here).
 5. Confirm tickets: :meth:`AgentToolCore._confirm_step` (M38.7 plugs in here).
@@ -34,6 +36,7 @@ agents and tests already depend on them.
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -122,6 +125,63 @@ def policy_denied(tool: str, message: str) -> ToolRefusal:
 
 def secret_param_refused(tool: str) -> ToolRefusal:
     return ToolRefusal(CODE_SECRET_PARAM_REFUSED, MESSAGE_SECRET_PARAM_REFUSED, tool)
+
+
+# ---- ids that become filesystem paths -----------------------------------
+#
+# Agents pass untrusted, possibly prompt-injected text. Every id that a store
+# joins into a filesystem path is checked against its exact on-disk format in
+# step 3, before any handler runs. The refusal message never echoes the value.
+
+# ``StrategyDraftService._revision_id`` is ``sha256(...).hexdigest()``.
+REVISION_ID_PATTERN = r"[0-9a-f]{64}"
+# ``pack/schema.json`` ``id``; the draft store creates ``drafts/<pack id>/``
+# from it before any lint runs.
+PACK_ID_PATTERN = r"[a-z0-9][a-z0-9-]{0,31}"
+_REVISION_ID_RE = re.compile(REVISION_ID_PATTERN)
+_PACK_ID_RE = re.compile(PACK_ID_PATTERN)
+
+# Param names checked for every tool, so a later tool taking one of these
+# names is covered without extra wiring.
+REVISION_ID_PARAMS: tuple[str, ...] = ("revision_id", "parent_revision_id")
+REVISION_ID_LIST_PARAMS: tuple[str, ...] = ("revision_ids",)
+PACK_PARAMS: tuple[str, ...] = ("pack",)
+
+MESSAGE_BAD_REVISION_ID = "revision ids are exactly 64 lowercase hex characters"
+MESSAGE_BAD_PACK_ID = "pack id must be 1-32 characters of a-z, 0-9 and '-', starting with a letter or digit"
+
+
+def is_revision_id(value: object) -> bool:
+    """True for a draft revision id in its exact on-disk form."""
+    return isinstance(value, str) and _REVISION_ID_RE.fullmatch(value) is not None
+
+
+def is_pack_id(value: object) -> bool:
+    """True for a pack id that matches the pack schema's ``id`` pattern."""
+    return isinstance(value, str) and _PACK_ID_RE.fullmatch(value) is not None
+
+
+def path_id_refusal(tool: str, params: dict) -> dict | None:
+    """Refuse any filesystem-bound id that is not in its exact on-disk format.
+
+    A falsy value passes, because every handler treats it as "not given" and
+    never joins it into a path. Returns the refusal result, or ``None``.
+    """
+    for name in REVISION_ID_PARAMS:
+        value = params.get(name)
+        if value and not is_revision_id(value):
+            return invalid_request(tool, f"{name}: {MESSAGE_BAD_REVISION_ID}").to_dict()
+    for name in REVISION_ID_LIST_PARAMS:
+        value = params.get(name)
+        if value and not (isinstance(value, list | tuple) and all(is_revision_id(v) for v in value)):
+            return invalid_request(tool, f"{name}: {MESSAGE_BAD_REVISION_ID}").to_dict()
+    for name in PACK_PARAMS:
+        pack = params.get(name)
+        if isinstance(pack, dict):
+            pack_id = pack.get("id")
+            if pack_id and not is_pack_id(pack_id):
+                return invalid_request(tool, f"{name}: {MESSAGE_BAD_PACK_ID}").to_dict()
+    return None
 
 
 def _tool_error(tool: str, cause: str) -> dict:
@@ -338,6 +398,9 @@ class AgentToolCore:
             return invalid_request(spec.name, "tool param names must be strings").to_dict(), None, False
         if any(is_secret_param_name(name) for name in params):
             return secret_param_refused(spec.name).to_dict(), None, False
+        refusal = path_id_refusal(spec.name, params)
+        if refusal is not None:
+            return refusal, None, False
 
         ctx = ToolContext(home=self._home, actor=actor, clock=self._clock, fetch=self._fetch)
         ticket: str | None = None
@@ -714,11 +777,18 @@ __all__ = [
     "LABEL_NOT_ADVICE",
     "LABEL_PAPER",
     "LABEL_SIMULATED",
+    "MESSAGE_BAD_PACK_ID",
+    "MESSAGE_BAD_REVISION_ID",
     "MESSAGE_KEY_READ_REFUSED",
     "MESSAGE_LIVE_ARM_REFUSED",
     "MESSAGE_SECRET_PARAM_REFUSED",
     "MESSAGE_TOOL_ERROR",
     "MESSAGE_UNKNOWN_TOOL",
+    "PACK_ID_PATTERN",
+    "PACK_PARAMS",
+    "REVISION_ID_LIST_PARAMS",
+    "REVISION_ID_PARAMS",
+    "REVISION_ID_PATTERN",
     "SCHEMA_VERSION",
     "AgentToolCore",
     "Cost",
@@ -727,9 +797,12 @@ __all__ = [
     "ToolRefusal",
     "ToolSpec",
     "invalid_request",
+    "is_pack_id",
+    "is_revision_id",
     "key_read_refused",
     "live_arm_refused",
     "normalize_tool_name",
+    "path_id_refusal",
     "policy_denied",
     "secret_param_refused",
     "unknown_tool",

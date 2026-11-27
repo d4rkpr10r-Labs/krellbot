@@ -17,10 +17,20 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import krellbot.pack
 from krellbot import sanitize
 from krellbot.agent.actors import KRELL, Actor
 from krellbot.agent.audit import is_secret_param_name, read_agent_activity
-from krellbot.agent.core import LABEL_NOT_ADVICE, LABEL_PAPER, LABEL_SIMULATED, AgentToolCore, ToolSpec
+from krellbot.agent.core import (
+    LABEL_NOT_ADVICE,
+    LABEL_PAPER,
+    LABEL_SIMULATED,
+    PACK_ID_PATTERN,
+    AgentToolCore,
+    ToolSpec,
+    is_revision_id,
+)
+from krellbot.application.strategy import StrategyDraftService
 from krellbot.journal import browse, read_records_lenient, summarize_record
 from krellbot.mcp import ALLOWED_TOOLS, CODE_KEY_READ_REFUSED, CODE_LIVE_ARM_REFUSED, McpTools
 
@@ -211,6 +221,81 @@ def test_nested_secret_shaped_names_never_reach_the_journal(home: Path):
 
     assert len(_agent_rows(home)) == 1
     assert value not in _journal_text(home)
+
+
+_BAD_REVISION_IDS = (
+    "../../config",
+    "..\\..\\x",
+    "/etc/passwd",
+    "A" * 64,
+    "a" * 63,
+    "a" * 64 + "\n",
+)
+
+
+def _spy_on_draft_store(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record (and fail) any draft-store method that would touch a path."""
+    calls: list[str] = []
+    for name in ("get", "pack_for_arm", "validate", "edit", "create", "exists", "revision_path"):
+
+        def _forbidden(*_args, _name=name, **_kwargs):
+            calls.append(_name)
+            raise AssertionError(f"StrategyDraftService.{_name} must not be called")
+
+        monkeypatch.setattr(StrategyDraftService, name, _forbidden)
+    return calls
+
+
+def test_malformed_revision_ids_are_refused_before_the_draft_store(home: Path, monkeypatch: pytest.MonkeyPatch):
+    (home / "config.json").write_text("{}", encoding="utf-8")
+    calls = _spy_on_draft_store(monkeypatch)
+    mcp = McpTools(home)
+
+    results = []
+    for bad in (*_BAD_REVISION_IDS, str(home / "config")):
+        results.append(mcp.call("validate", revision_id=bad))
+        results.append(mcp.call("paper_arm", revision_id=bad, venue="kraken"))
+        results.append(mcp.call("draft", pack=_valid_pack_dict(), parent_revision_id=bad))
+
+    for result in results:
+        assert result["ok"] is False
+        assert result["code"] == "mcp_invalid_request"
+        assert "../" not in result["message"]
+        assert "config" not in result["message"]
+        assert "passwd" not in result["message"]
+    assert calls == []
+    rows = _agent_rows(home)
+    assert len(rows) == len(results)
+    assert {r["detail"]["outcome"] for r in rows} == {"refused"}
+
+
+def test_malformed_draft_pack_ids_are_refused_before_the_draft_store(home: Path, monkeypatch: pytest.MonkeyPatch):
+    calls = _spy_on_draft_store(monkeypatch)
+    mcp = McpTools(home)
+    for bad_id in ("../../evil", "..\\evil", "/tmp/evil", "Trend", "x" * 33, 7):
+        pack = _valid_pack_dict()
+        pack["id"] = bad_id
+        result = mcp.call("draft", pack=pack)
+        assert result["code"] == "mcp_invalid_request", bad_id
+        assert "evil" not in result["message"]
+    assert calls == []
+    assert not (home.parent / "evil").exists()
+
+
+def test_well_formed_ids_still_reach_the_handler(home: Path):
+    mcp = McpTools(home)
+    missing = mcp.call("validate", revision_id="0" * 64)
+    assert missing["code"] == "mcp_invalid_request"
+    assert missing["message"].startswith("revision not found")
+
+    created = mcp.call("draft", pack=_valid_pack_dict())
+    assert created["ok"] is True
+    assert is_revision_id(created["result"]["revision_id"])
+
+
+def test_pack_id_pattern_matches_the_pack_schema():
+    schema = json.loads((Path(krellbot.pack.__file__).parent / "schema.json").read_text(encoding="utf-8"))
+    assert schema["properties"]["id"]["pattern"] == f"^{PACK_ID_PATTERN}$"
 
 
 class _RaisingPolicyCore(AgentToolCore):
