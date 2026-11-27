@@ -387,6 +387,10 @@ class AgentToolCore:
             raise ValueError(f"unknown actor kind for {name!r}: {sorted(spec.actors)!r}")
         self._specs[name] = spec
 
+    def has(self, name: str) -> bool:
+        """True when a tool named exactly ``name`` is registered (for any actor)."""
+        return name in self._specs
+
     def specs(self, actor: Actor) -> list[ToolSpec]:
         """Tools offered to ``actor``, in registration order."""
         return [spec for spec in self._specs.values() if actor.kind in spec.actors]

@@ -127,6 +127,46 @@ def test_mcp_backtest_returns_the_same_run_id_as_a_web_job(home: Path) -> None:
     assert shifted["run"]["run_id"] not in {None, result["run"]["run_id"]}
 
 
+def test_backtest_with_default_inputs_matches_a_web_job_sending_none(home: Path) -> None:
+    # No window, no costs, no holdout: the window bounds are null and the
+    # engine's default costs come from the receipt, for both.
+    pack_path = _write_pack(home / "packs", "defaults.json", _pack())
+    csv_path = _cache_csv(home)
+    app = _build_app(home)
+    csrf, session = _bootstrap_session(app)
+    payload = {
+        "kind": "research.backtest",
+        "correlation_id": "run-identity-defaults",
+        "pack_path": str(pack_path),
+        "dataset_csv": str(csv_path),
+    }
+    web = _run_body(app, csrf, session, _run(app, csrf, session, payload))["run"]
+    assert web["run_id"] is not None
+    assert {key: web["inputs"][key] for key in ("from_ms", "to_ms", "holdout_from_ms", "holdout_to_ms")} == {
+        "from_ms": None,
+        "to_ms": None,
+        "holdout_from_ms": None,
+        "holdout_to_ms": None,
+    }
+
+    result = McpTools(home, actor=CURSOR).call("backtest", pack_path=str(pack_path), dataset_csv=str(csv_path))
+    assert result["ok"] is True, result
+    assert result["run"]["run_id"] == web["run_id"]
+    assert result["run"]["receipt_canonical_sha256"] == web["receipt_canonical_sha256"]
+    assert result["run"] == _run_of(web)
+
+
+def test_registering_the_research_tools_twice_offers_one_compare(home: Path) -> None:
+    core = AgentToolCore(home)
+    assert not core.has("compare")
+    assert core.has("backtest")
+    register_research_tools(core)
+    register_research_tools(core)
+    assert core.has("compare")
+    for actor in (CURSOR, KRELL):
+        assert [spec.name for spec in core.specs(actor)].count("compare") == 1
+
+
 def test_backtest_refuses_bad_run_inputs_and_an_ambiguous_pack_source(home: Path) -> None:
     pack_path = _write_pack(home / "packs", "run-identity.json", _pack())
     csv_path = _cache_csv(home)
@@ -258,6 +298,27 @@ def test_estimate_marks_long_backtests_heavy_and_short_ones_light(home: Path) ->
     # Unknown size (no dataset to count, or one that may not be read) is heavy.
     unknown = agent_estimate.estimate("backtest", {}, home=home)
     assert (unknown.cost, unknown.bars) == ("heavy", None)
+
+
+def test_bar_count_ignores_the_header_blank_lines_and_a_missing_trailing_newline(home: Path) -> None:
+    rows = [f"{index * HOUR_MS},90,90,90,90,100" for index in range(5)]
+    header = "ts_ms,open,high,low,close,volume"
+    with_newline = ("\n".join([header, *rows]) + "\n").encode()
+    without_newline = "\n".join([header, *rows]).encode()
+    crlf_with_blanks = ("\r\n".join([header, "", *rows[:2], "  \t", *rows[2:], ""]) + "\r\n\r\n").encode()
+    no_header = "\n".join(rows).encode()
+    for raw in (with_newline, without_newline, crlf_with_blanks, no_header):
+        assert tools_research.count_csv_bars(raw) == 5, raw
+    assert tools_research.count_csv_bars(b"") == 0
+    assert tools_research.count_csv_bars(b"\n\n  \n") == 0
+    assert tools_research.count_csv_bars(header.encode()) == 0
+    assert tools_research.count_csv_bars(b"ts_ms,open\n1,2") == 1
+
+    # The estimate counts the file the same way, trailing newline or not.
+    (home / "cache").mkdir(parents=True, exist_ok=True)
+    for name, raw in (("with.csv", with_newline), ("without.csv", without_newline)):
+        (home / "cache" / name).write_bytes(raw)
+        assert agent_estimate.estimate("backtest", {"dataset_csv": f"cache/{name}"}, home=home).bars == 5
 
 
 # ---------------------------------------------------------------------------

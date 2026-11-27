@@ -24,13 +24,16 @@ before the check, and each file is read once, bounded and regular-file only
 copied to a private temporary folder and the run reads only those copies, so
 a file swapped after the check cannot change or flood the run. A refusal
 names the param but never echoes the path, and research refusals carry a
-fixed message per code, never engine text that may quote the file.
+fixed message per code, never engine text that may quote the file. A hard
+link inside an allowed folder, or a swap between the check and the read,
+needs write access inside the home, which is out of scope.
 """
 
 from __future__ import annotations
 
 import math
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -107,6 +110,10 @@ _WINDOW_PARAMS: tuple[str, ...] = ("from_ms", "to_ms", "holdout_from_ms", "holdo
 _COST_PARAMS: tuple[str, ...] = ("fee_bps", "slippage_bps")
 _WORKDIR_PREFIX = "krellbot-agent-research-"
 
+# Dataset line shapes for counting bars (whitespace as ``bytes.strip`` sees it, newline aside).
+_BLANK_LINE = re.compile(rb"^[ \t\r\f\v]*$", re.MULTILINE)
+_HEADER_LINE = re.compile(rb"^[ \t\r\f\v]*ts_ms,", re.MULTILINE)
+
 
 # ---- input files ----------------------------------------------------------
 
@@ -159,18 +166,22 @@ def read_dataset_input(home: Path, value: object) -> bytes | None:
 
 
 def count_csv_bars(raw: bytes) -> int:
-    """Count the data rows (bars) of dataset CSV bytes: non-blank lines after a ``ts_ms,`` header."""
-    bars = 0
-    header_seen = False
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if not header_seen and line.startswith(b"ts_ms,"):
-            header_seen = True
-            continue
-        bars += 1
-    return bars
+    """Count the data rows (bars) of dataset CSV bytes without splitting them into lines.
+
+    Lines end at ``\\n`` (so ``\\r\\n`` too); a last line without one still
+    counts. Blank or whitespace-only lines do not count, and neither does one
+    ``ts_ms,`` header line. Memory stays flat: the newlines are counted in
+    place and the blank lines are matched one at a time.
+    """
+    if not raw:
+        return 0
+    lines = raw.count(b"\n") + (0 if raw.endswith(b"\n") else 1)
+    blank = sum(1 for _ in _BLANK_LINE.finditer(raw))
+    if raw.endswith(b"\n"):
+        # In multiline mode ``^...$`` also matches the empty tail after the last newline: not a line.
+        blank -= 1
+    header = 1 if _HEADER_LINE.search(raw) is not None else 0
+    return max(0, lines - blank - header)
 
 
 def dataset_bars(home: Path, value: object) -> int | None:
@@ -514,8 +525,13 @@ def compare_spec() -> ToolSpec:
 
 
 def register_research_tools(core: AgentToolCore) -> None:
-    """Add ``compare`` to ``core``; ``backtest`` is one of the core's built-in verbs."""
-    core.register(compare_spec())
+    """Add ``compare`` to ``core`` unless it is already there; ``backtest`` is a built-in verb.
+
+    Idempotent, so every front door (the MCP server, Krell) can call it on a
+    shared core. A malformed spec still raises from ``register``.
+    """
+    if not core.has(TOOL_COMPARE):
+        core.register(compare_spec())
 
 
 __all__ = [
