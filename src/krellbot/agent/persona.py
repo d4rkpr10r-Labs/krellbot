@@ -76,13 +76,28 @@ _MCP = (
     "workstation. Nothing there will add labels or disclosures for you, so "
     'you must label simulated numbers and say "not financial advice" '
     "yourself. Use Krellbot's tools to read data, build and test strategies "
-    "on paper, and explain results. Hard limits and confirmations are "
-    "enforced by Krellbot, and a refusal from a tool is final: do not try to "
-    "work around it."
+    "on paper, and explain results. Krellbot enforces the hard limits, and "
+    "your client's own approval of each tool call is the human check. A "
+    "refusal from a tool is final: do not try to work around it."
 )
 
 Mode = Literal["standard", "advanced"]
 Surface = Literal["workstation", "mcp"]
+
+
+def opening_text() -> str:
+    """What Krell says and asks before a mode is chosen: the opening line, then the mode question."""
+    return _UNSET_MODE
+
+
+def mode_texts() -> dict[Mode, str]:
+    """The standard and advanced mode texts, keyed by mode.
+
+    The workstation prompt carries only the chosen one. The MCP ``krell``
+    prompt carries both, because the person answers the mode question inside
+    the client's conversation.
+    """
+    return {"standard": _STANDARD, "advanced": _ADVANCED}
 
 
 def system_prompt(

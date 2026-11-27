@@ -41,10 +41,11 @@ Surface contract: [mcp.md](mcp.md).
    `.cursor/skills/krellbot-mcp/SKILL.md` loads, or copy or symlink it
    into a personal Cursor skills directory.
 
-Cursor asks you before each tool call unless you turn that off, and every
-call is journaled as an `agent_action` under the actor `mcp:cursor` (from
-the client name Cursor sends when it connects). Use the `krell` prompt to
-start Krell in Cursor, and `krell_tour` for her guided tour.
+MCP clients ask you before each tool call unless you turn that off, and
+every call is journaled as an `agent_action` under the actor
+`mcp:<client>`, from the name the client sends when it connects: a client
+that names itself `Cursor` is recorded as `mcp:cursor`. Use the `krell`
+prompt to start Krell in Cursor, and `krell_tour` for her guided tour.
 
 Scripts and tests can call the five original verbs in-process through
 `McpTools` (same core, same refusals and audit), with an explicit home and

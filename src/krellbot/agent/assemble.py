@@ -1,9 +1,10 @@
 """Build the agent tool core with every agent tool registered.
 
-Both front doors (the stdio MCP server in :mod:`krellbot.mcp.stdio`, and
-Krell in the engine) build their core here, so they offer the same tools:
-the five built-in verbs, the read tools, ``compare`` and the paper change
-tools. Each ``register_*`` call is idempotent (``core.has``).
+The one place a front door should build its core, so both offer the same
+tools: the five built-in verbs, the read tools, ``compare`` and the paper
+change tools. Today the stdio MCP server (:mod:`krellbot.mcp.stdio`) uses
+it; Krell's front door in the engine should build its core here too. Each
+``register_*`` call is idempotent (``core.has``).
 
 ``confirm`` is the engine's confirm-ticket ledger. The MCP server passes
 none: MCP actors never get tickets, because their client asks the human

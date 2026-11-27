@@ -19,6 +19,7 @@ import sys
 import threading
 from collections.abc import Awaitable, Callable
 from contextlib import redirect_stderr, redirect_stdout
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,7 @@ from krellbot.agent import persona, tour
 from krellbot.agent.actors import Actor
 from krellbot.agent.assemble import build_agent_core
 from krellbot.agent.audit import read_agent_activity
+from krellbot.agent.core import ToolSpec
 from krellbot.mcp import stdio as mcp_stdio
 from krellbot.mcp.errors import CODE_LIVE_ARM_REFUSED, CODE_UNKNOWN_TOOL
 
@@ -115,18 +117,20 @@ def test_tool_call_is_audited_under_the_client_name(home: Path, mode: str):
     payload = _payload(result)
     assert payload["actor"] == "mcp:cursor"
     assert payload["ok"] is True
+
+    # The served call wrote exactly one record, before any direct core call below.
+    rows = read_agent_activity(home)
+    assert len(rows) == 1
+    served = rows[0]
+    assert served["ts"] == NOW
+    assert served["detail"]["actor"] == "mcp:cursor"
+    assert served["detail"]["tool"] == "tour_step"
+    assert served["detail"]["params"] == params
+    assert served["detail"]["outcome"] == "ok"
+
     # The JSON text is the core's result dict, unchanged.
     expected = build_agent_core(home, clock=lambda: NOW).call(Actor.mcp("Cursor"), "tour_step", params)
     assert payload == expected
-
-    rows = read_agent_activity(home, tool="tour_step")
-    assert len(rows) == 2  # the served call, then the direct core call above
-    served = rows[-1]
-    assert served["ts"] == NOW
-    assert served["detail"]["actor"] == "mcp:cursor"
-    assert served["detail"]["params"] == params
-    assert served["detail"]["outcome"] == "ok"
-    assert {row["detail"]["actor"] for row in read_agent_activity(home)} == {"mcp:cursor"}
 
 
 def test_client_without_a_usable_name_is_audited_as_local(home: Path):
@@ -160,6 +164,20 @@ def test_krell_and_tour_prompts_are_served(home: Path, mode: str):
     for rule in persona.HONESTY_RULES:
         assert rule in krell_text
     assert krell_text.index(persona.OPENING_LINE) < krell_text.index(persona.MODE_QUESTION)
+    # The client's model can act on the answer: both mode texts, word for word,
+    # after the question, and nothing suggested before the person answers.
+    assert persona.opening_text() in krell_text
+    assert "Do not suggest anything until they answer." in krell_text
+    assert "Follow the one they choose" in krell_text
+    modes = persona.mode_texts()
+    assert set(modes) == {"standard", "advanced"}
+    for text in modes.values():
+        assert text in krell_text
+        assert krell_text.index(persona.MODE_QUESTION) < krell_text.index(text)
+    assert "budget" in modes["standard"]
+    assert "deep end" in modes["advanced"]
+    # Krellbot does not confirm an MCP agent's calls; the client's approval is the human check.
+    assert "confirm" not in krell_text.lower()
 
     tour_text = _prompt_text(krell_tour)
     position = 0
@@ -205,6 +223,114 @@ def test_live_tool_name_over_stdio_returns_mcp_live_arm_refused(home: Path, mode
         ("live_arm", "refused", CODE_LIVE_ARM_REFUSED),
         ("close_position", "refused", CODE_UNKNOWN_TOOL),
     ]
+
+
+def _serve_extra_tools(monkeypatch: pytest.MonkeyPatch, *specs: ToolSpec) -> None:
+    """Make ``build_server`` use the real assembled core plus ``specs``."""
+
+    def build(home: Path, **kwargs: Any):
+        core = build_agent_core(home, **kwargs)
+        for spec in specs:
+            core.register(spec)
+        return core
+
+    monkeypatch.setattr(mcp_stdio, "build_agent_core", build)
+
+
+def _test_spec(name: str, handler: Callable[[Any, dict], dict]) -> ToolSpec:
+    return ToolSpec(
+        name=name,
+        effect="read",
+        cost="light",
+        input_schema={"type": "object", "properties": {}},
+        labels=(),
+        description=f"test tool {name}",
+        handler=handler,
+    )
+
+
+def _ok(name: str) -> dict:
+    return {"schema_version": "1", "ok": True, "effect": "unchanged", "tool": name}
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_call_cancelled_while_queued_never_runs(home: Path, monkeypatch: pytest.MonkeyPatch, mode: str):
+    started, release = threading.Event(), threading.Event()
+    ran: list[str] = []
+
+    def slow(ctx, params) -> dict:
+        ran.append("slow_probe")
+        started.set()
+        release.wait(timeout=30)
+        return _ok("slow_probe")
+
+    def queued(ctx, params) -> dict:
+        ran.append("queued_probe")
+        return _ok("queued_probe")
+
+    _serve_extra_tools(monkeypatch, _test_spec("slow_probe", slow), _test_spec("queued_probe", queued))
+
+    async def body(client: Client):
+        results: dict[str, CallToolResult] = {}
+
+        async def call_slow() -> None:
+            results["slow"] = await client.call_tool("slow_probe", {})
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(call_slow)
+            with anyio.fail_after(10):
+                while not started.is_set():
+                    await anyio.sleep(0.01)
+            # The client gives up on a call queued behind the slow one.
+            with anyio.move_on_after(0.3) as gave_up:
+                await client.call_tool("queued_probe", {})
+            assert gave_up.cancelled_caught
+            await anyio.sleep(0.2)
+            release.set()
+        # Later calls still run, one at a time, after the slow one.
+        results["after"] = await client.call_tool("tour_step", {})
+        return results
+
+    results = _with_client(home, body, mode=mode)
+
+    assert _payload(results["slow"])["ok"] is True
+    assert _payload(results["after"])["ok"] is True
+    assert ran == ["slow_probe"]
+    assert [row["detail"]["tool"] for row in reversed(read_agent_activity(home))] == ["slow_probe", "tour_step"]
+
+
+def test_a_result_that_is_not_json_is_a_protocol_error_not_a_coerced_string(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from mcp import MCPError
+
+    _serve_extra_tools(monkeypatch, _test_spec("decimal_probe", lambda ctx, params: {**_ok("x"), "n": Decimal(1)}))
+
+    async def body(client: Client):
+        with pytest.raises(MCPError):
+            await client.call_tool("decimal_probe", {})
+
+    _with_client(home, body)
+
+
+def test_backtest_over_mcp_returns_the_simulated_receipt_and_run_identity(home: Path):
+    from tests.test_research_run_identity import _pack, _write_csv, _write_pack
+
+    pack_path = _write_pack(home / "packs", "run-identity.json", _pack())
+    csv_path = _write_csv(home / "cache", "kraken__SUIUSD__1h.csv")
+    params = {"pack_path": str(pack_path), "dataset_csv": str(csv_path), "venue": "kraken"}
+
+    async def body(client: Client):
+        return await client.call_tool("backtest", params)
+
+    result = _with_client(home, body)
+
+    assert result.is_error is False
+    payload = _payload(result)
+    assert payload["ok"] is True, payload
+    assert payload["labels"] == ["simulated"]
+    assert payload["run"]["run_id"]
+    assert [row["detail"]["tool"] for row in read_agent_activity(home, actor="mcp:cursor")] == ["backtest"]
 
 
 def _paper_pack(home: Path) -> Path:

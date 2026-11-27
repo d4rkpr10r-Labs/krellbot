@@ -15,10 +15,12 @@ Python SDK's low-level :class:`~mcp.server.lowlevel.Server`.
   ``agent_action`` audit record are the core's. The result is the core's dict,
   unchanged, as one JSON text block. A refusal (``ok: false``) is a normal
   result the client can show, not a protocol error; ``isError`` is set only
-  when the core reports an internal failure (``effect: error``).
-- Prompts: ``krell`` (Krell's MCP system prompt, then the opening line and the
-  standard/advanced question) and ``krell_tour`` (the curated tour as text).
-  Prompts are content, so they are not audited.
+  when the core reports an internal failure (``effect: error``). Calls run one
+  at a time: they queue on an async lock, so a call cancelled while queued
+  never starts.
+- Prompts: ``krell`` (Krell's MCP system prompt, her opening and the
+  standard/advanced question, then both mode texts) and ``krell_tour`` (the
+  curated tour as text). Prompts are content, so they are not audited.
 
 stdout carries protocol frames only. Nothing here prints on import. Tool calls
 run with ``sys.stdout`` pointed at stderr, because facades print (``run``'s
@@ -33,7 +35,6 @@ import copy
 import json
 import logging
 import sys
-import threading
 from collections.abc import Callable
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -73,15 +74,20 @@ _PROMPT_DESCRIPTIONS: dict[str, str] = {
 
 
 def krell_prompt_text() -> str:
-    """Krell's MCP system prompt, then her opening line and the mode question, word for word."""
-    opening = (
-        "Open with this line, word for word:\n"
-        f'"{persona.OPENING_LINE}"\n'
-        "Then ask this, word for word:\n"
-        f'"{persona.MODE_QUESTION}"\n'
-        "The mode only changes how you talk, and they can switch by asking."
-    )
-    return persona.system_prompt(mode=None, profile={}, surface="mcp") + "\n\n" + opening
+    """Krell's MCP system prompt, her opening and mode question, then both mode texts.
+
+    All the text is persona's own (:func:`krellbot.agent.persona.opening_text`,
+    :func:`krellbot.agent.persona.mode_texts`) except the one connecting line.
+    """
+    modes = persona.mode_texts()
+    parts = [
+        persona.system_prompt(mode=None, profile={}, surface="mcp"),
+        persona.opening_text(),
+        "Follow the one they choose:",
+        modes["standard"],
+        modes["advanced"],
+    ]
+    return "\n\n".join(parts)
 
 
 def tour_prompt_text() -> str:
@@ -111,7 +117,9 @@ def _actor(ctx: Any) -> Actor:
 
 
 def _tool_result(result: dict) -> types.CallToolResult:
-    text = json.dumps(result, ensure_ascii=False, default=str)
+    # No ``default=``: a result that is not plain JSON is a bug, and it fails
+    # the request loudly instead of reaching the client as a coerced string.
+    text = json.dumps(result, ensure_ascii=False)
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=text)],
         is_error=result.get("effect") == "error",
@@ -126,13 +134,16 @@ def build_server(
 ) -> Server:
     """Return the SDK server for ``home``: one agent core, its tools and Krell's prompts."""
     core = build_agent_core(Path(home), clock=clock, fetch=fetch)
-    # One core call at a time, in a worker thread so the protocol loop stays
-    # responsive. The facades print (``run.arm_pack`` says "armed ..."), so a
-    # call's prints go to stderr; the protocol writer never uses sys.stdout.
-    call_lock = threading.Lock()
+    # One core call at a time. Calls queue on an async lock, so a call the
+    # client cancels while it waits never starts and holds no worker thread.
+    # A call that has started runs to the end in its worker thread (and is
+    # audited) even if the client then cancels it.
+    call_lock = anyio.Lock()
 
     def run_call(actor: Actor, name: str, arguments: dict) -> dict:
-        with call_lock, redirect_stdout(sys.stderr):
+        # The facades print (``run.arm_pack`` says "armed ..."), so a call's
+        # prints go to stderr; the protocol writer never uses sys.stdout.
+        with redirect_stdout(sys.stderr):
             return core.call(actor, name, arguments)
 
     async def list_tools(ctx: Any, params: types.PaginatedRequestParams | None) -> types.ListToolsResult:
@@ -147,8 +158,10 @@ def build_server(
         return types.ListToolsResult(tools=tools)
 
     async def call_tool(ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
+        actor = _actor(ctx)
         arguments = dict(params.arguments or {})
-        result = await to_thread.run_sync(run_call, _actor(ctx), params.name, arguments)
+        async with call_lock:
+            result = await to_thread.run_sync(run_call, actor, params.name, arguments)
         return _tool_result(result)
 
     async def list_prompts(ctx: Any, params: types.PaginatedRequestParams | None) -> types.ListPromptsResult:

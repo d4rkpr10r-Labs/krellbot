@@ -11,8 +11,9 @@ Every call runs through the same agent tool core as Krell in the
 workstation, so the hard refusals, the operator's agent limits and the
 audit trail are identical. Each call appends one `agent_action` record to
 the journal under the actor `mcp:<client>`, taken from the name the client
-sends when it connects (`mcp:cursor`, `mcp:claudecode`; `mcp:local` when it
-sends none).
+sends when it connects and reduced to lowercase letters, digits, `.`, `_`
+and `-`. For example, a client that names itself `Cursor` is recorded as
+`mcp:cursor`, and one that sends no usable name as `mcp:local`.
 
 ## What MCP can and cannot control
 
@@ -81,7 +82,7 @@ for MCP agents; the operator's agent limits bind them instead.
 
 | Prompt | What it gives the client's model |
 | --- | --- |
-| `krell` | Krell's persona and honesty rules for an MCP client, then her opening line and the standard/advanced question |
+| `krell` | Krell's persona and honesty rules for an MCP client, her opening line and the standard/advanced question, then how she talks in each mode |
 | `krell_tour` | Krell's curated tour (how algo trading works, agentic AI in crypto markets, how Krellbot keeps agents in bounds) as text |
 
 Clients that support MCP prompts offer them as slash commands, for example
