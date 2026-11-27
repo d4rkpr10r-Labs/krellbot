@@ -111,7 +111,9 @@ class AnthropicMessagesAdapter:
         output_tokens = 0
         stop_reason: str | None = None
         blocks: dict[int, dict[str, Any]] = {}
+        saw_usage = False
         finished = False
+        completed: list[ToolCall] = []
         for payload in iter_sse_data(self._transport.post_stream(self._url, body, headers, _TIMEOUT)):
             event = parse_json_object(payload, "stream event")
             kind = event.get("type")
@@ -122,6 +124,7 @@ class AnthropicMessagesAdapter:
                 return
             if kind == "message_start":
                 usage = (event.get("message") or {}).get("usage") or {}
+                saw_usage = saw_usage or bool(usage)
                 input_tokens = _count(usage.get("input_tokens"))
                 output_tokens = _count(usage.get("output_tokens"))
             elif kind == "content_block_start":
@@ -129,10 +132,14 @@ class AnthropicMessagesAdapter:
                 if not isinstance(block, dict) or not isinstance(event.get("index"), int):
                     raise BadStream("malformed content block")
                 if block.get("type") == "tool_use":
+                    initial = block.get("input")
+                    if initial is not None and not isinstance(initial, dict):
+                        raise BadStream("tool_use input is not an object")
                     blocks[event["index"]] = {
                         "id": block.get("id") if isinstance(block.get("id"), str) else "",
                         "name": block.get("name") if isinstance(block.get("name"), str) else "",
                         "json": "",
+                        "initial": initial or {},
                     }
                 elif block.get("type") == "text" and isinstance(block.get("text"), str) and block["text"]:
                     yield TextDelta(block["text"])
@@ -153,7 +160,11 @@ class AnthropicMessagesAdapter:
                 if slot is not None:
                     if not slot["id"] or not slot["name"]:
                         raise BadStream("tool_use missing id or name")
-                    yield ToolCallDone(ToolCall(slot["id"], slot["name"], parse_tool_arguments(slot["json"])))
+                    if slot["json"].strip():
+                        arguments = parse_tool_arguments(slot["json"])
+                    else:
+                        arguments = slot["initial"]
+                    completed.append(ToolCall(slot["id"], slot["name"], arguments))
             elif kind == "message_delta":
                 delta = event.get("delta") or {}
                 if isinstance(delta, dict) and delta.get("stop_reason"):
@@ -161,6 +172,7 @@ class AnthropicMessagesAdapter:
                 usage = event.get("usage") or {}
                 if isinstance(usage, dict) and "output_tokens" in usage:
                     output_tokens = _count(usage.get("output_tokens"))
+                    saw_usage = True
             elif kind == "message_stop":
                 finished = True
                 break
@@ -170,7 +182,11 @@ class AnthropicMessagesAdapter:
             raise BadStream("stream ended inside a tool call")
         if not finished:
             raise BadStream("stream ended before message_stop")
-        yield Usage(input_tokens, output_tokens)
+        # Tool calls are released only once the whole message is known to be well formed.
+        for call in completed:
+            yield ToolCallDone(call)
+        if saw_usage:
+            yield Usage(input_tokens, output_tokens)
         yield Done(stop_reason or "end_turn")
 
 

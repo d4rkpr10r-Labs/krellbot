@@ -424,7 +424,7 @@ def test_urllib_transport_streams_lines_and_maps_http_errors(monkeypatch):
             raise urllib.error.HTTPError(req.full_url, 401, "no", {}, io.BytesIO(b'{"error":"denied"}'))
         return Resp(b"data: a\n\ndata: b\n\n")
 
-    monkeypatch.setattr(http_mod, "urlopen", fake_urlopen)
+    monkeypatch.setattr(http_mod, "_open", fake_urlopen)
     t = UrllibTransport()
     lines = list(t.post_stream("https://x.example/ok", {"a": 1}, {"authorization": "Bearer z"}, 5.0))
     assert lines == [b"data: a\n", b"\n", b"data: b\n", b"\n"]
@@ -435,3 +435,216 @@ def test_urllib_transport_streams_lines_and_maps_http_errors(monkeypatch):
     with pytest.raises(TransportError) as err:
         list(t.post_stream("https://x.example/bad", {}, {}, 5.0))
     assert err.value.status == 401 and "denied" in err.value.body
+
+
+def test_redirect_is_never_followed_and_credential_never_reaches_a_second_request():
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    hits: dict[str, list[dict]] = {"first": [], "second": []}
+
+    class Second(BaseHTTPRequestHandler):
+        def do_POST(self):
+            hits["second"].append(dict(self.headers))
+            self.send_response(200)
+            self.end_headers()
+
+        do_GET = do_POST
+
+        def log_message(self, *a):
+            pass
+
+    second = HTTPServer(("127.0.0.1", 0), Second)
+    target = f"http://127.0.0.1:{second.server_port}/stolen"
+
+    class First(BaseHTTPRequestHandler):
+        def do_POST(self):
+            hits["first"].append(dict(self.headers))
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.end_headers()
+
+        do_GET = do_POST
+
+        def log_message(self, *a):
+            pass
+
+    first = HTTPServer(("127.0.0.1", 0), First)
+    threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (first, second)]
+    for t in threads:
+        t.start()
+    try:
+        base = f"http://127.0.0.1:{first.server_port}"
+        for make in (
+            lambda tr: OpenAICompatAdapter(base, SECRET, tr),
+            lambda tr: AnthropicMessagesAdapter(base, SECRET, tr),
+        ):
+            out = run(make(UrllibTransport()))
+            assert len(out) == 1 and isinstance(out[0], ProviderError)
+            assert out[0].code == "provider_bad_response"
+        with pytest.raises(TransportError) as err:
+            UrllibTransport().get_json(base + "/models", {"authorization": f"Bearer {SECRET}"}, 5.0)
+        assert err.value.status == 302
+    finally:
+        first.shutdown()
+        second.shutdown()
+    assert len(hits["first"]) == 3
+    assert hits["second"] == []
+
+
+def test_incomplete_read_mid_stream_is_unavailable(monkeypatch):
+    import http.client
+
+    import krellbot.ai.http as http_mod
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def __iter__(self):
+            yield f"data: {json.dumps(oa_chunk({'content': 'hi'}))}\n".encode()
+            raise http.client.IncompleteRead(b"", 10)
+
+    monkeypatch.setattr(http_mod, "_open", lambda req, timeout: Resp())
+    out = run(openai(UrllibTransport()))
+    assert out[0] == TextDelta("hi")
+    assert isinstance(out[-1], ProviderError) and out[-1].code == "provider_unavailable"
+
+
+def test_anthropic_tool_calls_are_released_only_after_message_stop():
+    # Second block has invalid JSON: nothing is emitted, not even the valid first call.
+    ev = an_events(['{"symbol": "BTC"}'])
+    second = [
+        {
+            "type": "content_block_start",
+            "index": 2,
+            "content_block": {"type": "tool_use", "id": "t2", "name": "get_price", "input": {}},
+        },
+        {"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "{bad"}},
+        {"type": "content_block_stop", "index": 2},
+    ]
+    ev = ev[:8] + second + ev[8:]
+    out = run(anthropic(FakeAiTransport(responses=[sse(*ev, named=True)])))
+    assert not any(isinstance(e, ToolCallDone) for e in out)
+    assert out[-1].code == "provider_bad_response"
+
+    # Valid block, then an overloaded_error event.
+    ev = an_events(['{"symbol": "BTC"}'])[:8] + [
+        {"type": "error", "error": {"type": "overloaded_error", "message": "x"}}
+    ]
+    out = run(anthropic(FakeAiTransport(responses=[sse(*ev, named=True)])))
+    assert not any(isinstance(e, ToolCallDone) for e in out)
+    assert out[-1].code == "provider_unavailable"
+
+    # Cut after content_block_stop and before message_stop.
+    ev = an_events(['{"symbol": "BTC"}'])[:8]
+    out = run(anthropic(FakeAiTransport(responses=[sse(*ev, named=True)])))
+    assert not any(isinstance(e, ToolCallDone) for e in out)
+    assert out[-1].code == "provider_bad_response"
+
+
+@pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
+def test_openai_token_limit_field_is_configurable(field):
+    transport = FakeAiTransport(responses=[sse(oa_chunk(finish="stop"), "[DONE]")])
+    run(openai(transport, token_limit_field=field))
+    body = transport.requests[0]["body"]
+    other = "max_tokens" if field == "max_completion_tokens" else "max_completion_tokens"
+    assert body[field] == 256 and other not in body
+
+
+def test_openai_default_token_limit_field_is_max_tokens():
+    transport = FakeAiTransport(responses=[sse(oa_chunk(finish="stop"), "[DONE]")])
+    run(openai(transport))
+    assert transport.requests[0]["body"]["max_tokens"] == 256
+
+
+def test_openai_tool_call_extra_content_round_trips_verbatim():
+    sig = {"google": {"thought_signature": "abc=="}}
+    events = [
+        oa_chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "g1",
+                        "extra_content": sig,
+                        "function": {"name": "get_price", "arguments": '{"symbol": "BTC"}'},
+                    }
+                ]
+            }
+        ),
+        oa_chunk(finish="tool_calls"),
+    ]
+    out = run(openai(FakeAiTransport(responses=[sse(*events, "[DONE]")])))
+    call = next(e.call for e in out if isinstance(e, ToolCallDone))
+    assert call.provider_data == sig
+    history = [
+        ChatMessage("user", "p"),
+        ChatMessage("assistant", "", tool_calls=(call,)),
+        ChatMessage("tool", "1", tool_call_id="g1"),
+    ]
+    transport = FakeAiTransport(responses=[sse(oa_chunk(finish="stop"), "[DONE]")])
+    run(openai(transport), messages=history)
+    wire = transport.requests[0]["body"]["messages"][2]["tool_calls"][0]
+    assert wire["extra_content"] == sig
+    # Calls without provider data send no extra_content.
+    plain = ChatMessage("assistant", "", tool_calls=(ToolCall("p", "get_price", {}),))
+    transport = FakeAiTransport(responses=[sse(oa_chunk(finish="stop"), "[DONE]")])
+    run(openai(transport), messages=[plain])
+    assert "extra_content" not in transport.requests[0]["body"]["messages"][1]["tool_calls"][0]
+
+
+def test_usage_is_emitted_exactly_once_just_before_done():
+    events = [
+        oa_chunk({"content": "a"}, usage={"prompt_tokens": 1, "completion_tokens": 1}),
+        oa_chunk(finish="stop", usage={"prompt_tokens": 5, "completion_tokens": 7}),
+        oa_chunk(choices=False, usage={"prompt_tokens": 5, "completion_tokens": 8}),
+    ]
+    out = run(openai(FakeAiTransport(responses=[sse(*events, "[DONE]")])))
+    assert [e for e in out if isinstance(e, Usage)] == [Usage(5, 8)]
+    assert out[-2:] == [Usage(5, 8), Done("stop")]
+
+    an = an_events([])
+    an.insert(-1, {"type": "message_delta", "delta": {}, "usage": {"output_tokens": 50}})
+    out = run(anthropic(FakeAiTransport(responses=[sse(*an, named=True)])))
+    assert [e for e in out if isinstance(e, Usage)] == [Usage(11, 50)]
+    assert out[-2:] == [Usage(11, 50), Done("tool_use")]
+
+
+def test_no_usage_event_when_provider_sends_none():
+    out = run(openai(FakeAiTransport(responses=[sse(oa_chunk(finish="stop"), "[DONE]")])))
+    assert out == [Done("stop")]
+    ev = [
+        {"type": "message_start", "message": {"id": "m"}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+        {"type": "message_stop"},
+    ]
+    out = run(anthropic(FakeAiTransport(responses=[sse(*ev, named=True)])))
+    assert out == [Done("end_turn")]
+
+
+def test_openai_object_arguments_are_accepted_but_other_types_are_bad_response():
+    def stream(args):
+        fn = {"name": "get_price", "arguments": args}
+        events = [oa_chunk({"tool_calls": [{"index": 0, "id": "a", "function": fn}]}), oa_chunk(finish="tool_calls")]
+        return run(openai(FakeAiTransport(responses=[sse(*events, "[DONE]")])))
+
+    assert ToolCallDone(ToolCall("a", "get_price", {"symbol": "BTC"})) in stream({"symbol": "BTC"})
+    for odd in (5, ["x"], True):
+        out = stream(odd)
+        assert not any(isinstance(e, ToolCallDone) for e in out), odd
+        assert out[-1].code == "provider_bad_response"
+
+
+def test_anthropic_uses_nonempty_start_input_when_no_json_deltas_arrive():
+    ev = an_events([])
+    ev[5]["content_block"]["input"] = {"symbol": "SOL"}
+    out = run(anthropic(FakeAiTransport(responses=[sse(*ev, named=True)])))
+    assert ToolCallDone(ToolCall("toolu_1", "get_price", {"symbol": "SOL"})) in out
+    ev = an_events([])
+    ev[5]["content_block"]["input"] = "oops"
+    out = run(anthropic(FakeAiTransport(responses=[sse(*ev, named=True)])))
+    assert not any(isinstance(e, ToolCallDone) for e in out) and out[-1].code == "provider_bad_response"

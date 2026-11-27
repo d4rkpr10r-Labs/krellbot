@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -9,7 +10,7 @@ from collections.abc import Iterator
 from typing import Protocol
 
 from krellbot.ai.types import ErrorCode, ProviderError
-from krellbot.tls import urlopen
+from krellbot.tls import ssl_context
 
 _MAX_ERROR_BODY = 2000
 
@@ -54,36 +55,48 @@ def _http_error(exc: urllib.error.HTTPError) -> TransportError:
     return TransportError(exc.code, text)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: it would re-send the credential header to the new location."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _open(req: urllib.request.Request, timeout: float):
+    opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=ssl_context()))
+    return opener.open(req, timeout=timeout)
+
+
 class UrllibTransport:
     def post_stream(self, url: str, body: dict, headers: dict[str, str], timeout: float) -> Iterator[bytes]:
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode("utf-8"),
-            headers={"content-type": "application/json", "user-agent": "krellbot/0.1", **headers},
-            method="POST",
-        )
         try:
-            res = urlopen(req, timeout=timeout)
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode("utf-8"),
+                headers={"content-type": "application/json", "user-agent": "krellbot/0.1", **headers},
+                method="POST",
+            )
+            res = _open(req, timeout)
         except urllib.error.HTTPError as exc:
             raise _http_error(exc) from None
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, http.client.HTTPException) as exc:
             raise TransportError(None, type(exc).__name__) from None
         try:
             with res:
                 yield from res
         except urllib.error.HTTPError as exc:
             raise _http_error(exc) from None
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, http.client.HTTPException) as exc:
             raise TransportError(None, type(exc).__name__) from None
 
     def get_json(self, url: str, headers: dict[str, str], timeout: float) -> dict:
-        req = urllib.request.Request(url, headers={"user-agent": "krellbot/0.1", **headers}, method="GET")
         try:
-            with urlopen(req, timeout=timeout) as res:
+            req = urllib.request.Request(url, headers={"user-agent": "krellbot/0.1", **headers}, method="GET")
+            with _open(req, timeout) as res:
                 parsed = json.loads(res.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             raise _http_error(exc) from None
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, http.client.HTTPException) as exc:
             raise TransportError(None, type(exc).__name__) from None
         if not isinstance(parsed, dict):
             raise TransportError(None, "not an object")

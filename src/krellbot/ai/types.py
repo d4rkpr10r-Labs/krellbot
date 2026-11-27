@@ -26,6 +26,8 @@ class ToolCall:
     id: str
     name: str
     arguments: dict[str, Any]
+    # Opaque provider metadata (e.g. Gemini thought signatures), echoed back verbatim, never interpreted.
+    provider_data: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
