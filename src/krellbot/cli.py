@@ -798,7 +798,7 @@ def cmd_backtest(args):
 
 def usage():
     print(
-        "Usage: krellbot list | show <plan> | search <text> | setup <license-key> | setup-kraken <key-file> | keys add <venue> --file <path> | run <plan> | lint <pack.json> | backtest <pack.json> [--venue kraken|coinbase] [--data csv] [--json] | data import kraken-ohlcvt <zip> --pair PAIR --timeframe TF | arm <pack.json> --venue kraken|coinbase --mode paper|live [--paper-balance USD] | disarm --venue NAME --pair PAIR | stop --venue NAME --pair PAIR --price N | tick [--venue NAME] [--offline-candles csv] | status [--venue NAME] | journal --tail N | service install|uninstall|status [--dry-run] [--root PATH] | backup create --out PATH | backup restore --from PATH | doctor [--json] | workstation|ui [--port N] [--dist PATH] [--open] | community list | community install <id> | telemetry enable | telemetry disable | telemetry show",
+        "Usage: krellbot list | show <plan> | search <text> | setup <license-key> | setup-kraken <key-file> | keys add <venue> --file <path> | run <plan> | lint <pack.json> | backtest <pack.json> [--venue kraken|coinbase] [--data csv] [--json] | data import kraken-ohlcvt <zip> --pair PAIR --timeframe TF | arm <pack.json> --venue kraken|coinbase --mode paper|live [--paper-balance USD] | disarm --venue NAME --pair PAIR | stop --venue NAME --pair PAIR --price N | tick [--venue NAME] [--offline-candles csv] | status [--venue NAME] | journal --tail N | service install|uninstall|status [--dry-run] [--root PATH] | backup create --out PATH | backup restore --from PATH | doctor [--json] | workstation|ui [--port N] [--dist PATH] [--open] | community list | community install <id> | telemetry enable | telemetry disable | telemetry show | mcp",
         file=sys.stderr,
     )
     return 2
@@ -2376,6 +2376,30 @@ def cmd_telemetry(args):
     return 2
 
 
+# ---- mcp -------------------------------------------------------------------
+
+
+def cmd_mcp(args):
+    """`krellbot mcp`: serve the agent tools to a local MCP client over stdio.
+
+    Plumbing an MCP client launches (docs/mcp.md), not a user feature. It
+    binds the current home and reads no keys. While it serves, stdout carries
+    protocol frames only, so help and errors go to stderr.
+    """
+    if args and args[0] in {"-h", "--help", "help"}:
+        print(
+            "usage: krellbot mcp  (an MCP client launches this and talks to it over stdio; see docs/mcp.md)",
+            file=sys.stderr,
+        )
+        return 0
+    if args:
+        print(f"Unknown argument: {args[0]}", file=sys.stderr)
+        return 2
+    from krellbot.mcp import stdio as kb_mcp_stdio
+
+    return kb_mcp_stdio.run_stdio(kb_paths.home())
+
+
 def _resolve_backup_home() -> Path:
     """Resolve ``KRELLBOT_HOME`` (or ``~/.krellbot``) without creating the directory.
 
@@ -2481,6 +2505,10 @@ def main(argv):
         # The scheduler's heartbeat check reads no keys, so it runs before
         # the legacy key migration below.
         return cmd_service(argv[2:])
+    if argv[1] == "mcp":
+        # The MCP server reads no keys, so it starts before the legacy key
+        # migration below, which touches the keyring.
+        return cmd_mcp(argv[2:])
     try:
         kb_secrets.migrate_legacy()
     except (ValueError, RuntimeError, FileNotFoundError) as exc:

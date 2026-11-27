@@ -43,6 +43,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -133,6 +134,30 @@ class StrategyIdMismatch(ValueError):
         self.pack_strategy_id = pack_strategy_id
 
 
+_ORIGIN_RE = re.compile(r"^mcp:[a-z0-9._-]{1,40}$")
+
+
+def _check_origin(origin: object) -> None:
+    """Origin is draft metadata only; reject anything that is not a known label."""
+
+    if origin in ("workstation", "krell"):
+        return
+    if isinstance(origin, str) and _ORIGIN_RE.fullmatch(origin):
+        return
+    raise ValueError("origin must be 'workstation', 'krell' or 'mcp:<client>'")
+
+
+def _meta_origin(meta: dict) -> str:
+    """Read origin from untrusted meta; anything unrecognised reads as workstation."""
+
+    origin = meta.get("origin")
+    try:
+        _check_origin(origin)
+    except ValueError:
+        return "workstation"
+    return str(origin)
+
+
 class StrategyDraftService:
     """Application-layer boundary for strategy drafts."""
 
@@ -214,7 +239,7 @@ class StrategyDraftService:
 
     # ---- create --------------------------------------------------------
 
-    def create(self, pack: dict) -> dict:
+    def create(self, pack: dict, *, origin: str = "workstation") -> dict:
         """Store an initial draft for the pack's strategy id.
 
         Returns a summary dict with ``schema_version``, ``strategy_id``,
@@ -225,6 +250,7 @@ class StrategyDraftService:
         canonical bytes.
         """
 
+        _check_origin(origin)
         strategy_id = str(pack.get("id") or "")
         if not strategy_id:
             raise ValueError("pack must have a non-empty id")
@@ -251,6 +277,7 @@ class StrategyDraftService:
             "runnable": False,
             "created_at": _now_iso(self._clock),
             "errors": [],
+            "origin": origin,
         }
         self._write_meta(strategy_id, rev_id, meta)
         summary = self._summary(strategy_id, rev_id)
@@ -259,7 +286,7 @@ class StrategyDraftService:
 
     # ---- edit ----------------------------------------------------------
 
-    def edit(self, parent_revision_id: str, pack: dict) -> dict:
+    def edit(self, parent_revision_id: str, pack: dict, *, origin: str = "workstation") -> dict:
         """Create a new draft revision descending from ``parent_revision_id``.
 
         Returns the stored summary plus an ``outcome`` literal:
@@ -275,6 +302,7 @@ class StrategyDraftService:
             ``parent_revision_id`` is the requested parent.
         """
 
+        _check_origin(origin)
         if not self.exists(parent_revision_id):
             raise RevisionNotFound(parent_revision_id)
         strategy_id = self._strategy_for_revision(parent_revision_id)
@@ -320,6 +348,7 @@ class StrategyDraftService:
             "runnable": False,
             "created_at": _now_iso(self._clock),
             "errors": [],
+            "origin": origin,
         }
         self._write_meta(strategy_id, rev_id, meta)
         summary = self._summary(strategy_id, rev_id)
@@ -474,6 +503,7 @@ class StrategyDraftService:
                         "state": str(meta.get("state", STATE_DRAFT)),
                         "runnable": _as_runnable(meta.get("runnable")),
                         "created_at": str(meta.get("created_at", "")),
+                        "origin": _meta_origin(meta),
                         "id": pack.get("id") if isinstance(pack.get("id"), str) else "",
                         "label": (pack.get("label") if isinstance(pack.get("label"), str) else ""),
                         "pair": pair,
@@ -544,6 +574,7 @@ class StrategyDraftService:
             "runnable": _as_runnable(meta.get("runnable")),
             "created_at": str(meta.get("created_at", "")),
             "errors": list(meta.get("errors") or []),
+            "origin": _meta_origin(meta),
             "pack": pack,
         }
         if "editor" in meta:

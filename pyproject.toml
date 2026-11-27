@@ -12,6 +12,7 @@ dependencies = [
     "fastapi==0.141.1",
     "jsonschema==4.26.0",
     "keyring==25.7.0",
+    "mcp==2.3.0",
     "uvicorn==0.54.0",
 ]
 
