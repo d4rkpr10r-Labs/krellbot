@@ -598,9 +598,9 @@ def _draft(ctx: ToolContext, params: dict) -> dict:
     service = StrategyDraftService(ctx.home, clock=ctx.clock)
     try:
         if parent_revision_id:
-            summary = service.edit(str(parent_revision_id), pack)
+            summary = service.edit(str(parent_revision_id), pack, origin=ctx.actor.label)
         else:
-            summary = service.create(pack)
+            summary = service.create(pack, origin=ctx.actor.label)
     except RevisionNotFound as exc:
         return invalid_request("draft", f"revision not found: {exc}").to_dict()
     except StrategyIdMismatch as exc:
