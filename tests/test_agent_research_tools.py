@@ -20,6 +20,7 @@ import csv
 import hashlib
 import json
 import os
+import random
 from pathlib import Path
 
 import pytest
@@ -319,6 +320,49 @@ def test_bar_count_ignores_the_header_blank_lines_and_a_missing_trailing_newline
     for name, raw in (("with.csv", with_newline), ("without.csv", without_newline)):
         (home / "cache" / name).write_bytes(raw)
         assert agent_estimate.estimate("backtest", {"dataset_csv": f"cache/{name}"}, home=home).bars == 5
+
+
+def test_a_long_cr_only_dataset_is_counted_and_heavy(home: Path) -> None:
+    # The engine reads CR-only line breaks (classic Mac exports), so the
+    # estimate must count them, or a heavy run would skip the confirm gate.
+    header = "ts_ms,open,high,low,close,volume"
+    rows = [f"{index * HOUR_MS},90,90,90,90,100" for index in range(20001)]
+    (home / "cache").mkdir(parents=True, exist_ok=True)
+    long_cr = home / "cache" / "long-cr.csv"
+    long_cr.write_bytes(("\r".join([header, *rows]) + "\r").encode())
+    heavy = agent_estimate.estimate("backtest", {"dataset_csv": str(long_cr)}, home=home)
+    assert (heavy.cost, heavy.bars) == ("heavy", 20001)
+
+    short_cr = home / "cache" / "short-cr.csv"
+    short_cr.write_bytes("\r".join([header, *rows[:6]]).encode())
+    assert agent_estimate.estimate("backtest", {"dataset_csv": str(short_cr)}, home=home).bars == 6
+    pack_path = _write_pack(home / "packs", "cr.json", _pack())
+    ran = _core(home).call(CURSOR, "backtest", {"pack_path": str(pack_path), "dataset_csv": str(short_cr)})
+    assert ran["ok"] is True, ran
+    assert ran["detail"]["bar_count"] == 6
+
+
+def test_bar_count_never_undercounts_what_the_engine_loader_reads() -> None:
+    from krellbot.data.cache import _parse_csv
+
+    breaks = ["\n", "\r\n", "\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", " ", " "]
+    pieces = ["ts_ms,open,high,low,close,volume", "", "  ", "\t", " ts_ms,o,h,l,c,v", "x,y", " "]
+    rng = random.Random(38)
+    for _ in range(3000):
+        lines = [
+            rng.choice(pieces) if rng.random() < 0.4 else f"{rng.randint(0, 10**12)},1,2,0.5,1.5,10"
+            for _ in range(rng.randint(0, 12))
+        ]
+        text = "".join(line + rng.choice(breaks) for line in lines)
+        if lines and rng.random() < 0.5:
+            text = text[: -1 if not text.endswith("\r\n") else -2]
+        raw = text.encode("utf-8")
+        assert tools_research.count_csv_bars(raw) >= len(_parse_csv(raw)), raw
+    # One kind of break, header first, no blank lines: exact.
+    for brk in breaks:
+        rows = [f"{index},1,2,0.5,1.5,10" for index in range(7)]
+        raw = brk.join(["ts_ms,open,high,low,close,volume", *rows]).encode("utf-8")
+        assert tools_research.count_csv_bars(raw) == len(_parse_csv(raw)) == 7, brk
 
 
 # ---------------------------------------------------------------------------

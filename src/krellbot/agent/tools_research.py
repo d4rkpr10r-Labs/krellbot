@@ -110,6 +110,21 @@ _WINDOW_PARAMS: tuple[str, ...] = ("from_ms", "to_ms", "holdout_from_ms", "holdo
 _COST_PARAMS: tuple[str, ...] = ("fee_bps", "slippage_bps")
 _WORKDIR_PREFIX = "krellbot-agent-research-"
 
+# Every line break ``str.splitlines`` splits on, as UTF-8 bytes: the breaks the
+# engine's CSV loader sees. ASCII bytes never occur inside a multi-byte UTF-8
+# sequence, and each multi-byte entry has one encoding, so each is counted exactly.
+_LINE_BREAKS: tuple[bytes, ...] = (
+    b"\n",
+    b"\r",
+    b"\x0b",
+    b"\x0c",
+    b"\x1c",
+    b"\x1d",
+    b"\x1e",
+    b"\xc2\x85",
+    b"\xe2\x80\xa8",
+    b"\xe2\x80\xa9",
+)
 # Dataset line shapes for counting bars (whitespace as ``bytes.strip`` sees it, newline aside).
 _BLANK_LINE = re.compile(rb"^[ \t\r\f\v]*$", re.MULTILINE)
 _HEADER_LINE = re.compile(rb"^[ \t\r\f\v]*ts_ms,", re.MULTILINE)
@@ -168,14 +183,23 @@ def read_dataset_input(home: Path, value: object) -> bytes | None:
 def count_csv_bars(raw: bytes) -> int:
     """Count the data rows (bars) of dataset CSV bytes without splitting them into lines.
 
-    Lines end at ``\\n`` (so ``\\r\\n`` too); a last line without one still
-    counts. Blank or whitespace-only lines do not count, and neither does one
-    ``ts_ms,`` header line. Memory stays flat: the newlines are counted in
-    place and the blank lines are matched one at a time.
+    The engine's loader (``data.cache._parse_csv``) splits the decoded text
+    with ``str.splitlines``, so it accepts CR-only files and every other
+    break in :data:`_LINE_BREAKS`. This count uses exactly those breaks
+    (``\\r\\n`` is one), and a last line without a break still counts. It then
+    subtracts the ``\\n``-delimited blank or whitespace-only lines and one
+    ``ts_ms,`` header line. Lines it cannot be sure are blank stay counted,
+    so the result never falls below the rows the engine reads: the M38.7
+    confirm gate relies on that. It can be higher, for example for blank
+    lines in a CR-only file.
+
+    Memory stays flat: the breaks are counted in place and the blank lines
+    are matched one at a time.
     """
     if not raw:
         return 0
-    lines = raw.count(b"\n") + (0 if raw.endswith(b"\n") else 1)
+    breaks = sum(raw.count(separator) for separator in _LINE_BREAKS) - raw.count(b"\r\n")
+    lines = breaks + (0 if raw.endswith(_LINE_BREAKS) else 1)
     blank = sum(1 for _ in _BLANK_LINE.finditer(raw))
     if raw.endswith(b"\n"):
         # In multiline mode ``^...$`` also matches the empty tail after the last newline: not a line.
