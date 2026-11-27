@@ -54,7 +54,8 @@ export function AiModelSection(): JSX.Element {
   }
 
   const list = connections ?? [];
-  const showForm = adding ?? list.length === 0;
+  // An empty list always shows the form, even after Cancel then Remove.
+  const showForm = list.length === 0 || adding === true;
 
   return (
     <section
@@ -163,7 +164,8 @@ export function AiModelSection(): JSX.Element {
 
       {showForm ? (
         <AiConnectForm
-          onConnected={() => {
+          onConnected={() => undefined}
+          onAdded={() => {
             setAdding(true);
             void refresh();
           }}

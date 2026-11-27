@@ -82,12 +82,27 @@ function disclosureFor(provider: AiProvider, baseUrl: string): string {
 }
 
 export type AiConnectFormProps = {
+  /**
+   * Fires only when Krell is ready on this connection: its capability is
+   * `tools` or `chat_only` AND it is the active connection (just
+   * auto-activated, or already active). Never fires for a `failed` or
+   * `unprobed` probe, when another connection stays active, or when the
+   * activate call fails.
+   */
   onConnected(conn: AiConnection): void;
+  /**
+   * Fires after any successful add, including `failed` probes and
+   * connections that were not activated. Use it to refresh lists.
+   */
+  onAdded?(
+    conn: AiConnection,
+    probe: { capability: AiCapability; message: string },
+  ): void;
   onCancel?(): void;
 };
 
 export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
-  const { onConnected, onCancel } = props;
+  const { onConnected, onAdded, onCancel } = props;
   const ids = useId();
   const keyRef = useRef<HTMLInputElement>(null);
   const [providers, setProviders] = useState<AiProvider[] | null>(null);
@@ -143,18 +158,26 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
       }
       setProbe(added.probe);
       let conn = added.connection;
-      if (conn.capability !== "failed") {
+      let ready = false;
+      if (conn.capability === "tools" || conn.capability === "chat_only") {
         const current = await listConnections();
-        if (current.ok && current.active === null) {
+        if (!current.ok) {
+          setError(`${current.message} (${current.code})`);
+        } else if (current.active === null) {
           const activated = await activateConnection(conn.id);
           if (activated.ok) {
             conn = activated.connection;
+            ready = true;
           } else {
             setError(`${activated.message} (${activated.code})`);
           }
+        } else if (current.active === conn.id) {
+          conn = { ...conn, active: true };
+          ready = true;
         }
       }
-      onConnected(conn);
+      onAdded?.(conn, added.probe);
+      if (ready) onConnected(conn);
     } finally {
       if (keyRef.current) keyRef.current.value = "";
       setBusy(false);

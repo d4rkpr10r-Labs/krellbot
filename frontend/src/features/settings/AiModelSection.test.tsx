@@ -399,25 +399,136 @@ describe("AiModelSection", () => {
   });
 });
 
-describe("AiConnectForm", () => {
-  it("activates a new connection only when none is active, then calls onConnected", async () => {
-    const created = conn({ id: "c_cccccccccccc" });
+
+describe("AiConnectForm contract", () => {
+  const OTHER = "c_aaaaaaaaaaaa";
+  const NEW = "c_cccccccccccc";
+
+  function setup(opts: {
+    capability: string;
+    active: string | null;
+    activateFails?: boolean;
+  }) {
+    const created = conn({ id: NEW, capability: opts.capability });
+    let added = false;
     const calls = installFetch((c) => {
       if (c.path === "/api/v1/ai/providers") return ok({ providers: PROVIDERS });
       if (c.path === "/api/v1/ai/connections" && c.method === "GET") {
-        return ok({ active: "c_aaaaaaaaaaaa", connections: [conn({ active: true })] });
+        const rows = added ? [created] : [];
+        if (opts.active === OTHER) rows.unshift(conn({ id: OTHER, active: true }));
+        return ok({ active: opts.active, connections: rows });
       }
+      if (c.path.endsWith("/activate")) {
+        if (opts.activateFails) {
+          return {
+            status: 500,
+            json: {
+              ok: false,
+              effect: "refused",
+              code: "ai_store_failed",
+              detail: "Could not save the active model.",
+            },
+          };
+        }
+        return ok({ connection: { ...created, active: true } });
+      }
+      added = true;
       return ok({
         connection: created,
-        probe: { capability: "tools", models: [], message: "", error: null },
+        probe: {
+          capability: opts.capability,
+          models: [],
+          message: "probe message",
+          error: null,
+        },
       });
     });
     const onConnected = vi.fn();
+    const onAdded = vi.fn();
+    return { calls, onConnected, onAdded };
+  }
+
+  it("calls onAdded but not onConnected for a failed probe", async () => {
+    const { onConnected, onAdded } = setup({ capability: "failed", active: null });
+    render(<AiConnectForm onConnected={onConnected} onAdded={onAdded} />);
+    await screen.findByLabelText(/api key/i);
+    fillAndSubmit();
+    await waitFor(() => expect(onAdded).toHaveBeenCalledTimes(1));
+    expect(onAdded.mock.calls[0][1].capability).toBe("failed");
+    expect(onConnected).not.toHaveBeenCalled();
+  });
+
+  it("does not call onConnected when another connection stays active", async () => {
+    const { calls, onConnected, onAdded } = setup({
+      capability: "tools",
+      active: OTHER,
+    });
+    render(<AiConnectForm onConnected={onConnected} onAdded={onAdded} />);
+    await screen.findByLabelText(/api key/i);
+    fillAndSubmit();
+    await waitFor(() => expect(onAdded).toHaveBeenCalledTimes(1));
+    expect(onConnected).not.toHaveBeenCalled();
+    expect(calls.some((c) => c.path.endsWith("/activate"))).toBe(false);
+  });
+
+  it("offers Activate in the section when another connection is active", async () => {
+    setup({ capability: "tools", active: OTHER });
+    render(<AiModelSection />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /add another model/i }),
+    );
+    await screen.findByLabelText(/api key/i);
+    fillAndSubmit();
+    expect(await screen.findByRole("button", { name: /^activate/i })).toBeTruthy();
+  });
+
+  it("does not call onConnected and shows the error when activation fails", async () => {
+    const { onConnected } = setup({
+      capability: "tools",
+      active: null,
+      activateFails: true,
+    });
     render(<AiConnectForm onConnected={onConnected} />);
     await screen.findByLabelText(/api key/i);
     fillAndSubmit();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Could not save the active model.");
+    expect(alert.textContent).toContain("ai_store_failed");
+    expect(onConnected).not.toHaveBeenCalled();
+  });
+
+  it("calls onConnected once the new connection is auto-activated", async () => {
+    const { onConnected, onAdded } = setup({
+      capability: "chat_only",
+      active: null,
+    });
+    render(<AiConnectForm onConnected={onConnected} onAdded={onAdded} />);
+    await screen.findByLabelText(/api key/i);
+    fillAndSubmit();
     await waitFor(() => expect(onConnected).toHaveBeenCalledTimes(1));
-    expect(onConnected.mock.calls[0][0].id).toBe("c_cccccccccccc");
-    expect(calls.some((c) => c.path.endsWith("/activate"))).toBe(false);
+    expect(onConnected.mock.calls[0][0]).toMatchObject({ id: NEW, active: true });
+    expect(onAdded).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("AiModelSection empty list", () => {
+  it("shows the form again after cancelling and removing every connection", async () => {
+    let connections = [conn({ active: true })];
+    installFetch((c) => {
+      if (c.path === "/api/v1/ai/providers") return ok({ providers: PROVIDERS });
+      if (c.method === "DELETE") {
+        connections = [];
+        return ok({ effect: "changed", removed: "c_aaaaaaaaaaaa" });
+      }
+      return ok({ active: connections[0]?.id ?? null, connections });
+    });
+    render(<AiModelSection />);
+    await screen.findByRole("button", { name: /^remove/i });
+    fireEvent.click(screen.getByRole("button", { name: /add another model/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /cancel/i }));
+    expect(screen.getByRole("button", { name: /add another model/i })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /^remove/i }));
+    expect(await screen.findByLabelText(/api key/i)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /add another model/i })).toBeNull();
   });
 });
