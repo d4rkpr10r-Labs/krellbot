@@ -414,13 +414,29 @@ def _connection_view(conn: Connection) -> dict:
 
 MAX_PROVIDER_DETAIL_CHARS = 300
 
+# Credential-shaped text a provider body could echo: a JWT (three base64url segments), a
+# ``Bearer <token>`` value, and ``sk-`` / ``sess-`` style keys with their tails.
+_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer [redacted]"),
+    (re.compile(r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "[redacted-jwt]"),
+    (re.compile(r"(?i)\b(?:sk|sess)[-_][A-Za-z0-9._-]+"), "[redacted-key]"),
+)
+
+
+def redact_diagnostic(text: str) -> str:
+    """``text`` with JWT-shaped, Bearer and ``sk-``/``sess-`` key values replaced, before it is stored."""
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
+
 
 def _provider_diagnostics(failure: ProviderError) -> dict:
     """What a provider error kept: ``provider`` (status, code, param, request id) for the event and the
     stored notice, and ``stored`` (a short body excerpt) for the stored notice only.
 
     The body is diagnostic text from the provider: never the message, never
-    on the live event. A provider error body never carries Krellbot's tokens.
+    on the live event. It reaches the browser with the stored conversation,
+    so credential-shaped values in it are redacted before it is kept.
     """
     facts = {
         "status": failure.status,
@@ -433,7 +449,8 @@ def _provider_diagnostics(failure: ProviderError) -> dict:
         return {}
     out: dict[str, Any] = {"provider": kept}
     if failure.detail:
-        out["stored"] = {"detail": failure.detail[:MAX_PROVIDER_DETAIL_CHARS]}
+        # Redact the whole body first, so a credential cut by the excerpt's end is still caught.
+        out["stored"] = {"detail": redact_diagnostic(failure.detail)[:MAX_PROVIDER_DETAIL_CHARS]}
     return out
 
 

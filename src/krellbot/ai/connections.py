@@ -219,10 +219,74 @@ def _service(conn_id: str) -> str:
 # header's generation and the lengths to add up: anything else is a torn or
 # stale write and fails closed (``TornSecret``), never a partial value. A
 # short value (an API key) stays one plain ``credential`` entry, as before.
+#
+# A write that dies part way (or a best-effort delete that fails) could leave
+# pieces no header names. So before a write touches any piece it records, in
+# ``credential.pending``, the generation it is writing and the one it
+# replaces (generation ids and counts only, nothing of the value). The next
+# write, replacement or removal of that connection sweeps whichever of those
+# generations the header does not name, then clears the marker; removal
+# deletes the marker too.
 
 _CHUNK_CHARS = 1000
 _MAX_CHUNKS = 128
 _CHUNK_HEADER_RE = re.compile(r"krellbot-chunked-v1:([0-9a-f]{32}):([1-9][0-9]{0,2}):([1-9][0-9]{0,6})")
+
+
+_MARKER_USERNAME = f"{KEYRING_USERNAME}.pending"
+_MARKER_PART_RE = re.compile(r"([0-9a-f]{32}):([1-9][0-9]{0,2})")
+
+
+def _marker_value(new: tuple[str, int] | None, old: tuple[str, int] | None) -> str:
+    def part(gen: tuple[str, int] | None) -> str:
+        return "-" if gen is None else f"{gen[0]}:{gen[1]}"
+
+    return f"krellbot-pending-v1 new={part(new)} old={part(old)}"
+
+
+def _parse_marker(value: object) -> list[tuple[str, int]] | None:
+    """The generations a marker names (new, then old), or None when it is not a marker."""
+
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"krellbot-pending-v1 new=(\S+) old=(\S+)", value)
+    if match is None:
+        return None
+    out = []
+    for part in match.groups():
+        if part == "-":
+            continue
+        found = _MARKER_PART_RE.fullmatch(part)
+        if found is None or int(found.group(2)) > _MAX_CHUNKS:
+            return None
+        out.append((found.group(1), int(found.group(2))))
+    return out
+
+
+def _generation_names(generation: str, count: int) -> list[str]:
+    return [f"{KEYRING_USERNAME}.{generation}.{index}" for index in range(1, count + 1)]
+
+
+def _sweep_marked(backend: object, service: str, header_value: str | None) -> None:
+    """Delete the pieces of every marked generation the header does not name, then the marker. Raises on a
+    backend read failure; deletions are best effort."""
+
+    raw = backend.get_password(service, _MARKER_USERNAME)  # type: ignore[attr-defined]
+    if raw is None:
+        return
+    header = _parse_chunk_header(header_value)
+    live = header[0] if header is not None else None
+    for generation, count in _parse_marker(raw) or []:
+        if generation != live:
+            _delete_names(backend, service, _generation_names(generation, count))
+    _delete_names(backend, service, [_MARKER_USERNAME])
+
+
+def _sweep_quietly(backend: object, service: str) -> None:
+    """Sweep against the header now in place, best effort (after a write committed or was undone)."""
+
+    with contextlib.suppress(Exception):
+        _sweep_marked(backend, service, backend.get_password(service, KEYRING_USERNAME))  # type: ignore[attr-defined]
 
 
 class TornSecret(Exception):
@@ -267,22 +331,31 @@ def _read_secret(backend: object, service: str) -> str | None:
     return whole
 
 
-def _write_secret(backend: object, service: str, secret: str, previous: str | None) -> None:
-    """Write ``secret`` (chunked when long), header last. Raises on any backend failure, cleaning up its pieces."""
+def _write_secret(backend: object, service: str, secret: str, previous: str | None) -> bool:
+    """Write ``secret`` (chunked when long), header last. Raises on any backend failure, cleaning up its pieces.
 
+    Returns True when it left an in-flight marker for the caller to sweep.
+    """
+
+    old = _parse_chunk_header(previous)
+    old_generation = (old[0], old[1]) if old is not None else None
     if len(secret) <= _CHUNK_CHARS and _parse_chunk_header(secret) is None:
+        if old_generation is not None:
+            # The previous value's pieces become garbage once this commits: mark them first.
+            backend.set_password(service, _MARKER_USERNAME, _marker_value(None, old_generation))  # type: ignore[attr-defined]
         backend.set_password(service, KEYRING_USERNAME, secret)  # type: ignore[attr-defined]
-        return
+        return old_generation is not None
     pieces = [secret[i : i + _CHUNK_CHARS] for i in range(0, len(secret), _CHUNK_CHARS)]
     if len(pieces) > _MAX_CHUNKS:
         raise ValueError("value too long")
-    old = _parse_chunk_header(previous)
     # A random id for this write, never derived from the value.
     generation = stdlib_secrets.token_hex(16)
     while old is not None and generation == old[0]:
         generation = stdlib_secrets.token_hex(16)
     header = (generation, len(pieces), len(secret))
     names = _chunk_names(header)
+    # Before any piece is written: which generation is in flight, and which it replaces.
+    backend.set_password(service, _MARKER_USERNAME, _marker_value((generation, len(pieces)), old_generation))  # type: ignore[attr-defined]
     try:
         for name, piece in zip(names, pieces, strict=True):
             backend.set_password(service, name, f"{generation}:{piece}")  # type: ignore[attr-defined]
@@ -292,6 +365,7 @@ def _write_secret(backend: object, service: str, secret: str, previous: str | No
     except BaseException:
         _delete_names(backend, service, names)
         raise
+    return True
 
 
 def _delete_names(backend: object, service: str, names: list[str]) -> None:
@@ -652,21 +726,29 @@ class ConnectionStore:
             # A new connection's id is fresh, so it has no previous value to read.
             try:
                 previous = backend.get_password(service, KEYRING_USERNAME)
+                # A write that died part way last time: sweep the pieces no header names.
+                _sweep_marked(backend, service, previous)
             except Exception:  # noqa: BLE001 — backend errors can carry arbitrary text; never surfaced
                 raise ConnectionRefused("ai_keychain_unavailable") from None
+        marked = False
         try:
-            _write_secret(backend, service, secret, previous)
+            marked = _write_secret(backend, service, secret, previous)
             stored = _read_secret(backend, service)
         except Exception:  # noqa: BLE001
             stored = None
+            marked = True  # a chunked write may have marked before failing; the sweep below is cheap
         if stored != secret:
             if keep_on_failure:
                 _restore_secret(backend, service, previous)
             else:
                 self._forget_secret(conn_id, strict=False)
+            if marked:
+                _sweep_quietly(backend, service)
             raise ConnectionRefused("ai_keychain_unavailable")
         # Only now that the new value reads back whole: drop the previous generation's chunks.
         _delete_chunks(backend, service, previous)
+        if marked:
+            _sweep_quietly(backend, service)
 
     @staticmethod
     def _forget_secret(conn_id: str, *, strict: bool) -> None:
@@ -680,6 +762,14 @@ class ConnectionStore:
             if strict:
                 raise ConnectionRefused("ai_keychain_unavailable") from None
             header = None
+        marker = None
+        if _parse_chunk_header(header) is not None or strict:
+            # A marker exists only beside chunked values; a plain entry's removal needs no extra read.
+            try:
+                marker = backend.get_password(service, _MARKER_USERNAME)
+            except Exception:  # noqa: BLE001
+                if strict:
+                    raise ConnectionRefused("ai_keychain_unavailable") from None
         try:
             backend.delete_password(service, KEYRING_USERNAME)
         except keyring.errors.PasswordDeleteError:
@@ -688,7 +778,9 @@ class ConnectionStore:
             if strict:
                 raise ConnectionRefused("ai_keychain_unavailable") from None
             return
-        chunks = _chunk_names(_parse_chunk_header(header))
+        # The header's pieces, every marked generation's pieces (an interrupted write), and the marker.
+        marked = [name for gen, count in _parse_marker(marker) or [] for name in _generation_names(gen, count)]
+        chunks = _chunk_names(_parse_chunk_header(header)) + marked + ([_MARKER_USERNAME] if marker is not None else [])
         for name in chunks:
             try:
                 backend.delete_password(service, name)

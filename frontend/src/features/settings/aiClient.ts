@@ -405,14 +405,17 @@ export async function startOpenRouterSignin(
  * straight to the keychain and never reaches the browser.
  */
 export async function startChatgptSignin(
-  input: { model: string; account?: string } | { connectionId: string },
+  input: { model: string; account?: string; retry?: boolean } | { connectionId: string },
 ): Promise<AiResult<{ flowId: string; authorizeUrl: string }>> {
-  const body =
-    "connectionId" in input
-      ? { connection_id: input.connectionId }
-      : input.account
-        ? { model: input.model, account: input.account }
-        : { model: input.model };
+  let body: Record<string, unknown>;
+  if ("connectionId" in input) {
+    body = { connection_id: input.connectionId };
+  } else {
+    body = { model: input.model };
+    if (input.account) body.account = input.account;
+    // Try again after OpenAI refused a first registration's code: reuse that registration.
+    if (input.retry) body.retry = true;
+  }
   try {
     const parsed = await send("POST", "/api/v1/ai/signin/chatgpt", body);
     if (parsed.ok === false) return refusal(parsed);

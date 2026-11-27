@@ -5319,8 +5319,10 @@ def create_app(
         """Start Continue with ChatGPT.
 
         Body: ``model`` for a new connection, optionally with ``account`` (a
-        saved account's id: "Continue as", reusing its issued client), or
-        ``connection_id`` to sign that connection in again.
+        saved account's id: "Continue as", reusing its issued client) or
+        ``retry: true`` ("Try again" after OpenAI refused a first
+        registration's code), or ``connection_id`` to sign that connection in
+        again.
         """
 
         from krellbot.ai.connections import ConnectionRefused
@@ -5347,6 +5349,9 @@ def create_app(
             return _ai_invalid_body()
         if connection_id is None and not isinstance(model, str):
             return _ai_invalid_body()
+        retry = payload.get("retry", False)
+        if not isinstance(retry, bool):
+            return _ai_invalid_body()
         try:
             flow = await asyncio.to_thread(
                 start_chatgpt_signin,
@@ -5358,6 +5363,7 @@ def create_app(
                 registry=_ai_signins(s),
                 connection_id=connection_id,
                 account=account,
+                retry=retry,
                 allow_injected_fake_backend=s.keys_allow_fake_backend,
             )
         except (ConnectionRefused, SigninRefused) as exc:

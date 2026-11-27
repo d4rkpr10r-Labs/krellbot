@@ -312,7 +312,7 @@ class Env:
     def store(self) -> ConnectionStore:
         return ConnectionStore(self.home, allow_injected_fake_backend=True)
 
-    def start(self, *, model: str | None = "gpt-plan-a", connection_id: str | None = None):
+    def start(self, *, model: str | None = "gpt-plan-a", connection_id: str | None = None, retry: bool = False):
         flow = oauth.start_chatgpt_signin(
             self.home,
             model=model,
@@ -321,6 +321,7 @@ class Env:
             listener_factory=self.factory,
             registry=self.registry,
             connection_id=connection_id,
+            retry=retry,
             allow_injected_fake_backend=True,
         )
         return flow, self.factory.last
@@ -650,7 +651,9 @@ def test_a_discovery_document_pointing_off_auth_openai_com_is_refused(home, fres
 @pytest.mark.parametrize(
     ("answer", "code"),
     [
-        (TransportError(400, json.dumps({"error": "invalid_grant"})), "ai_chatgpt_rejected"),
+        # A first registration's refused code keeps its issued client and offers Try again.
+        (TransportError(400, json.dumps({"error": "invalid_grant"})), "ai_chatgpt_code_rejected"),
+        (TransportError(400, json.dumps({"error": "invalid_request"})), "ai_chatgpt_rejected"),
         (TransportError(None, "URLError"), "ai_chatgpt_unavailable"),
         (TransportError(503, ACCESS), "ai_chatgpt_unavailable"),
         ((200, b"not json"), "ai_chatgpt_bad_response"),
@@ -1883,11 +1886,12 @@ def test_an_invalid_grant_first_exchange_keeps_the_issued_client_for_the_next_at
     params = env.authorize(flow, listener)
     env.openai.token_replies.append(TransportError(400, json.dumps({"error": "invalid_grant"})))
     listener.request(f"/auth/callback?code={CODE}&state={params['state']}&client_id={CLIENT}")
-    assert env.status(flow)["code"] == "ai_chatgpt_rejected"
+    status = env.status(flow)
+    assert status["code"] == "ai_chatgpt_code_rejected" and "Try again" in status["message"]
     assert chatgpt_state(home)["pending_client"] == CLIENT
     assert fresh_keyring._store == {}
 
-    flow, listener = env.start()
+    flow, listener = env.start(retry=True)
     params = env.authorize(flow, listener)
     assert params["client_id"] == CLIENT and "agent_name_hint" not in params
     env.openai.token_replies.append(token_reply(env.nonce))
@@ -1906,13 +1910,64 @@ def test_a_pending_client_that_openai_refuses_otherwise_is_dropped(home, fresh_k
     params = env.authorize(flow, listener)
     env.openai.token_replies.append(TransportError(400, json.dumps({"error": "invalid_grant"})))
     listener.request(f"/auth/callback?code={CODE}&state={params['state']}&client_id={CLIENT}")
-    flow, listener = env.start()
+    flow, listener = env.start(retry=True)
     params = env.authorize(flow, listener)
     env.openai.token_replies.append(TransportError(401, json.dumps({"error": "invalid_client"})))
     listener.request(f"/auth/callback?code={CODE}&state={params['state']}")
     assert chatgpt_state(home)["pending_client"] is None
-    flow, listener = env.start()
+    flow, listener = env.start(retry=True)
     assert env.authorize(flow, listener)["client_id"] == "dynamic_agent_client"
+
+
+def _pending_after_invalid_grant(env: Env) -> None:
+    flow, listener = env.start()
+    params = env.authorize(flow, listener)
+    env.openai.token_replies.append(TransportError(400, json.dumps({"error": "invalid_grant"})))
+    listener.request(f"/auth/callback?code={CODE}&state={params['state']}&client_id={CLIENT}")
+    assert chatgpt_state(env.home)["pending_client"] == CLIENT
+
+
+def test_use_a_different_account_registers_with_dynamic_agent_client_even_with_a_pending_client(home, fresh_keyring):
+    env = Env(home)
+    _pending_after_invalid_grant(env)
+    flow, listener = env.start()  # no retry: "Use a different ChatGPT account" or a plain new sign-in
+    params = env.authorize(flow, listener)
+    assert params["client_id"] == "dynamic_agent_client" and params["agent_name_hint"] == "Krellbot"
+
+
+@pytest.mark.parametrize("ending", ["cancel", "expiry", "error_callback"])
+def test_a_retry_that_is_cancelled_expires_or_is_refused_at_openai_clears_the_pending_client(
+    home, fresh_keyring, ending
+):
+    env = Env(home)
+    _pending_after_invalid_grant(env)
+    flow, listener = env.start(retry=True)
+    params = env.authorize(flow, listener)
+    assert params["client_id"] == CLIENT
+    if ending == "cancel":
+        cancelled, status = oauth.cancel_signin(flow.id, registry=env.registry)
+        assert cancelled and status["code"] == "ai_signin_cancelled"
+    elif ending == "expiry":
+        env.clock.now += oauth.SIGNIN_LIFETIME_SECONDS
+        assert env.status(flow)["code"] == "ai_signin_expired"
+    else:
+        listener.request(f"/auth/callback?error=invalid_client&state={params['state']}")
+        assert env.status(flow)["code"] == "ai_chatgpt_signin_error"
+    assert chatgpt_state(home)["pending_client"] is None
+    # The next Try again has nothing to retry with, so it registers afresh.
+    flow, listener = env.start(retry=True)
+    assert env.authorize(flow, listener)["client_id"] == "dynamic_agent_client"
+
+
+def test_the_start_route_takes_retry_as_a_boolean(home, fresh_keyring):
+    env = Env(home)
+    client = Client(env)
+    _pending_after_invalid_grant(env)
+    status, raw = client.call("POST", "/api/v1/ai/signin/chatgpt", {"model": "m", "retry": "yes"})
+    assert status == 400 and json.loads(raw)["code"] == "ai_body_invalid"
+    started = client.json("POST", "/api/v1/ai/signin/chatgpt", {"model": "m", "retry": True})
+    flow = oauth.SigninFlow(id=started["flow_id"], authorize_url=started["authorize_url"], state="")
+    assert env.authorize(flow, env.factory.last)["client_id"] == CLIENT
 
 
 # ---- 14. mid-turn refresh failures, revocation causes, the lock during revocation --------------------
@@ -2015,3 +2070,130 @@ def test_a_usage_limit_notice_keeps_its_diagnostics_across_a_reload(home, fresh_
     )
     assert provider["detail"] == body[:300]
     assert ACCESS not in json.dumps(convo) and REFRESH not in json.dumps(convo)
+
+
+# ---- 15. a write that dies part way leaves no orphaned pieces; redacted diagnostics --------------------
+
+
+class Crash(BaseException):
+    """The process dying mid-write: nothing after it runs, not even best-effort cleanup."""
+
+
+def _die_before_the_header(keyring_fake, home: Path, conn_id: str, record: dict) -> None:
+    """Replace the record, dying after its pieces are written and before its header commits."""
+
+    set_password, delete_password = keyring_fake.set_password, keyring_fake.delete_password
+
+    def dying_set(service, username, password):
+        if username == "credential":
+            raise Crash()
+        set_password(service, username, password)
+
+    def dead_delete(service, username):
+        raise RuntimeError("the process is gone")
+
+    keyring_fake.set_password, keyring_fake.delete_password = dying_set, dead_delete
+    try:
+        with pytest.raises(Crash):
+            ConnectionStore(home, allow_injected_fake_backend=True).replace_record(conn_id, json.dumps(record))
+    finally:
+        keyring_fake.set_password, keyring_fake.delete_password = set_password, delete_password
+
+
+@pytest.mark.parametrize("cleanup", ["remove_chatgpt_connection", "store_remove", "next_write"])
+def test_a_write_that_dies_before_its_header_leaves_no_orphaned_pieces(home, windows_keyring, cleanup):
+    env = Env(home)
+    conn_id = env.sign_in()
+    store = env.store()
+    before = keychain_entries(windows_keyring, conn_id)
+    _die_before_the_header(
+        windows_keyring, home, conn_id, {**keychain_record(windows_keyring, conn_id), "access_token": LONG_ACCESS}
+    )
+
+    after = keychain_entries(windows_keyring, conn_id)
+    orphans = set(after) - set(before)
+    assert "credential.pending" in orphans and len(orphans) >= 3  # the new pieces and the marker
+    assert ACCESS not in after["credential.pending"] and LONG_ACCESS[:40] not in after["credential.pending"]
+    assert after["credential"] == before["credential"]
+    # The old record is still whole and readable.
+    assert keychain_record(windows_keyring, conn_id)["access_token"] == ACCESS
+
+    if cleanup == "remove_chatgpt_connection":
+        oauth.remove_chatgpt_connection(store, store.get(conn_id), transport=env.openai, sleep=lambda s: None)
+        assert keychain_entries(windows_keyring, conn_id) == {}
+    elif cleanup == "store_remove":
+        store.remove(conn_id)
+        assert keychain_entries(windows_keyring, conn_id) == {}
+    else:
+        env.clock.now = NOW + 3590
+        env.openai.token_replies.append(refresh_reply())
+        assert oauth.chatgpt_access_token(store, store.get(conn_id), transport=env.openai, clock=env.clock) == ACCESS_2
+        swept = keychain_entries(windows_keyring, conn_id)
+        assert "credential.pending" not in swept
+        _assert_one_generation(swept)
+        assert not orphans & set(swept)
+
+
+def test_a_write_that_dies_after_its_header_has_its_old_pieces_swept(home, windows_keyring):
+    env = Env(home)
+    conn_id = env.sign_in()
+    store = env.store()
+    old_pieces = set(_chunk_entries(keychain_entries(windows_keyring, conn_id)))
+    deleted = windows_keyring.delete_password
+
+    def dead_delete(service, username):
+        raise RuntimeError("cleanup failed")
+
+    # The header commits, then every best-effort delete fails: the old generation and the marker stay.
+    windows_keyring.delete_password = dead_delete
+    try:
+        store.replace_record(
+            conn_id, json.dumps({**keychain_record(windows_keyring, conn_id), "access_token": LONG_ACCESS})
+        )
+    finally:
+        windows_keyring.delete_password = deleted
+    left = keychain_entries(windows_keyring, conn_id)
+    assert old_pieces <= set(left) and "credential.pending" in left
+    assert keychain_record(windows_keyring, conn_id)["access_token"] == LONG_ACCESS
+
+    store.remove(conn_id)
+    assert keychain_entries(windows_keyring, conn_id) == {}
+
+
+FAKE_JWT = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyLTEyMzQ1In0.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWc"
+
+
+def test_the_stored_body_excerpt_is_redacted_before_it_reaches_the_browser(home, fresh_keyring):
+    from tests.test_krell_loop_api import Client as KrellClient
+
+    env = Env(home)
+    env.clock.now = time.time()
+    conn_id = env.sign_in()
+    store = env.store()
+    store.set_capability(conn_id, "tools")
+    store.activate(conn_id)
+    krell = KrellClient(home, env.openai)
+    leaky = f"token {FAKE_JWT} rejected; header was Bearer {ACCESS}; keys sk-proj-ABCDEF123456 and sess-XYZ987654"
+    exc = TransportError(429, _error_body("subscription_sharing_usage_limit_exceeded", message=leaky))
+    exc.request_id = "req_REDACT"
+    env.openai.stream_replies.append(exc)
+    krell.stream("/api/v1/krell/messages", {"text": "hello"})
+
+    convo = krell.json("GET", "/api/v1/krell/conversation")
+    text = json.dumps(convo)
+    for secret in (FAKE_JWT, FAKE_JWT.split(".")[1], ACCESS, "sk-proj-ABCDEF123456", "sess-XYZ987654"):
+        assert secret not in text
+    [notice] = [m["payload"] for m in convo["messages"] if m["payload"].get("kind") == "error"]
+    detail = notice["provider"]["detail"]
+    assert "[redacted-jwt]" in detail and "Bearer [redacted]" in detail and "[redacted-key]" in detail
+    assert notice["provider"]["request_id"] == "req_REDACT"
+
+
+def test_a_credential_cut_by_the_excerpts_end_is_still_redacted():
+    from krellbot.agent import krell_loop
+
+    failure = ProviderError("provider_rate_limited", "x", status=429, detail="x" * 290 + FAKE_JWT)
+    stored = krell_loop._provider_diagnostics(failure)["stored"]["detail"]
+    assert len(stored) <= krell_loop.MAX_PROVIDER_DETAIL_CHARS
+    assert "eyJ" not in stored and FAKE_JWT[:12] not in stored
+    assert krell_loop.redact_diagnostic("Authorization: bearer abc.DEF-123") == "Authorization: Bearer [redacted]"

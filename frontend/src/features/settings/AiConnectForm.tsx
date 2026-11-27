@@ -40,6 +40,7 @@ import {
   startChatgptSignin,
   startOpenRouterSignin,
   type AiCapability,
+  type AiChatgptAccount,
   type AiConnection,
   type AiProbe,
   type AiProvider,
@@ -79,6 +80,24 @@ const CHATGPT_REAUTH_PLAN =
 export const CHATGPT_WELCOME_TITLE = "You're using your ChatGPT plan";
 const CHATGPT_WELCOME_BODY =
   "Krell's requests on this connection use your ChatGPT plan. You can review and manage that usage in ChatGPT settings.";
+
+/** OpenAI refused a first registration's code; Try again reuses that registration. */
+const CHATGPT_CODE_REJECTED = "ai_chatgpt_code_rejected";
+
+/**
+ * "Continue as <email>" for a saved account. When the email would not tell
+ * two saved accounts apart (the same email, or none), a short suffix from the
+ * account's random id, stable across reloads, makes each label distinct.
+ */
+export function continueAsLabel(account: AiChatgptAccount, all: readonly AiChatgptAccount[]): string {
+  const twins = all.filter((other) => other.id !== account.id && other.email === account.email);
+  if (account.email && twins.length === 0) return `Continue as ${account.email}`;
+  const short = account.id.slice(0, 6);
+  const suffix = twins.some((other) => other.id.slice(0, 6) === short) ? account.id : short;
+  return account.email
+    ? `Continue as ${account.email} (${suffix})`
+    : `Continue as saved ChatGPT account ${suffix}`;
+}
 
 type SigninKind = "openrouter" | "chatgpt";
 
@@ -197,6 +216,8 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
   const [unavailable, setUnavailable] = useState<Partial<Record<SigninKind, string>>>({});
   // A ChatGPT sign-in that did not allow plan use.
   const [planNote, setPlanNote] = useState<string | null>(null);
+  // OpenAI refused a first registration's code: offer Try again with that registration.
+  const [retryRegistration, setRetryRegistration] = useState(false);
   // "You're using your ChatGPT plan", waiting for Got it.
   const [welcome, setWelcome] = useState<{ connectionId: string; done(): void } | null>(null);
   // Sign-ins this form is done with; any other is cancelled when its polling ends.
@@ -349,17 +370,18 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
     }
   }
 
-  async function startSignin(kind: SigninKind, account?: string): Promise<void> {
+  async function startSignin(kind: SigninKind, account?: string, retry = false): Promise<void> {
     if ((!provider && !reauth) || busy || signin) return;
     setBusy(true);
     setError(null);
     setProbe(null);
     setPlanNote(null);
+    setRetryRegistration(false);
     try {
       const started =
         kind === "chatgpt"
           ? await startChatgptSignin(
-              reauth ? { connectionId: reauth.id } : { model: model.trim(), account },
+              reauth ? { connectionId: reauth.id } : { model: model.trim(), account, retry },
             )
           : await startOpenRouterSignin(model.trim());
       if (!started.ok) {
@@ -436,6 +458,7 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
         return;
       }
       if (status.state !== "connected" || !status.connectionId) {
+        if (status.code === CHATGPT_CODE_REJECTED) setRetryRegistration(true);
         settle(`${status.message} (${status.code || status.state})`);
         return;
       }
@@ -759,9 +782,20 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
             onClick={() => void startSignin("chatgpt", account.id)}
             disabled={locked || unavailable.chatgpt !== undefined}
           >
-            Continue as {account.email ?? "your saved ChatGPT account"}
+            {continueAsLabel(account, savedAccounts)}
           </button>
         ))}
+        {offersChatgpt && retryRegistration ? (
+          <button
+            type="button"
+            className="kbot-settings__btn"
+            data-oai-siwc-button=""
+            onClick={() => void startSignin("chatgpt", undefined, true)}
+            disabled={locked || unavailable.chatgpt !== undefined}
+          >
+            Try again
+          </button>
+        ) : null}
         {offersChatgpt ? (
           <button
             type="button"

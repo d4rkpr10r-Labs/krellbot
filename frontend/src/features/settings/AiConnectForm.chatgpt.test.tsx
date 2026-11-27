@@ -314,6 +314,70 @@ describe("AiConnectForm Continue with ChatGPT", () => {
     expect(different).toBeTruthy();
   });
 
+  it("gives saved accounts that share an email, or have none, distinct and stable labels", async () => {
+    const accounts = [
+      { id: "aaaaaa0000000001", email: "trader@example.com" },
+      { id: "bbbbbb0000000002", email: "trader@example.com" },
+      { id: "cccccc0000000003", email: null },
+      { id: "dddddd0000000004", email: null },
+      { id: "eeeeee0000000005", email: "solo@example.com" },
+    ];
+    const withAccounts = PROVIDERS.map((p) => (p.id === "openai" ? { ...p, chatgpt_accounts: accounts } : p));
+    const calls = installFetch((c) =>
+      c.path === "/api/v1/ai/providers" ? ok({ providers: withAccounts }) : engine("enabled", { welcome: false })(c),
+    );
+    await renderForm();
+    const labels = screen
+      .getAllByRole("button")
+      .map((b) => b.textContent ?? "")
+      .filter((t) => t.startsWith("Continue as"));
+    expect(labels).toEqual([
+      "Continue as trader@example.com (aaaaaa)",
+      "Continue as trader@example.com (bbbbbb)",
+      "Continue as saved ChatGPT account cccccc",
+      "Continue as saved ChatGPT account dddddd",
+      "Continue as solo@example.com",
+    ]);
+    expect(new Set(labels).size).toBe(labels.length);
+
+    fireEvent.change(screen.getByLabelText(/^model$/i), { target: { value: "gpt-plan-a" } });
+    fireEvent.click(screen.getByRole("button", { name: "Continue as trader@example.com (bbbbbb)" }));
+    await advance(0);
+    expect(calls.find((c) => c.path === "/api/v1/ai/signin/chatgpt")?.body).toEqual({
+      model: "gpt-plan-a",
+      account: "bbbbbb0000000002",
+    });
+  });
+
+  it("offers Try again after OpenAI refused a first registration's code, and only then retries it", async () => {
+    let attempt = 0;
+    const calls = installFetch((c) => {
+      if (c.path === `/api/v1/ai/signin/${FLOW_ID}` && c.method === "GET") {
+        attempt += 1;
+        return attempt === 1
+          ? ok({
+              flow_id: FLOW_ID,
+              state: "failed",
+              code: "ai_chatgpt_code_rejected",
+              detail: "OpenAI did not accept that sign-in code, so nothing was stored. Choose Try again.",
+            })
+          : ok({ flow_id: FLOW_ID, state: "waiting" });
+      }
+      return engine("enabled")(c);
+    });
+    await renderForm();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    await continueWithChatgpt();
+    await advance(2000);
+    expect(screen.getByRole("alert").textContent).toContain("ai_chatgpt_code_rejected");
+
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await advance(0);
+    const starts = calls.filter((c) => c.path === "/api/v1/ai/signin/chatgpt");
+    expect(starts.map((c) => c.body)).toEqual([{ model: "gpt-plan-a" }, { model: "gpt-plan-a", retry: true }]);
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
   it("signs an existing ChatGPT connection in again by its connection id", async () => {
     const calls = installFetch(engine("enabled", { welcome: false }));
     const onAdded = vi.fn();

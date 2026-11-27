@@ -147,6 +147,10 @@ SIGNIN_MESSAGES: dict[str, str] = {
     "ai_chatgpt_rejected": "OpenAI did not accept the sign-in, so nothing was stored. Start the sign-in again.",
     "ai_chatgpt_unavailable": "OpenAI could not be reached to finish the sign-in, so nothing was stored.",
     "ai_chatgpt_bad_response": "OpenAI sent a reply Krellbot could not read, so nothing was stored.",
+    "ai_chatgpt_code_rejected": (
+        "OpenAI did not accept that sign-in code, so nothing was stored. Choose Try again to finish signing in "
+        "with the registration OpenAI just made."
+    ),
 }
 
 _CLOSE_PAGE = (
@@ -975,6 +979,22 @@ def _upsert_account(state: dict, client_id: str, issuer: str, subject: str, emai
 
 _ACCOUNT_ID_RE = re.compile(r"[0-9a-f]{16}")
 
+# A ChatGPT sign-in that ends this way abandons a pending first registration's retry.
+_ENDS_PENDING_RETRY = frozenset(
+    {"ai_signin_cancelled", "ai_signin_expired", "ai_chatgpt_access_denied", "ai_chatgpt_signin_error"}
+)
+
+
+def _clear_pending_client(home: Path) -> None:
+    """Forget a pending first registration's client (cancelled, expired or refused at OpenAI's page)."""
+
+    # Best effort: the sign-in has ended either way.
+    with contextlib.suppress(Exception), _state_lock(home):
+        state = _load_state(home)
+        if state["pending_client"] is not None:
+            state["pending_client"] = None
+            _save_state(home, state)
+
 
 def chatgpt_saved_accounts(home: Path) -> list[dict]:
     """Saved ChatGPT accounts with no connection now: each can be signed in again with its issued client.
@@ -1330,6 +1350,8 @@ class _ChatGPTFlow(_Flow):
         super()._finish_locked(phase, error_code)
         self.authorize_url = None
         self.nonce = ""
+        if error_code in _ENDS_PENDING_RETRY:
+            _clear_pending_client(self.store.home)
 
     def _fail_locked(self, code: str) -> CallbackReply:
         self._finish_locked("failed", code)
@@ -1421,7 +1443,8 @@ class _ChatGPTFlow(_Flow):
                 },
             )
         except TransportError as exc:
-            self._note_exchange_failure(client_id, exc)
+            if self._note_exchange_failure(client_id, exc):
+                raise SigninRefused("ai_chatgpt_code_rejected") from None
             raise _signin_failure(exc) from None
         try:
             tokens = _parse_token_set(raw, need_id_token=True)
@@ -1489,24 +1512,29 @@ class _ChatGPTFlow(_Flow):
                 entry.update(client_id=client_id, plan=plan, signed_in=True, account=email)
         return conn_id, plan
 
-    def _note_exchange_failure(self, client_id: str, exc: TransportError) -> None:
-        """Keep an issued client whose code exchange returned invalid_grant, so the next attempt reuses it.
+    def _note_exchange_failure(self, client_id: str, exc: TransportError) -> bool:
+        """Keep a first registration's issued client whose code exchange returned invalid_grant, for Try again.
 
         OpenAI: "If code exchange returns invalid_grant, discard that code and
         start a fresh authorization with the issued client ID retained for
-        this attempt." A pending client that OpenAI refuses for another reason
-        is dropped, so the next attempt registers afresh.
+        this attempt." Only an explicit retry reuses it (``retry=True``). A
+        pending client that OpenAI refuses for another reason is dropped.
+        Returns True when the client was kept, so the person is offered Try again.
         """
 
         code = _oauth_error_code(exc.body) if exc.status is not None and 400 <= exc.status < 500 else None
         if code is None:
-            return  # a network or server failure says nothing about the client
-        # Best effort: the attempt has failed either way.
-        with contextlib.suppress(Exception), _state_change(self.store.home) as state:
-            if code == "invalid_grant" and (self.target is None or self.target.subject is None):
-                state["pending_client"] = client_id
-            elif code != "invalid_grant" and state.get("pending_client") == client_id:
-                state["pending_client"] = None
+            return False  # a network or server failure says nothing about the client
+        keep = code == "invalid_grant" and (self.target is None or self.target.subject is None)
+        try:
+            with _state_change(self.store.home) as state:
+                if keep:
+                    state["pending_client"] = client_id
+                elif state.get("pending_client") == client_id:
+                    state["pending_client"] = None
+        except Exception:  # noqa: BLE001 — best effort: the attempt has failed either way
+            return False
+        return keep
 
     def status(self) -> dict:
         out = super().status()
@@ -1527,6 +1555,7 @@ def start_chatgpt_signin(
     registry: SigninRegistry | None = None,
     connection_id: str | None = None,
     account: str | None = None,
+    retry: bool = False,
     allow_injected_fake_backend: bool = False,
 ) -> SigninFlow:
     """Open the loopback callback and return the address the browser should open.
@@ -1538,10 +1567,12 @@ def start_chatgpt_signin(
     - ``connection_id``: sign that connection in again;
     - ``account`` (an id from :func:`chatgpt_saved_accounts`): "Continue as"
       a saved account, making a new connection;
-    - neither, while a first registration's client is pending after an
-      ``invalid_grant`` exchange: retry with that client.
+    - ``retry``: "Try again" after a first registration's code exchange
+      returned ``invalid_grant``, with the client that registration issued
+      (when it is still pending).
 
-    Otherwise it registers a new client for the account the person picks
+    Otherwise, "Use a different ChatGPT account" included, it registers a new
+    client for the account the person picks
     (``dynamic_agent_client``, ``agent_name_hint=Krellbot``). The returned
     ``authorize_url`` is the listener's launch address on ``127.0.0.1``,
     which redirects to OpenAI; the OpenAI URL itself stays in the engine. The
@@ -1593,7 +1624,7 @@ def start_chatgpt_signin(
                 email=saved.get("email"),
                 id_token=None,  # an ID token is retained only with a connection's record
             )
-        elif state["pending_client"] is not None:
+        elif retry and state["pending_client"] is not None:
             target = _Reauth(
                 conn_id=None, client_id=state["pending_client"], issuer=None, subject=None, email=None, id_token=None
             )
