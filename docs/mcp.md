@@ -44,8 +44,11 @@ filled in for this computer, ready to copy: the full launch command
 (`GET /api/v1/agents/mcp-setup`) and the workstation's own
 `KRELLBOT_HOME`, with the Claude Code line quoted for this computer's
 shell. The launch command is the frozen build's own executable, else the
-`krellbot` script on `PATH`, else the Python interpreter with
-`-m krellbot.cli mcp`.
+`krellbot` script installed beside the engine's Python interpreter (so the
+client runs the same install as the engine), else the `krellbot` script on
+`PATH`, else the Python interpreter with `-m krellbot.cli mcp`. On Windows
+the Claude Code line always double-quotes the command and the `--env`
+value; PowerShell still expands `$` and backticks inside double quotes.
 
 **Claude Desktop** (`claude_desktop_config.json`):
 

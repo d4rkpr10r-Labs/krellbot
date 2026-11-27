@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 import time
 import urllib.error
 from collections.abc import Callable
@@ -442,21 +443,71 @@ def _mcp_launch() -> tuple[str, list[str]]:
     """How an MCP client starts ``krellbot mcp`` on this computer.
 
     A frozen build runs its own executable. A source install runs the
-    ``krellbot`` script on PATH, or else this interpreter with the CLI module.
+    ``krellbot`` script installed beside this interpreter, so the client runs
+    the same install as the engine; else the ``krellbot`` script on PATH;
+    else this interpreter with the CLI module.
     """
 
     if getattr(sys, "frozen", False):
         return sys.executable, ["mcp"]
-    script = shutil.which("krellbot")
+    script = _interpreter_krellbot_script() or shutil.which("krellbot")
     if script:
         return os.path.abspath(script), ["mcp"]
     return sys.executable, ["-m", "krellbot.cli", "mcp"]
 
 
-def _mcp_shell_line(argv: list[str], *, windows: bool) -> str:
-    """``argv`` quoted for this computer's shell, so paths with spaces survive a paste."""
+def _interpreter_krellbot_script() -> str | None:
+    """The ``krellbot`` script in the running interpreter's scripts folder, if installed there."""
 
-    return subprocess.list2cmdline(argv) if windows else shlex.join(argv)
+    scripts = sysconfig.get_path("scripts")
+    if not scripts:
+        return None
+    script = os.path.join(scripts, "krellbot.exe" if sys.platform == "win32" else "krellbot")
+    return script if os.path.isfile(script) else None
+
+
+def _windows_quoted(value: str) -> str:
+    """``value`` always in double quotes, escaped the way Windows programs split their arguments.
+
+    ``subprocess.list2cmdline`` quotes only on whitespace, which leaves ``&``
+    and the like bare for cmd to act on. A backslash run before a quote, or at
+    the end, is doubled so it stays literal.
+    """
+
+    out: list[str] = []
+    backslashes = 0
+    for char in value:
+        if char == "\\":
+            backslashes += 1
+            continue
+        if char == '"':
+            out.append("\\" * (backslashes * 2 + 1) + '"')
+        else:
+            out.append("\\" * backslashes + char)
+        backslashes = 0
+    out.append("\\" * (backslashes * 2))
+    return '"' + "".join(out) + '"'
+
+
+def _claude_code_line(command: str, args: list[str], home: str, *, windows: bool) -> str:
+    """The ``claude mcp add`` line, quoted for this computer's shell so it survives a paste.
+
+    On Windows the command and the ``--env`` value are always double-quoted;
+    elsewhere ``shlex`` quotes only what needs it.
+    """
+
+    env = f"KRELLBOT_HOME={home}"
+    if not windows:
+        return shlex.join(["claude", "mcp", "add", "krellbot", "--env", env, "--", command, *args])
+    return " ".join(
+        [
+            "claude mcp add krellbot --env",
+            _windows_quoted(env),
+            "--",
+            _windows_quoted(command),
+            *([subprocess.list2cmdline(args)] if args else []),
+        ]
+    )
 
 
 def _stored_deployment_mode(home: Path) -> str | None:
@@ -5095,10 +5146,7 @@ def create_app(
             return denied
         command, args = _mcp_launch()
         home = str(s.home.absolute())
-        claude_code = _mcp_shell_line(
-            ["claude", "mcp", "add", "krellbot", "--env", f"KRELLBOT_HOME={home}", "--", command, *args],
-            windows=sys.platform == "win32",
-        )
+        claude_code = _claude_code_line(command, args, home, windows=sys.platform == "win32")
         return JSONResponse(
             {
                 "schema_version": SCHEMA_VERSION,
