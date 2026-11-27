@@ -111,6 +111,7 @@ its keychain entry.
 
 Endpoints must use `https://`. Plain `http://` is accepted only for a model on
 this computer (`127.0.0.1`, `::1` or `localhost`, for example Ollama or LM
-Studio). An endpoint with a user name, password, query or fragment is
-refused, and a provider redirect is never followed, so the key is not re-sent
-to another host.
+Studio), and requests to this computer never go through a proxy. An endpoint
+with a user name, password, query, parameters or fragment is refused, and a
+provider redirect is never followed, so the key is not re-sent to another
+host.

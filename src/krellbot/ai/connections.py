@@ -15,6 +15,7 @@ import os
 import re
 import secrets as stdlib_secrets  # the standard library module, not krellbot.secrets
 import sys
+import threading
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -24,6 +25,11 @@ from urllib.parse import urlsplit
 
 import keyring
 import keyring.errors
+
+try:
+    from keyring.backends.chainer import ChainerBackend
+except ImportError:  # pragma: no cover — present in every supported keyring release
+    ChainerBackend = None  # type: ignore[assignment,misc]
 
 from krellbot import paths
 from krellbot.ai.anthropic_messages import AnthropicMessagesAdapter
@@ -45,16 +51,27 @@ _MAX_URL = 2048
 _MAX_MODEL = 256
 _MAX_LABEL = 80
 _MAX_CREDENTIAL = 4096
-# Backends that would put a key in a file, drop it, or always fail. A chained
-# backend is judged by every backend it chains.
-_UNSAFE_BACKEND_MARKERS = ("null", "fail", "plaintext", "keyrings.alt")
+_FORBIDDEN_URL_CHARS = frozenset("@?#; \\")
+
+# Every store for one file shares a lock: routes run store writes in worker threads.
+_LOCKS: dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(path: Path) -> threading.Lock:
+    key = os.path.abspath(path)
+    with _LOCKS_GUARD:
+        return _LOCKS.setdefault(key, threading.Lock())
+
 
 REFUSAL_MESSAGES: dict[str, str] = {
     "ai_endpoint_insecure": (
         "Use an https:// endpoint. Plain http:// is allowed only for a model on this computer "
         "(127.0.0.1, ::1 or localhost)."
     ),
-    "ai_endpoint_invalid": "Enter the endpoint as a base URL with a host and no user name, password, query or fragment.",
+    "ai_endpoint_invalid": (
+        "Enter the endpoint as a base URL with a host and no user name, password, query, parameters or fragment."
+    ),
     "ai_endpoint_fixed": "This provider's endpoint is fixed. Use a custom endpoint to connect another address.",
     "ai_preset_unknown": "Choose one of the listed AI providers.",
     "ai_model_invalid": "Enter the model name the provider uses.",
@@ -67,6 +84,7 @@ REFUSAL_MESSAGES: dict[str, str] = {
     "ai_keychain_unavailable": "The OS keychain is not available, so the key was not stored or changed.",
     "ai_connection_not_found": "There is no AI connection with that id.",
     "ai_connections_unreadable": "The AI connections file could not be read, so it was left unchanged.",
+    "ai_body_invalid": "The request body is not a valid AI connection request.",
 }
 
 
@@ -97,32 +115,38 @@ def is_connection_id(value: object) -> bool:
 
 
 def validate_base_url(url: str) -> None:
-    """Refuse anything but https, or plain http to this computer."""
+    """Refuse anything but https, or plain http to this computer. Never raises anything but ConnectionRefused."""
 
-    if not isinstance(url, str) or not url or len(url) > _MAX_URL or not url.isprintable() or " " in url:
+    if not isinstance(url, str) or not url or len(url) > _MAX_URL or not url.isprintable():
         raise ConnectionRefused("ai_endpoint_invalid")
-    parts = urlsplit(url)
-    scheme = parts.scheme.lower()
-    if scheme not in ("http", "https"):
-        raise ConnectionRefused("ai_endpoint_insecure")
+    # A user name, password, query or path parameter could carry a credential into
+    # the metadata file; spaces and backslashes are never part of a base URL.
+    if any(ch in url for ch in _FORBIDDEN_URL_CHARS):
+        raise ConnectionRefused("ai_endpoint_invalid")
     try:
+        parts = urlsplit(url)
+        scheme = parts.scheme.lower()
         host = parts.hostname
         parts.port  # noqa: B018 — raises ValueError for a malformed port
-    except ValueError:
+    except ValueError:  # e.g. an unbalanced or non-IP "[...]" host
         raise ConnectionRefused("ai_endpoint_invalid") from None
-    # A user name, password or query could carry a credential into the metadata file.
-    if not host or "@" in parts.netloc or "?" in url or "#" in url:
+    if scheme not in ("http", "https"):
+        raise ConnectionRefused("ai_endpoint_insecure")
+    if not host:
         raise ConnectionRefused("ai_endpoint_invalid")
     if scheme == "http" and host not in LOOPBACK_HOSTS:
         raise ConnectionRefused("ai_endpoint_insecure")
 
 
 def provider_host(base_url: str) -> str:
-    return urlsplit(base_url).hostname or ""
+    try:
+        return urlsplit(base_url).hostname or ""
+    except ValueError:
+        return ""
 
 
 def check_endpoint(conn: Connection) -> ProviderPreset:
-    """Re-check a connection's endpoint before use: the metadata file is editable by anything local."""
+    """Re-check a connection's endpoint before use, so a hand-edited or corrupt record cannot widen the rules."""
 
     validate_base_url(conn.base_url)
     preset = PRESETS.get(conn.preset)
@@ -148,14 +172,23 @@ def _service(conn_id: str) -> str:
     return KEYRING_SERVICE_PREFIX + conn_id
 
 
-def _backend_is_safe(backend: object, depth: int = 0) -> bool:
-    module = (getattr(type(backend), "__module__", "") or "").lower()
-    if any(marker in module for marker in _UNSAFE_BACKEND_MARKERS):
-        return False
-    if "chainer" in module:
-        children = list(getattr(backend, "backends", None) or ())
-        return depth < 3 and bool(children) and all(_backend_is_safe(b, depth + 1) for b in children)
-    return True
+def keychain_is_safe(backend: object, *, allow_injected_fake_backend: bool = False) -> bool:
+    """The exchange-key allow-list: a native OS keychain, verified by class identity.
+
+    A chained backend (keyring's default when several native keychains exist,
+    e.g. Secret Service and KWallet) passes only when every backend it chains
+    passes. The in-tree test fake passes only with the tests-only opt-in.
+    """
+
+    from krellbot.keys_onboarding import _classify_backend
+
+    if ChainerBackend is not None and type(backend) is ChainerBackend:
+        try:
+            chained = list(backend.backends)
+        except Exception:  # noqa: BLE001 — discovery failure means unproven, so refused
+            return False
+        return bool(chained) and all(_classify_backend(b, allow_injected_fake_backend) for b in chained)
+    return _classify_backend(backend, allow_injected_fake_backend)
 
 
 def _clean_text(value: object, max_len: int) -> str | None:
@@ -172,10 +205,21 @@ def _now_iso() -> str:
 
 
 class ConnectionStore:
-    def __init__(self, home: Path, *, clock: Callable[[], str] | None = None) -> None:
+    """Connections under ``<home>/ai``. Methods block on the keychain: async callers use a worker thread."""
+
+    def __init__(
+        self,
+        home: Path,
+        *,
+        clock: Callable[[], str] | None = None,
+        allow_injected_fake_backend: bool = False,
+    ) -> None:
         self._dir = Path(home) / "ai"
         self._path = self._dir / "connections.json"
         self._clock = clock or _now_iso
+        # Tests-only: admit the in-tree FakeKeyring, as the exchange-key routes do.
+        self._allow_fake = allow_injected_fake_backend
+        self._lock = _lock_for(self._path)
 
     # ---- reads ------------------------------------------------------------
 
@@ -233,6 +277,18 @@ class ConnectionStore:
         model needs none). Built-in providers always need a credential.
         """
 
+        with self._lock:
+            return self._add(preset, model, credential, base_url, label, auth)
+
+    def _add(
+        self,
+        preset: str,
+        model: str,
+        credential: str | None,
+        base_url: str | None,
+        label: str | None,
+        auth: Auth,
+    ) -> Connection:
         conns, active = self._load()
         spec = PRESETS.get(preset) if isinstance(preset, str) else None
         if spec is None:
@@ -295,34 +351,41 @@ class ConnectionStore:
         return conn
 
     def remove(self, conn_id: str) -> None:
-        """Delete the keychain entry first, so a failure leaves the connection listed and removable."""
+        """Delete the keychain entry first, so a failure leaves a keyed connection listed and removable.
 
-        conns, active = self._load()
-        found = next((c for c in conns if c.id == conn_id), None) if is_connection_id(conn_id) else None
-        if found is None:
-            raise ConnectionRefused("ai_connection_not_found")
-        if found.auth != "none":  # a keyless connection never had an entry
-            self._forget_secret(conn_id, strict=True)
-        self._save([c for c in conns if c.id != conn_id], None if active == conn_id else active)
+        A keyless connection still gets a best-effort delete (the record's
+        ``auth`` is not proof that no entry exists), but a keychain failure
+        never blocks its removal.
+        """
+
+        with self._lock:
+            conns, active = self._load()
+            found = next((c for c in conns if c.id == conn_id), None) if is_connection_id(conn_id) else None
+            if found is None:
+                raise ConnectionRefused("ai_connection_not_found")
+            self._forget_secret(conn_id, strict=found.auth != "none")
+            self._save([c for c in conns if c.id != conn_id], None if active == conn_id else active)
 
     def activate(self, conn_id: str) -> Connection:
-        conns, _active = self._load()
-        found = next((c for c in conns if c.id == conn_id), None) if is_connection_id(conn_id) else None
-        if found is None:
-            raise ConnectionRefused("ai_connection_not_found")
-        self._save(conns, conn_id)
-        return found
+        with self._lock:
+            conns, _active = self._load()
+            found = next((c for c in conns if c.id == conn_id), None) if is_connection_id(conn_id) else None
+            if found is None:
+                raise ConnectionRefused("ai_connection_not_found")
+            self._save(conns, conn_id)
+            return found
 
     def set_capability(self, conn_id: str, cap: Capability) -> Connection:
         if cap not in get_args(Capability):
             raise ConnectionRefused("ai_capability_invalid")
-        conns, active = self._load()
-        found = next((c for c in conns if c.id == conn_id), None) if is_connection_id(conn_id) else None
-        if found is None:
-            raise ConnectionRefused("ai_connection_not_found")
-        updated = replace(found, capability=cap)
-        self._save([updated if c.id == conn_id else c for c in conns], active)
-        return updated
+        with self._lock:
+            conns, active = self._load()
+            found = next((c for c in conns if c.id == conn_id), None) if is_connection_id(conn_id) else None
+            if found is None:
+                raise ConnectionRefused("ai_connection_not_found")
+            updated = replace(found, capability=cap)
+            self._save([updated if c.id == conn_id else c for c in conns], active)
+            return updated
 
     # ---- keychain ---------------------------------------------------------
 
@@ -340,11 +403,10 @@ class ConnectionStore:
             raise ConnectionRefused("ai_credential_invalid")
         return value
 
-    @staticmethod
-    def _store_secret(conn_id: str, secret: str) -> None:
+    def _store_secret(self, conn_id: str, secret: str) -> None:
         service = _service(conn_id)
         backend = keyring.get_keyring()
-        if not _backend_is_safe(backend):
+        if not keychain_is_safe(backend, allow_injected_fake_backend=self._allow_fake):
             raise ConnectionRefused("ai_keychain_unavailable")
         try:
             backend.set_password(service, KEYRING_USERNAME, secret)
@@ -352,7 +414,7 @@ class ConnectionStore:
         except Exception:  # noqa: BLE001 — backend errors can carry arbitrary text; never surfaced
             stored = None
         if stored != secret:
-            ConnectionStore._forget_secret(conn_id, strict=False)
+            self._forget_secret(conn_id, strict=False)
             raise ConnectionRefused("ai_keychain_unavailable")
 
     @staticmethod

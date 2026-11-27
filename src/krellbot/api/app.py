@@ -4688,6 +4688,8 @@ def create_app(
     # The user's own model for Krell. Credentials go only to the OS keychain
     # (``krellbot-ai:<id>``) and are never returned, logged or echoed; GET
     # never reads the keychain. Ids in paths must be Krellbot-generated ids.
+    # Store calls that touch the keychain (or wait on a store write) run in a
+    # worker thread: a keychain unlock prompt must not freeze the loop.
 
     _AI_REFUSAL_STATUS = {
         "ai_connection_not_found": 404,
@@ -4707,6 +4709,17 @@ def create_app(
             {"ok": False, "effect": "refused", "code": exc.code, "detail": exc.message},
             _AI_REFUSAL_STATUS.get(exc.code, 400),
         )
+
+    def _ai_invalid_body() -> Response:
+        from krellbot.ai.connections import ConnectionRefused
+
+        return _ai_refused(ConnectionRefused("ai_body_invalid"))
+
+    def _ai_store(s: _AppState):
+        from krellbot.ai.connections import ConnectionStore
+
+        # The tests-only FakeKeyring opt-in is the one the exchange-key routes use.
+        return ConnectionStore(s.home, allow_injected_fake_backend=s.keys_allow_fake_backend)
 
     def _ai_not_found() -> Response:
         return _ai_json(
@@ -4743,9 +4756,8 @@ def create_app(
 
         transport = s.ai_transport or UrllibTransport()
         try:
-            # Keychain reads stay on the loop thread; only provider HTTP runs in the worker.
-            check_endpoint(conn)
-            credential = store.credential_for(conn)
+            check_endpoint(conn)  # before the keychain is touched
+            credential = await asyncio.to_thread(store.credential_for, conn)
             adapter = build_adapter(conn, credential, transport)
         except ConnectionRefused as exc:
             return _ai_refused(exc)
@@ -4756,7 +4768,7 @@ def create_app(
             list_models=lambda: fetch_model_ids(conn.format, conn.base_url, credential, transport),
         )
         try:
-            updated = store.set_capability(conn.id, result.capability)
+            updated = await asyncio.to_thread(store.set_capability, conn.id, result.capability)
             active = store.active()
         except ConnectionRefused as exc:
             return _ai_refused(exc)
@@ -4803,13 +4815,13 @@ def create_app(
     async def ai_connections(request: Request) -> Response:
         """List AI connections and the active one. Never returns or reads a credential."""
 
-        from krellbot.ai.connections import ConnectionRefused, ConnectionStore
+        from krellbot.ai.connections import ConnectionRefused
 
         s = _state(request.app)
         denied = _gate_get(request, s)
         if denied is not None:
             return denied
-        store = ConnectionStore(s.home)
+        store = _ai_store(s)
         try:
             conns = store.list()
             active = store.active()
@@ -4834,7 +4846,7 @@ def create_app(
         with no key is stored as ``auth: "none"``.
         """
 
-        from krellbot.ai.connections import ConnectionRefused, ConnectionStore
+        from krellbot.ai.connections import ConnectionRefused
 
         s = _state(request.app)
         denied = _gate_state_change(request, s)
@@ -4843,9 +4855,9 @@ def create_app(
         try:
             payload = await request.json()
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
-            return JSONResponse({"detail": "invalid body"}, status_code=400)
+            return _ai_invalid_body()
         if not isinstance(payload, dict):
-            return JSONResponse({"detail": "invalid body"}, status_code=400)
+            return _ai_invalid_body()
         preset = payload.get("preset")
         model = payload.get("model")
         optional = {name: payload.get(name) for name in ("credential", "base_url", "label")}
@@ -4854,11 +4866,11 @@ def create_app(
             or not isinstance(model, str)
             or any(v is not None and not isinstance(v, str) for v in optional.values())
         ):
-            return JSONResponse({"detail": "invalid body"}, status_code=400)
+            return _ai_invalid_body()
 
-        store = ConnectionStore(s.home)
+        store = _ai_store(s)
         try:
-            conn = store.add(preset, model=model, **optional)
+            conn = await asyncio.to_thread(store.add, preset, model=model, **optional)
         except ConnectionRefused as exc:
             return _ai_refused(exc)
         return await _ai_probe_and_record(s, store, conn)
@@ -4867,7 +4879,7 @@ def create_app(
     async def ai_connections_remove(conn_id: str, request: Request) -> Response:
         """Remove a connection and delete its keychain entry."""
 
-        from krellbot.ai.connections import ConnectionRefused, ConnectionStore, is_connection_id
+        from krellbot.ai.connections import ConnectionRefused, is_connection_id
 
         s = _state(request.app)
         denied = _gate_state_change(request, s)
@@ -4876,7 +4888,7 @@ def create_app(
         if not is_connection_id(conn_id):
             return _ai_not_found()
         try:
-            ConnectionStore(s.home).remove(conn_id)
+            await asyncio.to_thread(_ai_store(s).remove, conn_id)
         except ConnectionRefused as exc:
             return _ai_refused(exc)
         return _ai_json({"ok": True, "effect": "changed", "removed": conn_id})
@@ -4885,7 +4897,7 @@ def create_app(
     async def ai_connections_activate(conn_id: str, request: Request) -> Response:
         """Make this connection the one Krell uses."""
 
-        from krellbot.ai.connections import ConnectionRefused, ConnectionStore, is_connection_id
+        from krellbot.ai.connections import ConnectionRefused, is_connection_id
 
         s = _state(request.app)
         denied = _gate_state_change(request, s)
@@ -4894,7 +4906,7 @@ def create_app(
         if not is_connection_id(conn_id):
             return _ai_not_found()
         try:
-            conn = ConnectionStore(s.home).activate(conn_id)
+            conn = await asyncio.to_thread(_ai_store(s).activate, conn_id)
         except ConnectionRefused as exc:
             return _ai_refused(exc)
         return _ai_json(
@@ -4905,7 +4917,7 @@ def create_app(
     async def ai_connections_probe(conn_id: str, request: Request) -> Response:
         """Re-run the capability probe and record the result."""
 
-        from krellbot.ai.connections import ConnectionRefused, ConnectionStore, is_connection_id
+        from krellbot.ai.connections import ConnectionRefused, is_connection_id
 
         s = _state(request.app)
         denied = _gate_state_change(request, s)
@@ -4913,7 +4925,7 @@ def create_app(
             return denied
         if not is_connection_id(conn_id):
             return _ai_not_found()
-        store = ConnectionStore(s.home)
+        store = _ai_store(s)
         try:
             conn = store.get(conn_id)
         except ConnectionRefused as exc:

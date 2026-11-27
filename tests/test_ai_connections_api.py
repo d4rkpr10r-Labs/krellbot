@@ -4,10 +4,12 @@ Users connect their own model so Krell can run on it. The credential lives
 only in the OS keychain (service ``krellbot-ai:<id>``, username
 ``credential``); ``<home>/ai/connections.json`` holds metadata and no secret.
 Plain HTTP is refused unless the endpoint is on this computer. The probe
-marks a model ``tools``, ``chat_only`` or ``failed``. Every route sits behind
-the existing session gate (and CSRF for state changes).
+marks a model ``tools``, ``chat_only`` or ``failed``, or leaves it
+``unprobed`` when the reply was cut off. Every route sits behind the
+existing session gate (and CSRF for state changes).
 
-Fakes only: ``FakeKeyring`` and ``FakeAiTransport``. No socket is opened.
+Fakes only: ``FakeKeyring`` (admitted through the same tests-only opt-in the
+exchange-key routes use) and ``FakeAiTransport``. No socket is opened.
 """
 
 from __future__ import annotations
@@ -15,15 +17,19 @@ from __future__ import annotations
 import json
 import re
 import sys
+import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import keyring
 import keyring.errors
 import pytest
 
-from krellbot.ai.connections import ConnectionRefused, ConnectionStore, validate_base_url
+from krellbot.ai import http as ai_http
+from krellbot.ai.connections import ConnectionRefused, ConnectionStore, keychain_is_safe, validate_base_url
 from krellbot.ai.disclosure import egress_disclosure
-from krellbot.ai.http import TransportError
+from krellbot.ai.http import TransportError, UrllibTransport
 from krellbot.ai.probe import probe
 from krellbot.ai.providers import PRESETS
 from tests.fakes.fake_ai_transport import FakeAiTransport, sse
@@ -106,6 +112,7 @@ class Client:
     def __init__(self, home: Path, transport: FakeAiTransport | None = None) -> None:
         self.app = _build_app(home, bootstrap_token=TOKEN)
         self.app.state.krellbot.ai_transport = transport
+        self.app.state.krellbot.keys_allow_fake_backend = True  # tests-only FakeKeyring opt-in
         self.csrf = _bootstrap_and_get_csrf(self.app, TOKEN)
         self.session = next(iter(self.app.state.krellbot.sessions))
 
@@ -130,7 +137,8 @@ class Client:
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             headers += [("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
-        status, _hdrs, raw, _cookies = asgi_call(self.app, method=method, path=path, body=body, headers=headers)
+        status, hdrs, raw, _cookies = asgi_call(self.app, method=method, path=path, body=body, headers=headers)
+        self.last_headers = {name.lower(): value for name, value in hdrs}
         return status, raw
 
     def json(self, method: str, path: str, payload: object = None, *, expect: int = 200) -> dict:
@@ -143,6 +151,10 @@ class Client:
 
 def _connections_file(home: Path) -> Path:
     return home / "ai" / "connections.json"
+
+
+def _store(home: Path) -> ConnectionStore:
+    return ConnectionStore(home, allow_injected_fake_backend=True)
 
 
 # ---- 1. keychain namespace, never returned -------------------------------------
@@ -172,7 +184,7 @@ def test_api_key_is_stored_in_the_ai_keychain_namespace_and_never_returned(home,
     request = transport.requests[0]
     assert request["url"] == "https://api.openai.com/v1/chat/completions"
     assert request["headers"]["authorization"] == f"Bearer {SECRET}"
-    assert request["body"]["max_completion_tokens"] == 64
+    assert request["body"]["max_completion_tokens"] == 512
     assert "max_tokens" not in request["body"]
     assert [t["function"]["name"] for t in request["body"]["tools"]] == ["ping"]
 
@@ -219,7 +231,7 @@ def test_a_rejected_key_is_never_echoed_by_a_refusal_or_a_failed_probe(home, fre
 
 
 def test_connections_file_holds_no_secret_bytes(home, fresh_keyring):
-    store = ConnectionStore(home)
+    store = _store(home)
     first = store.add("anthropic", model="claude-x", credential=SECRET)
     second = store.add(
         "custom_openai", model="llama", credential=SECRET + "-2", base_url="https://gateway.example/v1", label="Gateway"
@@ -278,7 +290,7 @@ def test_a_plaintext_keyring_backend_is_refused_and_nothing_is_written(home, mon
     unsafe = PlaintextKeyring()
     monkeypatch.setattr(keyring, "get_keyring", lambda: unsafe)
     with pytest.raises(ConnectionRefused) as refused:
-        ConnectionStore(home).add("openai", model="gpt-x", credential=SECRET)
+        _store(home).add("openai", model="gpt-x", credential=SECRET)
     assert refused.value.code == "ai_keychain_unavailable"
     assert unsafe.writes == []
     assert not _connections_file(home).exists()
@@ -335,11 +347,11 @@ def test_plain_http_remote_endpoint_is_refused_but_local_ollama_is_allowed(home)
     assert added["connection"]["base_url"] == "http://localhost:11434/v1"
     assert transport.requests[0]["url"] == "http://localhost:11434/v1/chat/completions"
     assert "authorization" not in transport.requests[0]["headers"]
-    assert transport.requests[0]["body"]["max_tokens"] == 64
+    assert transport.requests[0]["body"]["max_tokens"] == 512
 
 
-def test_a_tampered_metadata_file_cannot_point_a_connection_at_plain_http(home, fresh_keyring):
-    store = ConnectionStore(home)
+def test_a_hand_edited_metadata_file_cannot_point_a_connection_at_plain_http(home, fresh_keyring):
+    store = _store(home)
     conn = store.add("custom_openai", model="m", credential=SECRET, base_url="https://gateway.example/v1")
     path = _connections_file(home)
     record = json.loads(path.read_text())
@@ -357,7 +369,7 @@ def test_a_tampered_metadata_file_cannot_point_a_connection_at_plain_http(home, 
 
 def test_a_fixed_provider_endpoint_cannot_be_overridden(home, fresh_keyring):
     with pytest.raises(ConnectionRefused) as refused:
-        ConnectionStore(home).add("anthropic", model="m", credential=SECRET, base_url="https://proxy.example")
+        _store(home).add("anthropic", model="m", credential=SECRET, base_url="https://proxy.example")
     assert refused.value.code == "ai_endpoint_fixed"
     assert fresh_keyring._store == {}
 
@@ -381,7 +393,7 @@ def test_probe_marks_a_model_without_tool_calls_chat_only(home):
     assert transport.get_requests == []
     request = transport.requests[0]
     assert request["url"] == "http://127.0.0.1:8080/v1/messages"
-    assert request["body"]["max_tokens"] == 64
+    assert request["body"]["max_tokens"] == 512
     assert [t["name"] for t in request["body"]["tools"]] == ["ping"]
     assert "x-api-key" not in request["headers"]
 
@@ -399,7 +411,7 @@ def test_probe_marks_a_model_without_tool_calls_chat_only(home):
 
 
 def test_probe_lists_models_best_effort_and_only_a_ping_call_counts(home, fresh_keyring):
-    store = ConnectionStore(home)
+    store = _store(home)
     conn = store.add("openrouter", model="some/model", credential=SECRET)
     assert conn.capability == "unprobed"
 
@@ -417,7 +429,7 @@ def test_probe_lists_models_best_effort_and_only_a_ping_call_counts(home, fresh_
 
 
 def test_only_the_openai_preset_uses_max_completion_tokens(home, fresh_keyring):
-    store = ConnectionStore(home)
+    store = _store(home)
     for preset in PRESETS.values():
         if preset.format != "openai_compatible":
             continue
@@ -427,7 +439,7 @@ def test_only_the_openai_preset_uses_max_completion_tokens(home, fresh_keyring):
         assert probe(conn, store.adapter(conn, transport)).capability == "tools"
         body = transport.requests[0]["body"]
         expected = "max_completion_tokens" if preset.id == "openai" else "max_tokens"
-        assert body.get(expected) == 64, preset.id
+        assert body.get(expected) == 512, preset.id
         assert set(body) & {"max_tokens", "max_completion_tokens"} == {expected}, preset.id
 
 
@@ -470,15 +482,15 @@ def test_removing_a_connection_deletes_its_keychain_entry(home, fresh_keyring):
     listed = client.json("GET", "/api/v1/ai/connections")
     assert [c["id"] for c in listed["connections"]] == [second_id]
     assert listed["active"] is None
-    assert ConnectionStore(home).active() is None
-    assert ConnectionStore(home).credential(first_id) is None
+    assert _store(home).active() is None
+    assert _store(home).credential(first_id) is None
 
     status, raw = client.call("DELETE", f"/api/v1/ai/connections/{first_id}")
     assert status == 404, raw
 
 
 def test_a_keychain_failure_keeps_the_keyed_connection_but_never_blocks_a_keyless_one(home, fresh_keyring, monkeypatch):
-    store = ConnectionStore(home)
+    store = _store(home)
     keyed = store.add("openai", model="gpt-x", credential=SECRET)
     keyless = store.add("custom_openai", model="llama3", credential=None, base_url="http://localhost:11434/v1")
 
@@ -504,7 +516,7 @@ def test_a_keychain_failure_keeps_the_keyed_connection_but_never_blocks_a_keyles
 
 
 def test_activate_switches_the_active_connection(home, fresh_keyring):
-    store = ConnectionStore(home)
+    store = _store(home)
     a = store.add("deepseek", model="chat", credential=SECRET)
     b = store.add("gemini", model="gemini-x", credential=SECRET)
     assert store.active() is None
@@ -521,7 +533,7 @@ def test_activate_switches_the_active_connection(home, fresh_keyring):
 
 
 def test_disclosure_names_the_provider_host(home, fresh_keyring):
-    store = ConnectionStore(home)
+    store = _store(home)
     anthropic = store.add("anthropic", model="claude-x", credential=SECRET)
     assert egress_disclosure(anthropic) == (
         "Your conversation with Krell and the Krellbot data she reads are sent to Anthropic "
@@ -582,7 +594,7 @@ def test_routes_are_session_and_csrf_gated(home):
             status, _raw = client.call(method, path)
             assert status == 404, (method, path, status)
     with pytest.raises(ConnectionRefused):
-        ConnectionStore(home).credential("../../etc")
+        _store(home).credential("../../etc")
 
 
 def test_the_connections_file_is_never_overwritten_when_unreadable(home, fresh_keyring):
@@ -599,3 +611,210 @@ def test_the_connections_file_is_never_overwritten_when_unreadable(home, fresh_k
     assert path.read_text() == "{not json"
     assert fresh_keyring._store == {}
     assert client.call("GET", "/api/v1/ai/connections")[0] == 409
+
+
+# ---- endpoint parsing never crashes --------------------------------------------
+
+
+def test_malformed_or_parameterised_endpoints_are_refused_with_a_typed_code():
+    for url in (
+        "https://[gateway.example/v1",
+        "https://[sk-live-abc123]/v1",
+        "http://[::1]evil.example/v1",
+        "https://gateway.example:99999/v1",
+        "https://gw.example/v1;key=abc",
+        "https://a.example\\b.example/v1",
+    ):
+        with pytest.raises(ConnectionRefused) as refused:
+            validate_base_url(url)
+        assert refused.value.code == "ai_endpoint_invalid", url
+        assert "sk-live" not in refused.value.message
+
+
+def test_a_malformed_stored_endpoint_is_dropped_and_the_other_connections_still_work(home, fresh_keyring):
+    good = _store(home).add("openai", model="gpt-x", credential=SECRET)
+    path = _connections_file(home)
+    record = json.loads(path.read_text())
+    bad = {**record["connections"][0], "id": "fedcba9876543210", "preset": "custom_openai"}
+    bad["base_url"] = "https://[sk-live-abc123]/v1"
+    record["connections"].append(bad)
+    path.write_text(json.dumps(record))
+
+    assert [c.id for c in _store(home).list()] == [good.id]
+    client = Client(home, FakeAiTransport([oa_ping_call()], [MODELS]))
+    listed = client.json("GET", "/api/v1/ai/connections")
+    assert [c["id"] for c in listed["connections"]] == [good.id]
+    assert client.json("POST", f"/api/v1/ai/connections/{good.id}/probe")["probe"]["capability"] == "tools"
+    assert client.json("POST", f"/api/v1/ai/connections/{good.id}/activate")["active"] == good.id
+    status, raw = client.call("POST", "/api/v1/ai/connections/fedcba9876543210/probe")
+    assert status == 404 and b"sk-live" not in raw
+
+
+# ---- loopback traffic never goes through a proxy --------------------------------
+
+
+def test_a_loopback_endpoint_is_never_sent_through_an_environment_proxy(monkeypatch):
+    for name in ("no_proxy", "NO_PROXY", "all_proxy", "ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("http_proxy", "http://proxy.corp.example:3128")
+    monkeypatch.setenv("https_proxy", "http://proxy.corp.example:3128")
+    seen: list[tuple[str, str | None]] = []
+
+    def record(req):
+        seen.append((req.host, req.get_header("Authorization")))
+        raise urllib.error.URLError("recorded")
+
+    class RecordHttp(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return record(req)
+
+    class RecordHttps(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return record(req)
+
+    monkeypatch.setattr(ai_http, "_TEST_HANDLERS", (RecordHttp(), RecordHttps()))
+    transport = UrllibTransport()
+    headers = {"authorization": f"Bearer {SECRET}"}
+    for url, host in (
+        ("http://localhost:4000/v1", "localhost:4000"),
+        ("http://127.0.0.1:1234/v1", "127.0.0.1:1234"),
+        ("http://[::1]:8000/v1", "[::1]:8000"),
+        ("https://localhost:8443/v1", "localhost:8443"),
+    ):
+        seen.clear()
+        with pytest.raises(TransportError):
+            list(transport.post_stream(url + "/chat/completions", {}, headers, 1.0))
+        with pytest.raises(TransportError):
+            transport.get_json(url + "/models", headers, 1.0)
+        assert seen == [(host, f"Bearer {SECRET}")] * 2, url
+
+    # A remote https endpoint still honours the proxy (TLS is tunnelled end to end).
+    seen.clear()
+    with pytest.raises(TransportError):
+        transport.get_json("https://api.example.com/v1/models", headers, 1.0)
+    assert seen[0][0] == "proxy.corp.example:3128"
+
+
+# ---- keychain allow-list -------------------------------------------------------
+
+
+class _CryptFileKeyring:
+    """Stands in for keyrings.cryptfile: a backend outside the native allow-list."""
+
+    __module__ = "keyrings.cryptfile.cryptfile"
+
+
+def test_an_unrecognised_keychain_backend_is_refused_without_the_test_opt_in(home, fresh_keyring):
+    with pytest.raises(ConnectionRefused) as refused:
+        ConnectionStore(home).add("openai", model="gpt-x", credential=SECRET)
+    assert refused.value.code == "ai_keychain_unavailable"
+    assert fresh_keyring._store == {}
+    assert not _connections_file(home).exists()
+    assert not keychain_is_safe(_CryptFileKeyring())
+
+
+def test_a_chained_keychain_is_used_only_when_every_backend_in_it_is_allowed(home, fresh_keyring, monkeypatch):
+    from keyring.backends import SecretService, kwallet
+    from keyring.backends.chainer import ChainerBackend
+
+    chainer = ChainerBackend()
+    native = [SecretService.Keyring(), kwallet.DBusKeyring()]
+    monkeypatch.setattr(ChainerBackend, "backends", native)
+    assert keychain_is_safe(chainer)
+    monkeypatch.setattr(ChainerBackend, "backends", [native[0], _CryptFileKeyring()])
+    assert not keychain_is_safe(chainer)
+    monkeypatch.setattr(ChainerBackend, "backends", [])
+    assert not keychain_is_safe(chainer)
+
+    # End to end, with the fake first in the chain so a write never reaches a real keychain.
+    monkeypatch.setattr(keyring, "get_keyring", lambda: chainer)
+    monkeypatch.setattr(ChainerBackend, "backends", [fresh_keyring, _CryptFileKeyring()])
+    with pytest.raises(ConnectionRefused) as refused:
+        _store(home).add("openai", model="gpt-x", credential=SECRET)
+    assert refused.value.code == "ai_keychain_unavailable"
+    assert fresh_keyring._store == {}
+    assert not _connections_file(home).exists()
+
+    monkeypatch.setattr(ChainerBackend, "backends", [fresh_keyring, native[0]])
+    conn = _store(home).add("openai", model="gpt-x", credential=SECRET)
+    assert fresh_keyring._store == {(f"krellbot-ai:{conn.id}", "credential"): SECRET}
+
+
+def test_removing_a_keyless_connection_still_clears_a_stray_keychain_entry(home, fresh_keyring):
+    store = _store(home)
+    conn = store.add("custom_openai", model="llama3", credential=None, base_url="http://localhost:11434/v1")
+    fresh_keyring.set_password(f"krellbot-ai:{conn.id}", "credential", "stray")
+    store.remove(conn.id)
+    assert fresh_keyring._store == {}
+    assert store.list() == []
+
+
+def test_keychain_calls_run_off_the_event_loop_thread(home, fresh_keyring, monkeypatch):
+    threads: list[threading.Thread] = []
+    for name in ("get_password", "set_password", "delete_password"):
+        original = getattr(fresh_keyring, name)
+
+        def recording(*args, _original=original):
+            threads.append(threading.current_thread())
+            return _original(*args)
+
+        monkeypatch.setattr(fresh_keyring, name, recording)
+
+    client = Client(home, FakeAiTransport([oa_ping_call(), oa_ping_call()], [MODELS, MODELS]))
+    added = client.json("POST", "/api/v1/ai/connections", {"preset": "xai", "model": "grok", "credential": SECRET})
+    conn_id = added["connection"]["id"]
+    client.json("POST", f"/api/v1/ai/connections/{conn_id}/probe")
+    client.json("DELETE", f"/api/v1/ai/connections/{conn_id}")
+    assert threads, "the keychain was never touched"
+    assert threading.main_thread() not in threads
+
+
+# ---- refusal shape -------------------------------------------------------------
+
+
+def test_an_invalid_body_is_refused_in_the_ai_refusal_shape(home, fresh_keyring):
+    client = Client(home, FakeAiTransport())
+    payloads = (
+        ["openai"],
+        {"preset": 1, "model": "m"},
+        {"preset": "openai"},
+        {"preset": "openai", "model": "m", "label": 3},
+    )
+    for payload in payloads:
+        status, raw = client.call("POST", "/api/v1/ai/connections", payload)
+        assert status == 400, payload
+        body = json.loads(raw)
+        assert body["ok"] is False and body["effect"] == "refused" and body["code"] == "ai_body_invalid", body
+        assert body["schema_version"] == "1"
+        assert client.last_headers.get("cache-control") == "no-store"
+    status, raw = client.call("POST", "/api/v1/ai/connections")
+    assert status == 400 and json.loads(raw)["code"] == "ai_body_invalid"
+    assert not _connections_file(home).exists()
+
+
+# ---- a reply cut off by the token limit proves nothing -------------------------
+
+
+def test_a_reply_cut_off_by_the_token_limit_leaves_the_model_unprobed(home, fresh_keyring):
+    cut_openai = sse(
+        {"choices": [{"index": 0, "delta": {"content": "Let me think"}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]},
+        "[DONE]",
+    )
+    client = Client(home, FakeAiTransport([cut_openai], [MODELS]))
+    added = client.json("POST", "/api/v1/ai/connections", {"preset": "openai", "model": "o-x", "credential": SECRET})
+    assert added["probe"]["capability"] == "unprobed"
+    assert added["connection"]["capability"] == "unprobed"
+    assert added["probe"]["error"] is None
+    assert "limit" in added["probe"]["message"]
+
+    cut_anthropic = [
+        line.replace('"stop_reason": "end_turn"', '"stop_reason": "max_tokens"') for line in an_text_only()
+    ]
+    store = _store(home)
+    conn = store.add("anthropic", model="claude-x", credential=SECRET)
+    transport = FakeAiTransport([cut_anthropic, an_text_only()])
+    assert probe(conn, store.adapter(conn, transport)).capability == "unprobed"
+    assert transport.requests[0]["body"]["max_tokens"] == 512
+    # A normal stop without a tool call is still chat only.
+    assert probe(conn, store.adapter(conn, transport)).capability == "chat_only"
