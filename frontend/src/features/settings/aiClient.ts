@@ -9,6 +9,7 @@ import { getCsrf } from "../../session";
 
 export type AiCapability = "tools" | "chat_only" | "failed" | "unprobed";
 export type AiFormat = "openai_compatible" | "anthropic_messages";
+export type AiSignin = "none" | "openrouter" | "chatgpt";
 
 export type AiProvider = {
   id: string;
@@ -17,6 +18,8 @@ export type AiProvider = {
   baseUrl: string | null;
   custom: boolean;
   credential: "required" | "optional";
+  /** A browser sign-in the engine offers for this provider, besides a key. */
+  signin: AiSignin;
 };
 
 export type AiConnection = {
@@ -41,6 +44,16 @@ export type AiProbe = {
 export type AiRefusal = { ok: false; code: string; message: string };
 export type AiResult<T> = ({ ok: true } & T) | AiRefusal;
 
+export type AiSigninState = "waiting" | "connected" | "failed" | "expired";
+
+/** A sign-in's state. `failed` and `expired` carry the server's code and fixed message. */
+export type AiSigninStatus = {
+  state: AiSigninState;
+  connectionId: string | null;
+  code: string;
+  message: string;
+};
+
 export type AiAddInput = {
   preset: string;
   model: string;
@@ -63,6 +76,16 @@ function asCapability(value: unknown): AiCapability {
 
 function asFormat(value: unknown): AiFormat {
   return value === "anthropic_messages" ? value : "openai_compatible";
+}
+
+function asSignin(value: unknown): AiSignin {
+  return value === "openrouter" || value === "chatgpt" ? value : "none";
+}
+
+function asSigninState(value: unknown): AiSigninState {
+  return value === "waiting" || value === "connected" || value === "expired"
+    ? value
+    : "failed";
 }
 
 function toConnection(raw: unknown): AiConnection {
@@ -162,6 +185,7 @@ export async function listProviders(): Promise<
           baseUrl: typeof r.base_url === "string" ? r.base_url : null,
           custom: r.custom === true,
           credential: r.credential === "optional" ? "optional" : "required",
+          signin: asSignin(r.signin),
         };
       }),
     };
@@ -250,6 +274,50 @@ export async function probeConnection(
       ok: true,
       connection: toConnection(parsed.connection),
       probe: toProbe(parsed.probe),
+    };
+  } catch {
+    return networkFailure();
+  }
+}
+
+/**
+ * Start Sign in with OpenRouter. The engine opens a one-shot listener on
+ * 127.0.0.1 and returns the OpenRouter page to open; the key it receives
+ * goes straight to the keychain and never reaches the browser.
+ */
+export async function startOpenRouterSignin(
+  model: string,
+): Promise<AiResult<{ flowId: string; authorizeUrl: string }>> {
+  try {
+    const parsed = await send("POST", "/api/v1/ai/signin/openrouter", { model });
+    if (parsed.ok === false) return refusal(parsed);
+    return {
+      ok: true,
+      flowId: str(parsed.flow_id),
+      authorizeUrl: str(parsed.authorize_url),
+    };
+  } catch {
+    return networkFailure();
+  }
+}
+
+export async function getSigninStatus(
+  flowId: string,
+): Promise<AiResult<{ status: AiSigninStatus }>> {
+  try {
+    const parsed = await getJson(
+      `/api/v1/ai/signin/${encodeURIComponent(flowId)}`,
+    );
+    if (parsed.ok === false) return refusal(parsed);
+    return {
+      ok: true,
+      status: {
+        state: asSigninState(parsed.state),
+        connectionId:
+          typeof parsed.connection_id === "string" ? parsed.connection_id : null,
+        code: str(parsed.code),
+        message: str(parsed.detail, GENERIC_MESSAGE),
+      },
     };
   } catch {
     return networkFailure();

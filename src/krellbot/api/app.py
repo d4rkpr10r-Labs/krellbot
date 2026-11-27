@@ -114,6 +114,9 @@ class _AppState:
     alert_notifier: object = None  # Notifier; tests inject FakeNotifier
     referral_transport: object = None  # referral.Transport; tests inject FakeTransport
     ai_transport: object = None  # ai.http.HttpTransport; tests inject FakeAiTransport
+    # Sign-in flows (ai.oauth.SigninRegistry), in engine memory only; built on first use.
+    ai_signins: object = None
+    ai_signin_listener_factory: object = None  # ai.oauth.ListenerFactory; tests inject a socket-free fake
 
 
 def _app_now(s: _AppState) -> int:
@@ -1480,6 +1483,8 @@ def create_app(
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+            if state.ai_signins is not None:
+                state.ai_signins.close_all()  # type: ignore[attr-defined]
 
     app = FastAPI(
         title="krellbot.api",
@@ -4695,6 +4700,8 @@ def create_app(
         "ai_connection_not_found": 404,
         "ai_connections_unreadable": 409,
         "ai_keychain_unavailable": 503,
+        "ai_signin_not_found": 404,
+        "ai_signin_listener_failed": 503,
     }
 
     def _ai_json(body: dict, status_code: int = 200) -> Response:
@@ -4931,6 +4938,74 @@ def create_app(
         except ConnectionRefused as exc:
             return _ai_refused(exc)
         return await _ai_probe_and_record(s, store, conn)
+
+    # ---- Sign in with OpenRouter (M38.20) ------------------------------
+    #
+    # OAuth PKCE through a one-shot listener on 127.0.0.1 (a separate socket,
+    # not a route here). The browser polls the status route; the code, the
+    # verifier and the key never pass through these routes.
+
+    def _ai_signins(s: _AppState):
+        from krellbot.ai.oauth import SigninRegistry
+
+        if s.ai_signins is None:
+            s.ai_signins = SigninRegistry()
+        return s.ai_signins
+
+    @app.post("/api/v1/ai/signin/openrouter")
+    async def ai_signin_openrouter(request: Request) -> Response:
+        """Start a sign-in. Body: ``model``. Returns ``flow_id`` and the ``authorize_url`` to open."""
+
+        from krellbot.ai.connections import ConnectionRefused
+        from krellbot.ai.http import UrllibTransport
+        from krellbot.ai.oauth import SigninRefused, start_openrouter_signin
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            return _ai_invalid_body()
+        if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
+            return _ai_invalid_body()
+        try:
+            flow = await asyncio.to_thread(
+                start_openrouter_signin,
+                s.home,
+                model=payload["model"],
+                clock=lambda: _app_now(s),
+                transport=s.ai_transport or UrllibTransport(),
+                listener_factory=s.ai_signin_listener_factory,
+                registry=_ai_signins(s),
+                allow_injected_fake_backend=s.keys_allow_fake_backend,
+            )
+        except (ConnectionRefused, SigninRefused) as exc:
+            return _ai_refused(exc)
+        return _ai_json({"ok": True, "effect": "changed", "flow_id": flow.id, "authorize_url": flow.authorize_url})
+
+    @app.get("/api/v1/ai/signin/{flow_id}")
+    async def ai_signin_status(flow_id: str, request: Request) -> Response:
+        """A sign-in's state: ``waiting``, ``connected`` (with ``connection_id``), ``failed`` or ``expired``."""
+
+        from krellbot.ai.oauth import SigninRefused, signin_status
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+        try:
+            status = signin_status(flow_id, registry=_ai_signins(s))
+        except SigninRefused as exc:
+            return _ai_refused(exc)
+        body: dict = {"ok": True, "effect": "unchanged", "flow_id": flow_id, "state": status["state"]}
+        if "connection_id" in status:
+            body["connection_id"] = status["connection_id"]
+        if "code" in status:
+            body["code"] = status["code"]
+            body["detail"] = status["message"]
+        return _ai_json(body)
 
     # ---- operator user policy (M22.2) ---------------------------------
 
