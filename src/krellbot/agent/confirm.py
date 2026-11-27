@@ -22,6 +22,9 @@ human presses Confirm, and the same call with that ticket runs once.
 - Tickets live in engine memory only: a new ledger (a restarted engine)
   knows none. Ticket ids come from :func:`secrets.token_urlsafe` and are
   matched with :func:`hmac.compare_digest`.
+- The ticket id is for the human's confirm UI only and must never be
+  returned to the model; the Krell loop (M38.15) strips it from the
+  ``needs_confirm`` result before the model sees it.
 - Only Krell receives tickets. External MCP actors need no Krellbot-side
   confirm, because their own client asks the human before each call.
 
