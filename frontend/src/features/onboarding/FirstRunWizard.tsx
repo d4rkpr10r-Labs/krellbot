@@ -26,7 +26,8 @@
  * (`onConnected`) marks the wizard complete and calls `onMeetKrell`; the
  * App gate then opens the Krell tab, whose own start says the opening.
  * Cancel, Back, or an add that is not usable leaves the wizard state as it
- * was, and an answer that arrives after Back is ignored.
+ * was, and an answer that arrives after Back is ignored, even once Meet
+ * Krell is open again (each open has its own token).
  */
 import {
   useCallback,
@@ -571,12 +572,15 @@ export function FirstRunWizard({
   });
   const [assumptionsPhase, setAssumptionsPhase] =
     useState<WizardAssumptionsPhase>({ kind: "loading" });
-  // Meet Krell's connect frame on the welcome step. Never persisted, so
-  // Cancel or Back leaves the wizard exactly as it was.
-  const [meetKrell, setMeetKrell] = useState(false);
+  // Meet Krell's connect frame on the welcome step: the open's token, or
+  // null when closed. Never persisted, so Cancel or Back leaves the wizard
+  // exactly as it was.
+  const [meetKrellGen, setMeetKrellGen] = useState<number | null>(null);
   const [meetKrellError, setMeetKrellError] = useState<string | null>(null);
-  // Read by the connect answer, which can arrive after Back.
-  const meetKrellOpen = useRef(false);
+  // Every open and close takes a new token. A connect answer counts only
+  // while its own open is the current one, so one that arrives after Back
+  // (even after Meet Krell is opened again) is ignored.
+  const meetKrellOpenGen = useRef(0);
   const inFlight = useRef(false);
   const stepPrompt = useRef<HTMLParagraphElement>(null);
   const session = useRef(sessionReady);
@@ -615,7 +619,7 @@ export function FirstRunWizard({
 
   useEffect(() => {
     if (visible) stepPrompt.current?.focus({ preventScroll: true });
-  }, [activeStep.id, visible, meetKrell]);
+  }, [activeStep.id, visible, meetKrellGen]);
 
   useEffect(() => {
     if (!visible) {
@@ -684,7 +688,9 @@ export function FirstRunWizard({
     return null;
   }
 
-  const connecting = meetKrell && activeStep.id === "welcome";
+  /** The open connect frame's token; the frame shows on the welcome step only. */
+  const connectGen = activeStep.id === "welcome" ? meetKrellGen : null;
+  const connecting = connectGen !== null;
   const showSkip =
     !connecting && (state.status === "active" || activeStep.id !== "welcome");
   const visual = WIZARD_STEP_VISUALS[activeStep.id];
@@ -765,21 +771,24 @@ export function FirstRunWizard({
       if (!(await requireSession("meet"))) {
         return;
       }
-      meetKrellOpen.current = true;
-      setMeetKrell(true);
+      meetKrellOpenGen.current += 1;
+      setMeetKrellGen(meetKrellOpenGen.current);
     } finally {
       inFlight.current = false;
     }
   }
 
   function closeMeetKrell(): void {
-    meetKrellOpen.current = false;
-    setMeetKrell(false);
+    meetKrellOpenGen.current += 1;
+    setMeetKrellGen(null);
   }
 
-  /** A usable, active model: complete the wizard and hand over to Krell. */
-  function handleKrellConnected(): void {
-    if (!meetKrellOpen.current) {
+  /**
+   * A usable, active model from the open `gen`: complete the wizard and
+   * hand over to Krell. An answer from an earlier open changes nothing.
+   */
+  function handleKrellConnected(gen: number): void {
+    if (gen !== meetKrellOpenGen.current) {
       return;
     }
     closeMeetKrell();
@@ -1216,11 +1225,12 @@ export function FirstRunWizard({
             </section>
           ) : null}
 
-          {connecting ? (
+          {connectGen !== null ? (
             <>
               <div className="kbot-first-run-wizard__connect">
                 <AiConnectForm
-                  onConnected={handleKrellConnected}
+                  key={connectGen}
+                  onConnected={() => handleKrellConnected(connectGen)}
                   onCancel={closeMeetKrell}
                 />
               </div>

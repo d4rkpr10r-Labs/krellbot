@@ -373,6 +373,37 @@ describe("Connecting a model through Meet Krell", () => {
     expect(window.localStorage.getItem(FIRST_RUN_WIZARD_STORAGE_KEY)).toBeNull();
   });
 
+  it("ignores a connect from before Back even after Meet Krell is opened again", async () => {
+    let release = (): void => {};
+    const holdAdd = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const engine = fakeEngine({ holdAdd });
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
+    const onMeetKrell = vi.fn();
+    render(<FirstRunWizard onMeetKrell={onMeetKrell} />);
+
+    await connect();
+    fireEvent.click(screen.getByTestId("first-run-wizard-meet-krell-back"));
+    expectWelcome();
+    const reopened = await openMeetKrell();
+    release();
+
+    // The first add still finishes on the engine side and reports usable.
+    await waitFor(() => {
+      expect(engine.calls.some((call) => call.path.endsWith("/activate"))).toBe(true);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(onMeetKrell).not.toHaveBeenCalled();
+    expect(setItem).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem(FIRST_RUN_WIZARD_STORAGE_KEY)).toBeNull();
+    expect(window.location.search).toBe("");
+    // The reopened frame is still the one on screen, untouched.
+    expect(wizardStep()).toBe("welcome");
+    expect(screen.getByTestId("ai-connect-form")).toBe(reopened);
+    expect(within(reopened).queryByRole("status")).toBeNull();
+  });
+
   it("waits for the loopback session, and retries a failed one, before asking for providers", async () => {
     const engine = fakeEngine();
     const retrySession = vi

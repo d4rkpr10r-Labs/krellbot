@@ -216,6 +216,9 @@ test("cancelling Meet Krell returns to welcome with nothing persisted", async ({
   await meet.click();
   const form = page.getByTestId("ai-connect-form");
   await expect(form).toBeVisible();
+  // The form's fields stay inside its card at phone width.
+  const width = await form.evaluate((el) => ({ scroll: el.scrollWidth, client: el.clientWidth }));
+  expect(width.scroll, "connect form does not overflow at 390px").toBeLessThanOrEqual(width.client);
   await form.getByRole("button", { name: "Cancel", exact: true }).click();
 
   await expectWelcome(page);
