@@ -2,59 +2,46 @@
 
 Refusals never carry key material or live grant payloads. Messages are
 from a closed set so an agent transcript cannot leak secrets.
+
+The agent tool core (:mod:`krellbot.agent.core`) owns these codes so the MCP
+adapter and Krell refuse identically. This module re-exports them under
+their MCP names; ``McpToolRefusal`` is the core's ``ToolRefusal``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from krellbot.agent.core import (
+    CODE_INVALID_REQUEST,
+    CODE_KEY_READ_REFUSED,
+    CODE_LIVE_ARM_REFUSED,
+    CODE_POLICY_DENIED,
+    CODE_UNKNOWN_TOOL,
+    MESSAGE_KEY_READ_REFUSED,
+    MESSAGE_LIVE_ARM_REFUSED,
+    MESSAGE_UNKNOWN_TOOL,
+    SCHEMA_VERSION,
+    invalid_request,
+    key_read_refused,
+    live_arm_refused,
+    policy_denied,
+    unknown_tool,
+)
+from krellbot.agent.core import ToolRefusal as McpToolRefusal
 
-SCHEMA_VERSION = "1"
-
-CODE_LIVE_ARM_REFUSED = "mcp_live_arm_refused"
-CODE_KEY_READ_REFUSED = "mcp_key_read_refused"
-CODE_UNKNOWN_TOOL = "mcp_unknown_tool"
-CODE_INVALID_REQUEST = "mcp_invalid_request"
-CODE_POLICY_DENIED = "user_policy_denied"
-
-MESSAGE_LIVE_ARM_REFUSED = "MCP refuses live arm; paper-arm only"
-MESSAGE_KEY_READ_REFUSED = "MCP refuses key read or key export"
-MESSAGE_UNKNOWN_TOOL = "MCP tool is not in the allowlist"
-
-
-@dataclass(frozen=True)
-class McpToolRefusal:
-    """Closed refusal returned by the MCP adapter (never raised as opaque text)."""
-
-    code: str
-    message: str
-    tool: str
-
-    def to_dict(self) -> dict:
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "ok": False,
-            "effect": "refused",
-            "code": self.code,
-            "message": self.message,
-            "tool": self.tool,
-        }
-
-
-def live_arm_refused(tool: str) -> McpToolRefusal:
-    return McpToolRefusal(CODE_LIVE_ARM_REFUSED, MESSAGE_LIVE_ARM_REFUSED, tool)
-
-
-def key_read_refused(tool: str) -> McpToolRefusal:
-    return McpToolRefusal(CODE_KEY_READ_REFUSED, MESSAGE_KEY_READ_REFUSED, tool)
-
-
-def unknown_tool(tool: str) -> McpToolRefusal:
-    return McpToolRefusal(CODE_UNKNOWN_TOOL, MESSAGE_UNKNOWN_TOOL, tool)
-
-
-def invalid_request(tool: str, message: str) -> McpToolRefusal:
-    return McpToolRefusal(CODE_INVALID_REQUEST, message, tool)
-
-
-def policy_denied(tool: str, message: str) -> McpToolRefusal:
-    return McpToolRefusal(CODE_POLICY_DENIED, message, tool)
+__all__ = [
+    "CODE_INVALID_REQUEST",
+    "CODE_KEY_READ_REFUSED",
+    "CODE_LIVE_ARM_REFUSED",
+    "CODE_POLICY_DENIED",
+    "CODE_UNKNOWN_TOOL",
+    "MESSAGE_KEY_READ_REFUSED",
+    "MESSAGE_LIVE_ARM_REFUSED",
+    "MESSAGE_UNKNOWN_TOOL",
+    "SCHEMA_VERSION",
+    "McpToolRefusal",
+    "invalid_request",
+    "key_read_refused",
+    "live_arm_refused",
+    "policy_denied",
+    "unknown_tool",
+]
