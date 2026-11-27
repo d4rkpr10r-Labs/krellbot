@@ -274,6 +274,8 @@ def test_close_position_is_not_an_agent_tool(home): ...  # "mcp_unknown_tool" fo
 
 ### Task M38.7: Confirm tickets
 
+Depends on M38.3 (`AgentLimits`) and M38.5 (`CostEstimate`, `estimate.estimate`).
+
 **Files:**
 - Create: `src/krellbot/agent/confirm.py`
 - Modify: `src/krellbot/agent/core.py` (the confirm step)
