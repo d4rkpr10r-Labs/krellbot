@@ -1,0 +1,104 @@
+/*
+ * Agent activity — Signal (KRELL-SIGNAL-20261010). Dense log table scoped
+ * under `.kbot-ops__agent-activity`; codes use IBM Plex Mono.
+ */
+
+.kbot-ops__agent-activity {
+  font-family: var(--font-ui, "Manrope", system-ui, sans-serif);
+  color: var(--text, #e9f0f5);
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.kbot-ops__agent-activity-helper,
+.kbot-ops__agent-activity-muted {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted, #abc4d8);
+}
+
+.kbot-ops__agent-activity-error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--caution, #cc9689);
+}
+
+.kbot-ops__agent-activity-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.kbot-ops__agent-activity-filters label {
+  display: grid;
+  gap: 2px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--muted, #abc4d8);
+}
+
+.kbot-ops__agent-activity-filters select {
+  font: inherit;
+  font-size: 12px;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text, #e9f0f5);
+  background: var(--surface, #14222e);
+  border: 1px solid var(--line, #22465d);
+  border-radius: 6px;
+  padding: 3px 6px;
+}
+
+.kbot-ops__agent-activity-filters select:focus-visible,
+.kbot-ops__agent-activity-table a:focus-visible {
+  outline: 2px solid var(--seafoam, #a8d8d1);
+  outline-offset: 2px;
+}
+
+.kbot-ops__agent-activity-scroll {
+  overflow: auto;
+  max-height: 360px;
+}
+
+.kbot-ops__agent-activity-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.kbot-ops__agent-activity-table th,
+.kbot-ops__agent-activity-table td {
+  padding: 4px 8px;
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--line, #22465d);
+}
+
+.kbot-ops__agent-activity-table th {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--muted, #abc4d8);
+}
+
+.kbot-ops__agent-activity-code {
+  font-family: var(--font-mono, "IBM Plex Mono", ui-monospace, monospace);
+  font-size: 11.5px;
+}
+
+.kbot-ops__agent-activity-table a {
+  color: var(--seafoam, #a8d8d1);
+}
+
+.kbot-ops__agent-outcome--refused,
+.kbot-ops__agent-outcome--error {
+  color: var(--caution, #cc9689);
+}
+
+.kbot-ops__agent-outcome--ok {
+  color: var(--sage, #b3dda8);
+}
