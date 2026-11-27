@@ -10,13 +10,23 @@ entries that still match the on-disk config. An entry counts while
 ``armed_at_ts``. A disarm, or a human re-arm of the same pair (a new
 ``armed_at_ts``), drops it out. Human arms are never recorded.
 
+Writers serialize on an exclusive lock on ``<home>/.agent-arms.lock``
+(:func:`registry_lock`), so two processes cannot lose each other's entry,
+and :func:`claim_agent_arm` re-counts and records under that one lock, so
+two agent arms that both passed an earlier count cannot both be kept.
+
 A registry file that exists but cannot be read raises
 :class:`AgentArmRegistryUnreadable`, so the limit fails closed.
 """
 
 from __future__ import annotations
 
+import errno
 import json
+import os
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from krellbot.agent.actors import Actor
@@ -24,6 +34,7 @@ from krellbot.config import Config, find_armed, load_config
 from krellbot.paths import atomic_write
 
 REGISTRY_FILENAME = "agent-arms.json"
+LOCK_FILENAME = ".agent-arms.lock"
 REGISTRY_SCHEMA_VERSION = "1"
 
 
@@ -31,9 +42,68 @@ class AgentArmRegistryUnreadable(ValueError):
     """``agent-arms.json`` exists but is not a well-formed registry."""
 
 
+class AgentArmRegistryBusy(TimeoutError):
+    """Another writer held the registry lock past the deadline."""
+
+
 def registry_path(home: Path) -> Path:
     """Return the path to the agent arm registry."""
     return Path(home) / REGISTRY_FILENAME
+
+
+@contextmanager
+def registry_lock(home: Path, *, timeout: float = 5.0) -> Iterator[bool]:
+    """Hold the exclusive registry lock; yields False if it was not acquired in time.
+
+    The same flock-with-deadline pattern as ``config._paper_command_transaction``,
+    on its own lock file. The lock file's identity stays stable across
+    handoffs, and kernel locks release on process exit.
+    """
+    home = Path(home)
+    home.mkdir(parents=True, exist_ok=True)
+    fd = os.open(home / LOCK_FILENAME, os.O_RDWR | os.O_CREAT, 0o600)
+    acquired = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            def acquire() -> None:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+            def release() -> None:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            def acquire() -> None:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            def release() -> None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                acquire()
+                acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    yield False
+                    return
+                time.sleep(min(0.05, remaining))
+        yield True
+    finally:
+        try:
+            if acquired:
+                release()
+        finally:
+            os.close(fd)
 
 
 def _entry(row: object) -> dict | None:
@@ -85,11 +155,7 @@ def _is_running(entry: dict, config: Config) -> bool:
     return armed is not None and armed.mode == "paper" and armed.armed_at_ts == entry["armed_at_ts"]
 
 
-def running_agent_arms(home: Path) -> list[dict]:
-    """Agent arms still running: recorded entries the live config still holds.
-
-    Raises :class:`AgentArmRegistryUnreadable` when the registry is unreadable.
-    """
+def _running(home: Path) -> list[dict]:
     entries = _read(home)
     if not entries:
         return []
@@ -97,7 +163,15 @@ def running_agent_arms(home: Path) -> list[dict]:
     return [entry for entry in entries if _is_running(entry, config)]
 
 
-def record_agent_arm(
+def running_agent_arms(home: Path) -> list[dict]:
+    """Agent arms still running: recorded entries the live config still holds.
+
+    Raises :class:`AgentArmRegistryUnreadable` when the registry is unreadable.
+    """
+    return _running(home)
+
+
+def _record_locked(
     home: Path,
     *,
     venue: str,
@@ -106,13 +180,6 @@ def record_agent_arm(
     armed_at_ts: int,
     revision_id: str | None,
 ) -> None:
-    """Record a successful agent paper arm.
-
-    Entries that no longer match the config, and any older entry for the same
-    venue and pair, are dropped, so the file stays as small as the set of
-    running arms. Raises :class:`AgentArmRegistryUnreadable` (an unreadable
-    registry is never overwritten) or ``OSError`` when the write fails.
-    """
     config = load_config(home)
     kept = [
         entry
@@ -133,11 +200,63 @@ def record_agent_arm(
     atomic_write(registry_path(home), encoded, mode=0o600)
 
 
+def record_agent_arm(
+    home: Path,
+    *,
+    venue: str,
+    pair: str,
+    actor: Actor,
+    armed_at_ts: int,
+    revision_id: str | None,
+) -> None:
+    """Record a successful agent paper arm, under the registry lock.
+
+    Entries that no longer match the config, and any older entry for the same
+    venue and pair, are dropped, so the file stays as small as the set of
+    running arms. Raises :class:`AgentArmRegistryUnreadable` (an unreadable
+    registry is never overwritten), :class:`AgentArmRegistryBusy`, or
+    ``OSError`` when the write fails.
+    """
+    with registry_lock(home) as acquired:
+        if not acquired:
+            raise AgentArmRegistryBusy("agent arm registry is busy")
+        _record_locked(home, venue=venue, pair=pair, actor=actor, armed_at_ts=armed_at_ts, revision_id=revision_id)
+
+
+def claim_agent_arm(
+    home: Path,
+    *,
+    venue: str,
+    pair: str,
+    actor: Actor,
+    armed_at_ts: int,
+    revision_id: str | None,
+    max_agent_arms: int,
+) -> bool:
+    """Count the other running agent arms and record this one, under one lock.
+
+    Returns False, recording nothing, when the other running agent arms
+    already reach ``max_agent_arms``. Raises like :func:`record_agent_arm`.
+    """
+    with registry_lock(home) as acquired:
+        if not acquired:
+            raise AgentArmRegistryBusy("agent arm registry is busy")
+        others = [e for e in _running(home) if not (e["venue"] == venue and e["pair"] == pair)]
+        if len(others) >= max_agent_arms:
+            return False
+        _record_locked(home, venue=venue, pair=pair, actor=actor, armed_at_ts=armed_at_ts, revision_id=revision_id)
+        return True
+
+
 __all__ = [
+    "LOCK_FILENAME",
     "REGISTRY_FILENAME",
     "REGISTRY_SCHEMA_VERSION",
+    "AgentArmRegistryBusy",
     "AgentArmRegistryUnreadable",
+    "claim_agent_arm",
     "record_agent_arm",
+    "registry_lock",
     "registry_path",
     "running_agent_arms",
 ]

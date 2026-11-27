@@ -5,7 +5,9 @@ file loads the safe defaults; a malformed file locks agents out. The agent
 tool core enforces the limits for Krell and external MCP agents alike, and
 journals every limit refusal as a ``user_policy`` refused row. Agent arms are
 counted from ``agent-arms.json`` against the live config, so human arms never
-count and disarmed or re-armed pairs drop out.
+count and disarmed or re-armed pairs drop out. After an arm, the stored
+record is checked again and counted under a lock; anything that fails then
+disarms the arm, or says plainly that it may still be running.
 """
 
 from __future__ import annotations
@@ -13,6 +15,8 @@ from __future__ import annotations
 import json
 import os
 import stat
+import threading
+import time
 from contextlib import contextmanager
 from decimal import Decimal
 from itertools import count
@@ -31,6 +35,8 @@ from krellbot.application.paper import PaperService
 from krellbot.journal import read_records_lenient
 from krellbot.mcp import McpTools
 from krellbot.mcp.errors import (
+    CODE_AGENT_ARM_CLEANUP_FAILED,
+    CODE_AGENT_ARM_UNVERIFIED,
     CODE_AGENT_CHANGE_NOT_ALLOWED,
     CODE_AGENT_LIMIT_BALANCE,
     CODE_AGENT_LIMIT_DAILY_LOSS_REQUIRED,
@@ -289,7 +295,52 @@ def test_policy_put_round_trips_v2_and_old_v1_put_still_works(home: Path):
     assert user_policy.policy_path(home).read_bytes() == before
 
 
+def test_agent_limit_decimals_round_trip_without_exponents(home: Path):
+    payload = _v2(max_paper_balance="10000.50", max_risk_cap_pct="0.0000001")
+    assert user_policy.save_policy(home, payload).ok is True
+    assert json.loads(user_policy.policy_path(home).read_text(encoding="utf-8")) == payload
+    loaded = user_policy.load_policy(home)
+    assert user_policy.check(home, user_policy.ACTION_PAPER_ARM).ok is True
+    assert loaded.agents.max_paper_balance == Decimal("10000.50")
+    assert loaded.agents.max_risk_cap_pct == Decimal("0.0000001")
+    assert loaded.to_dict() == payload
+
+    # Saving the loaded policy back is a byte-identical no-op.
+    before = user_policy.policy_path(home).read_bytes()
+    assert user_policy.save_policy(home, loaded).code == user_policy.CODE_OK
+    assert user_policy.policy_path(home).read_bytes() == before
+
+    # Refusal messages show the operator's value the same plain way.
+    refused = _agent_arm(home, _pack(home))
+    assert refused["code"] == CODE_AGENT_LIMIT_RISK_CAP
+    assert "0.0000001%" in refused["message"]
+
+
 # ---- paper-arm limits ----------------------------------------------------
+
+
+def test_a_policy_flip_between_reads_cannot_skip_the_agent_limits(home: Path, monkeypatch: pytest.MonkeyPatch):
+    deny = {"schema_version": "1", "allow_paper_arm": False, "allow_live": False, "allow_key_export": False}
+    _write_policy(home, deny)
+    real_load = user_policy._load
+    flipped: list[bool] = []
+
+    def read_then_operator_reenables(policy_home: Path):
+        loaded = real_load(policy_home)
+        if not flipped:
+            flipped.append(True)
+            _write_policy(home, {**deny, "allow_paper_arm": True})
+        return loaded
+
+    monkeypatch.setattr(user_policy, "_load", read_then_operator_reenables)
+    # 25% cap and no daily loss limit: any agent-limit check would refuse it.
+    result = _agent_arm(home, _pack(home, cap=25), loss=None)
+    assert result["ok"] is False
+    assert result["code"] == user_policy.CODE_POLICY_DENIED
+    assert result["action"] == user_policy.ACTION_PAPER_ARM
+    assert result["message"] == user_policy.MESSAGE_DENY_PAPER_ARM
+    assert not kb_config.config_path(home).exists()
+    assert [r["code"] for r in _refused_rows(home)] == [user_policy.CODE_POLICY_DENIED]
 
 
 def test_agent_paper_arm_over_balance_is_refused_and_journaled(home: Path):
@@ -530,14 +581,153 @@ def test_failure_applying_the_daily_loss_limit_leaves_nothing_armed(home: Path, 
     assert arm_registry.running_agent_arms(home) == []
 
 
-def test_agent_arm_is_rolled_back_when_it_cannot_be_counted(home: Path, monkeypatch: pytest.MonkeyPatch):
+def test_rollback_of_a_failed_agent_arm_keeps_a_concurrent_human_arm(home: Path, monkeypatch: pytest.MonkeyPatch):
+    def human_arms_meanwhile_then_the_limit_fails(*_args, **_kwargs):
+        _human_arm(home, _pack(home, pair="SOLUSD", cap=25, pack_id="human-solusd"))
+        return False
+
+    monkeypatch.setattr(paper_app, "_apply_loss_limit_to_new_arm", human_arms_meanwhile_then_the_limit_fails)
+    result = _agent_arm(home, _pack(home))
+    assert result["code"] == paper_app.CODE_LOSS_LIMIT_NOT_APPLIED
+    assert "rolled back" in result["message"]
+    # Only the agent's own record (kraken SUIUSD) was removed.
+    assert [a.pair for a in _armed(home)] == ["SOLUSD"]
+
+
+# ---- after the arm: the stored record is the authority -------------------
+
+
+def test_the_stored_arm_is_checked_against_the_limits_after_the_arm(home: Path, monkeypatch: pytest.MonkeyPatch):
+    # The pre-check reads a 1% cap, but the pack that is armed carries 25%
+    # (as if the pack file changed between the check and the arm).
+    monkeypatch.setattr("krellbot.agent.core.arm_terms", lambda _path, _venue: ("SUIUSD", Decimal(1)))
+    result = _agent_arm(home, _pack(home, cap=25))
+    _assert_limit_refusal(result, CODE_AGENT_LIMIT_RISK_CAP)
+    assert "was disarmed" in result["message"]
+    assert _armed(home) == []
+    assert arm_registry.running_agent_arms(home) == []
+    assert [r["code"] for r in _refused_rows(home)] == [CODE_AGENT_LIMIT_RISK_CAP]
+
+
+def test_an_arm_whose_new_record_cannot_be_found_is_never_counted_or_disarmed(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _write_policy(home, _v2(require_daily_loss_limit=False))
+    _human_arm(home, _pack(home, pair="SUIUSD", cap=25, pack_id="human-suiusd"))
+    before = kb_config.config_path(home).read_bytes()
+
+    # The arm reports success but wrote nothing; the record on the agent's
+    # pair is the human's, from before the arm, so it is left alone.
+    monkeypatch.setattr("krellbot.run.arm_pack", lambda *_args, **_kwargs: 0)
+    result = _agent_arm(home, _pack(home), loss=None)
+    _assert_limit_refusal(result, CODE_AGENT_ARM_UNVERIFIED)
+    assert "nothing was disarmed" in result["message"]
+    assert kb_config.config_path(home).read_bytes() == before
+    assert arm_registry.running_agent_arms(home) == []
+
+
+def test_failure_after_an_agent_arm_disarms_it_or_says_it_may_still_run(home: Path, monkeypatch: pytest.MonkeyPatch):
     def registry_write_fails(*_args, **_kwargs):
         raise OSError("read-only home")
 
     monkeypatch.setattr(arm_registry, "atomic_write", registry_write_fails)
     result = _agent_arm(home, _pack(home))
-    _assert_limit_refusal(result, CODE_AGENT_LIMIT_MAX_ARMS)
+    _assert_limit_refusal(result, CODE_AGENT_ARM_UNVERIFIED)
+    assert "was disarmed" in result["message"]
     assert _armed(home) == []
+
+    # The disarm raises: the arm may still be running, and the refusal says
+    # so, names it, and never claims it was disarmed.
+    def disarm_raises(_self, **_kwargs):
+        raise OSError("config is read-only")
+
+    monkeypatch.setattr(PaperService, "disarm", disarm_raises)
+    result = _agent_arm(home, _pack(home, pair="BTCUSD"))
+    _assert_limit_refusal(result, CODE_AGENT_ARM_CLEANUP_FAILED)
+    assert "kraken BTCUSD may still be running" in result["message"]
+    assert "was disarmed" not in result["message"]
+    assert [a.pair for a in _armed(home)] == ["BTCUSD"]
+
+    # A disarm that is refused is a failed cleanup too.
+    def disarm_refused(_self, *, venue, pair, correlation_id=""):
+        return paper_app.CommandResultV1(
+            schema_version="1",
+            correlation_id=correlation_id,
+            code=paper_app.CODE_STORED_MODE_NOT_PAPER,
+            ok=False,
+            message="refused",
+            effect="refused",
+            revision_before=None,
+            revision_after=None,
+        )
+
+    monkeypatch.setattr(PaperService, "disarm", disarm_refused)
+    result = _agent_arm(home, _pack(home, pair="ETHUSD"))
+    _assert_limit_refusal(result, CODE_AGENT_ARM_CLEANUP_FAILED)
+    assert "kraken ETHUSD may still be running" in result["message"]
+    assert sorted(a.pair for a in _armed(home)) == ["BTCUSD", "ETHUSD"]
+    assert [r["code"] for r in _refused_rows(home)] == [
+        CODE_AGENT_ARM_UNVERIFIED,
+        CODE_AGENT_ARM_CLEANUP_FAILED,
+        CODE_AGENT_ARM_CLEANUP_FAILED,
+    ]
+
+
+def test_two_agent_arms_that_both_passed_the_count_cannot_exceed_the_limit(home: Path, monkeypatch: pytest.MonkeyPatch):
+    _write_policy(home, _v2(max_agent_arms=1))
+    real_arm = PaperService.arm
+    racing: list[dict] = []
+
+    def arm_while_another_agent_arms(self, *args, **kwargs):
+        # This arm already passed its pre-check (0 of 1 running). Before it
+        # writes, a second agent passes the same pre-check and arms first.
+        if not racing:
+            racing.append({})
+            racing[0] = _agent_arm(home, _pack(home, pair="BTCUSD"), actor=KRELL)
+        return real_arm(self, *args, **kwargs)
+
+    monkeypatch.setattr(PaperService, "arm", arm_while_another_agent_arms)
+    late = _agent_arm(home, _pack(home, pair="SUIUSD"))
+    assert racing[0]["ok"] is True
+    _assert_limit_refusal(late, CODE_AGENT_LIMIT_MAX_ARMS)
+    assert "was disarmed" in late["message"]
+    assert [a.pair for a in _armed(home)] == ["BTCUSD"]
+    assert [(r["pair"], r["actor"]) for r in arm_registry.running_agent_arms(home)] == [("BTCUSD", "krell")]
+
+
+def test_concurrent_agent_arm_records_are_not_lost(home: Path, monkeypatch: pytest.MonkeyPatch):
+    _human_arm(home, _pack(home, pair="SUIUSD"))
+    _human_arm(home, _pack(home, pair="BTCUSD"))
+    real_read = arm_registry._read
+
+    def slow_read(registry_home: Path) -> list[dict]:
+        rows = real_read(registry_home)
+        time.sleep(0.2)  # widen the gap between a writer's read and its write
+        return rows
+
+    monkeypatch.setattr(arm_registry, "_read", slow_read)
+    errors: list[BaseException] = []
+
+    def record(armed: kb_config.ArmedPack) -> None:
+        try:
+            arm_registry.record_agent_arm(
+                home,
+                venue=armed.venue,
+                pair=armed.pair,
+                actor=MCP,
+                armed_at_ts=armed.armed_at_ts,
+                revision_id=None,
+            )
+        except BaseException as exc:  # noqa: BLE001 — surfaced by the assertion below.
+            errors.append(exc)
+
+    writers = [threading.Thread(target=record, args=(armed,)) for armed in _armed(home)]
+    for writer in writers:
+        writer.start()
+    for writer in writers:
+        writer.join()
+    assert errors == []
+    assert sorted(r["pair"] for r in arm_registry.running_agent_arms(home)) == ["BTCUSD", "SUIUSD"]
 
 
 # ---- change tools (M38.6 registers them) ---------------------------------

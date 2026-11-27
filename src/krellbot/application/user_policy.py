@@ -73,6 +73,11 @@ _DENY_MESSAGES: dict[str, str] = {
 }
 
 
+def plain_decimal(value: Decimal) -> str:
+    """A Decimal as a plain decimal string, with no exponent (``0.0000001``, ``10000.50``)."""
+    return format(value, "f")
+
+
 @dataclass(frozen=True)
 class AgentLimits:
     """Hard limits the operator sets on every agent (schema "2" ``agents``).
@@ -101,12 +106,17 @@ class AgentLimits:
     token_budget_per_month: int
 
     def to_dict(self) -> dict[str, object]:
-        """The on-disk form: Decimals as strings, ``None`` as null."""
+        """The on-disk form: Decimals as plain strings, ``None`` as null.
+
+        Decimals are written with ``format(value, "f")``, never ``str``, so a
+        value such as ``0.0000001`` is not written as ``1E-7``, which the
+        loader would reject.
+        """
         return {
             "allowed_venues": None if self.allowed_venues is None else list(self.allowed_venues),
             "allowed_pairs": None if self.allowed_pairs is None else list(self.allowed_pairs),
-            "max_paper_balance": str(self.max_paper_balance),
-            "max_risk_cap_pct": str(self.max_risk_cap_pct),
+            "max_paper_balance": plain_decimal(self.max_paper_balance),
+            "max_risk_cap_pct": plain_decimal(self.max_risk_cap_pct),
             "require_daily_loss_limit": self.require_daily_loss_limit,
             "max_agent_arms": self.max_agent_arms,
             "krell_allow_pause_resume": self.krell_allow_pause_resume,
@@ -598,6 +608,7 @@ __all__ = [
     "check",
     "ensure_allowed",
     "load_policy",
+    "plain_decimal",
     "policy_path",
     "save_policy",
 ]

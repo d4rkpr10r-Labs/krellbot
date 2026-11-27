@@ -1071,41 +1071,57 @@ def valid_daily_loss_limit(pct: object) -> bool:
     return isinstance(pct, Decimal) and pct.is_finite() and Decimal(0) < pct <= Decimal(100)
 
 
-def _new_arms(config: kb_config.Config, *, venue: str, before: set[tuple[str, str]]) -> list[kb_config.ArmedPack]:
-    return [a for a in config.armed if a.venue == venue and (a.venue, a.pair) not in before]
+def _new_arm(
+    config: kb_config.Config, *, venue: str, pair: str, before: set[tuple[str, str]]
+) -> kb_config.ArmedPack | None:
+    """The record this arm added: the one on its resolved venue and pair, absent before.
+
+    Never any other record, so a human's arm on another pair is never touched.
+    """
+    armed = kb_config.find_armed(config, venue, pair) if pair else None
+    if armed is None or (armed.venue, armed.pair) in before:
+        return None
+    return armed
 
 
-def _apply_loss_limit_to_new_arm(home: Path, *, venue: str, before: set[tuple[str, str]], pct: Decimal) -> bool:
-    """Set ``pct`` on the one arm ``run.arm_pack`` just added; False when it cannot.
+def _apply_loss_limit_to_new_arm(
+    home: Path, *, venue: str, pair: str, before: set[tuple[str, str]], pct: Decimal
+) -> bool:
+    """Set ``pct`` on the arm ``run.arm_pack`` just added; False when it cannot.
 
     The caller holds the paper command lock, so this makes the same checks as
     ``config.set_daily_loss_limit`` (a paper record with a positive starting
     cash) without taking the lock again.
     """
     config = kb_config.load_config(home)
-    new = _new_arms(config, venue=venue, before=before)
-    if len(new) != 1 or new[0].mode != "paper":
+    armed = _new_arm(config, venue=venue, pair=pair, before=before)
+    if armed is None or armed.mode != "paper":
         return False
-    cash = new[0].starting_cash
+    cash = armed.starting_cash
     if cash is None or not cash.is_finite() or cash <= 0:
         return False
-    new[0].daily_loss_limit_pct = pct
+    armed.daily_loss_limit_pct = pct
     kb_config.save_config(home, config)
     return True
 
 
-def _drop_new_arms(home: Path, *, venue: str, before: set[tuple[str, str]], existed: bool) -> None:
-    """Roll back the arm(s) added on ``venue`` since ``before``.
+def _drop_new_arm(home: Path, *, venue: str, pair: str, before: set[tuple[str, str]], existed: bool) -> bool:
+    """Roll back the arm this call added on ``venue`` ``pair``; False when it is not there.
 
-    A config file that did not exist before the arm is removed again when
-    nothing else is in it, so the rollback leaves the bytes as they were.
+    Only that record is removed. A config file that did not exist before the
+    arm is removed again when nothing else is in it, so the rollback leaves
+    the bytes as they were.
     """
     config = kb_config.load_config(home)
-    config.armed = [a for a in config.armed if a.venue != venue or (a.venue, a.pair) in before]
+    armed = _new_arm(config, venue=venue, pair=pair, before=before)
+    if armed is None:
+        return False
+    config.armed = [a for a in config.armed if a is not armed]
     if not existed and not config.armed and not config.live_first_armed:
         kb_config.config_path(home).unlink(missing_ok=True)
-        return
+        return True
     kb_config.save_config(home, config)
+    return True
 
 
 def _classify_invalid_input(pack_path: Path, venue: str) -> tuple[str, str]:
@@ -1290,6 +1306,7 @@ class PaperService:
         else:
             limited = self._arm_with_loss_limit(
                 arm_pack,
+                pack_path=pack_path,
                 venue=venue,
                 pct=daily_loss_limit_pct,
                 correlation_id=correlation_id,
@@ -1371,6 +1388,7 @@ class PaperService:
         self,
         arm_pack: Callable[[], int],
         *,
+        pack_path: Path,
         venue: str,
         pct: Decimal,
         correlation_id: str,
@@ -1380,8 +1398,9 @@ class PaperService:
 
         No stop, pause, resume or limit command can land between the two
         writes. ``run.arm_pack`` writes the record itself, so the limit is a
-        second write; if it cannot be made, the new arm is removed again and
-        a refusal is returned. Returns ``arm_pack``'s code otherwise.
+        second write; if it cannot be made, the new arm (only the record on
+        this pack's venue and pair) is removed again and a refusal is
+        returned. Returns ``arm_pack``'s code otherwise.
         """
         with kb_config._paper_command_transaction(self._home) as acquired:
             if not acquired:
@@ -1391,24 +1410,30 @@ class PaperService:
                     correlation_id,
                     rev_before,
                 )
+            pair = _resolve_pair(pack_path, venue)
             existed = kb_config.config_path(self._home).exists()
             before = {(a.venue, a.pair) for a in kb_config.load_config(self._home).armed}
             rc = arm_pack()
             if rc != 0:
                 return rc
             try:
-                applied = _apply_loss_limit_to_new_arm(self._home, venue=venue, before=before, pct=pct)
+                applied = _apply_loss_limit_to_new_arm(self._home, venue=venue, pair=pair, before=before, pct=pct)
             except OSError:
                 applied = False
             if applied:
                 return rc
-            _drop_new_arms(self._home, venue=venue, before=before, existed=existed)
+            removed = _drop_new_arm(self._home, venue=venue, pair=pair, before=before, existed=existed)
+        message = (
+            "the daily loss limit could not be set, so the arm was rolled back"
+            if removed
+            else "the daily loss limit could not be set and the new arm could not be found to roll it back"
+        )
         return CommandResultV1(
             schema_version=SCHEMA_VERSION,
             correlation_id=correlation_id,
             code=CODE_LOSS_LIMIT_NOT_APPLIED,
             ok=False,
-            message="the daily loss limit could not be set, so the arm was rolled back",
+            message=message,
             effect="refused",
             revision_before=rev_before,
             revision_after=_revision(self._home),

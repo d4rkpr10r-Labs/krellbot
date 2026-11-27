@@ -11,6 +11,8 @@ their MCP names; ``McpToolRefusal`` is the core's ``ToolRefusal``.
 from __future__ import annotations
 
 from krellbot.agent.core import (
+    CODE_AGENT_ARM_CLEANUP_FAILED,
+    CODE_AGENT_ARM_UNVERIFIED,
     CODE_AGENT_CHANGE_NOT_ALLOWED,
     CODE_AGENT_LIMIT_BALANCE,
     CODE_AGENT_LIMIT_DAILY_LOSS_REQUIRED,
@@ -36,6 +38,8 @@ from krellbot.agent.core import (
 from krellbot.agent.core import ToolRefusal as McpToolRefusal
 
 __all__ = [
+    "CODE_AGENT_ARM_CLEANUP_FAILED",
+    "CODE_AGENT_ARM_UNVERIFIED",
     "CODE_AGENT_CHANGE_NOT_ALLOWED",
     "CODE_AGENT_LIMIT_BALANCE",
     "CODE_AGENT_LIMIT_DAILY_LOSS_REQUIRED",
