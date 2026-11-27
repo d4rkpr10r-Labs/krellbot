@@ -24,7 +24,12 @@ result, and every call is audited:
    stored and counted in ``agent-arms.json`` under a lock
    (:mod:`krellbot.agent.arm_registry`); anything wrong undoes it, or says
    it may still be running (``agent_arm_*`` codes).
-5. Confirm tickets: :meth:`AgentToolCore._confirm_step` (M38.7 plugs in here).
+5. Confirm tickets: :meth:`AgentToolCore._confirm_step`. A Krell call whose
+   tool changes state or whose work is heavy (cost class or estimate) is
+   refused with ``needs_confirm`` and a single-use ticket bound to its exact
+   params (:mod:`krellbot.agent.confirm`); the same call with that ticket
+   runs once (``agent_confirm_*`` codes). A core without a ledger refuses
+   such Krell calls. External MCP actors never get tickets.
 6. The tool's handler.
 7. One ``kind=agent_action`` journal record (:mod:`krellbot.agent.audit`).
 
@@ -44,6 +49,8 @@ agents and tests already depend on them.
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import os
 import re
 import stat
@@ -58,6 +65,20 @@ from krellbot import sanitize
 from krellbot.agent import arm_registry, limits
 from krellbot.agent.actors import ACTOR_KINDS, Actor
 from krellbot.agent.audit import append_agent_record, is_secret_param_name
+from krellbot.agent.confirm import (
+    CODE_CONFIRM_MISMATCH,
+    CODE_CONFIRM_REQUIRED,
+    CODE_CONFIRM_UNKNOWN,
+    MESSAGE_CONFIRM_MISMATCH,
+    MESSAGE_CONFIRM_PARAMS,
+    MESSAGE_CONFIRM_UNAVAILABLE,
+    MESSAGE_CONFIRM_UNKNOWN,
+    MESSAGE_NEEDS_CONFIRM,
+    ConfirmLedger,
+    ConfirmParamsError,
+    ConfirmTicket,
+    confirm_limits,
+)
 from krellbot.agent.limits import (
     CODE_AGENT_ARM_CLEANUP_FAILED,
     CODE_AGENT_ARM_UNVERIFIED,
@@ -80,7 +101,6 @@ from krellbot.application.paper import (
     new_arms_of,
     parse_daily_loss_limit_pct,
 )
-from krellbot.application.research import ResearchRequest, ResearchService
 from krellbot.application.strategy import (
     DraftNotRunnable,
     RevisionNotFound,
@@ -343,8 +363,11 @@ class AgentToolCore:
 
     The five existing MCP verbs (read, draft, validate, backtest, paper_arm)
     are registered on construction; later tools are added with
-    :meth:`register`. ``confirm`` is the confirm-ticket ledger that M38.7
-    wires into :meth:`_confirm_step`; until then it is stored and unused.
+    :meth:`register` (``compare`` by
+    :func:`krellbot.agent.tools_research.register_research_tools`).
+    ``confirm`` is the engine's confirm-ticket ledger (:meth:`_confirm_step`),
+    built with the same clock. A core without one (``McpTools``) never issues
+    tickets and refuses Krell's change and heavy calls.
     """
 
     def __init__(
@@ -353,7 +376,7 @@ class AgentToolCore:
         *,
         clock: Callable[[], float] | None = None,
         fetch: Callable[..., Any] | None = None,
-        confirm: Any | None = None,
+        confirm: ConfirmLedger | None = None,
     ) -> None:
         self._home = Path(home)
         self._clock: Callable[[], float] = clock or time.time
@@ -385,6 +408,10 @@ class AgentToolCore:
         if not spec.actors or not set(spec.actors) <= ACTOR_KINDS:
             raise ValueError(f"unknown actor kind for {name!r}: {sorted(spec.actors)!r}")
         self._specs[name] = spec
+
+    def has(self, name: str) -> bool:
+        """True when a tool named exactly ``name`` is registered (for any actor)."""
+        return name in self._specs
 
     def specs(self, actor: Actor) -> list[ToolSpec]:
         """Tools offered to ``actor``, in registration order."""
@@ -497,14 +524,69 @@ class AgentToolCore:
         params: dict,
         confirm_token: str | None,
     ) -> tuple[dict | None, str | None]:
-        """Step 5: confirm tickets.
+        """Step 5: confirm tickets (:mod:`krellbot.agent.confirm`).
 
         Return ``(stop, ticket_id)``. A non-``None`` ``stop`` (a
-        ``needs_confirm`` or refusal result) ends the call; ``ticket_id``
-        names the consumed ticket for the audit record. M38.7 implements this
-        with ``self._confirm``; until then every call proceeds unticketed.
+        ``needs_confirm`` or refusal result) ends the call before the
+        handler; ``ticket_id`` names the consumed ticket for the audit record.
+
+        Only Krell is asked. A Krell call needs a human confirm when the
+        tool's effect is ``change`` or its work is heavy: its estimate
+        (:func:`krellbot.agent.estimate.estimate`) is heavy, or its cost
+        class is ``heavy`` (except ``backtest``, whose class is "heavy when
+        long" and whose estimate sizes the call). Then:
+
+        - no ledger on this core: refused, ``agent_confirm_required``, with
+          no ticket (fail closed);
+        - no token: the confirm card's limits are read, then a ticket is
+          issued (so a failing policy read leaves no ticket) and
+          ``needs_confirm`` returned. The ticket is bound to the params
+          exactly as the agent sent them (params with no plain-JSON form are
+          refused, ``mcp_invalid_request``) and, for ``paper_arm``, to the
+          sha256 of the pack bytes the policy step checked (``pack_sha256``);
+        - a token: the ledger spends it; ``agent_confirm_unknown`` or
+          ``agent_confirm_mismatch`` (another tool, other params, or a pack
+          file that now holds other bytes) refuse, ``ok`` lets the handler run.
+
+        Expiry follows this core's clock: ``now`` is passed to the ledger.
+        The policy step runs before this one on every call, so a ticketless
+        ``paper_arm`` was already checked (and its prepared arm is dropped
+        with this call's context), and a confirmed one is checked again; a
+        refusal there never presents the ticket, which stays live. External
+        MCP actors never get or spend tickets: their client asks the human
+        before each call.
         """
-        return None, None
+        if ctx.actor.kind != "krell":
+            return None, None
+        # These modules import this one, so they are imported here, at call time.
+        from krellbot.agent.estimate import estimate
+        from krellbot.agent.tools_research import TOOL_BACKTEST
+
+        cost = estimate(spec.name, params, home=ctx.home)
+        # A backtest's class is "heavy when long": its estimate measures this
+        # call (bars x packs; unknown size is heavy), so it decides. For every
+        # other tool a heavy cost class needs a confirm whatever the estimate.
+        heavy = cost.cost == "heavy" or (spec.cost == "heavy" and spec.name != TOOL_BACKTEST)
+        if spec.effect != "change" and not heavy:
+            return None, None
+        ledger = self._confirm
+        if ledger is None:
+            return ToolRefusal(CODE_CONFIRM_REQUIRED, MESSAGE_CONFIRM_UNAVAILABLE, spec.name).to_dict(), None
+        pack_sha256 = _prepared_pack_sha256(ctx)
+        if confirm_token is None:
+            # Read the limits first: a failing policy read must not leave a ticket behind.
+            agent_limits = confirm_limits(ctx.home, spec.name)
+            try:
+                ticket = ledger.issue(ctx.actor, spec.name, params, now=ctx.clock(), pack_sha256=pack_sha256)
+            except ConfirmParamsError:
+                return invalid_request(spec.name, MESSAGE_CONFIRM_PARAMS).to_dict(), None
+            return _needs_confirm(ticket, cost.to_dict(), agent_limits), None
+        verdict = ledger.consume(confirm_token, spec.name, params, now=ctx.clock(), pack_sha256=pack_sha256)
+        if verdict == "ok":
+            return None, confirm_token
+        if verdict == "mismatch":
+            return ToolRefusal(CODE_CONFIRM_MISMATCH, MESSAGE_CONFIRM_MISMATCH, spec.name).to_dict(), None
+        return ToolRefusal(CODE_CONFIRM_UNKNOWN, MESSAGE_CONFIRM_UNKNOWN, spec.name).to_dict(), None
 
     def _audit(
         self,
@@ -549,6 +631,39 @@ class AgentToolCore:
             )
         except Exception:  # noqa: BLE001 — call() never raises; the tool result stands without its record.
             return
+
+
+def _needs_confirm(ticket: ConfirmTicket, cost: dict, agent_limits: dict) -> dict:
+    """The ``needs_confirm`` result: what the confirm card shows, and the ticket to run it once."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "ok": False,
+        "effect": "needs_confirm",
+        "code": CODE_CONFIRM_REQUIRED,
+        "message": MESSAGE_NEEDS_CONFIRM,
+        "tool": ticket.tool,
+        "confirm": {
+            "ticket_id": ticket.id,
+            "tool": ticket.tool,
+            "params": copy.deepcopy(ticket.params),
+            "estimate": cost,
+            "limits": agent_limits,
+            "expires_at": ticket.expires_at,
+            "pack_sha256": ticket.pack_sha256,
+        },
+    }
+
+
+def _prepared_pack_sha256(ctx: ToolContext) -> str | None:
+    """The sha256 of the pack bytes this call's policy step checked and snapshotted, if it prepared an arm.
+
+    It is the content address of the snapshot ``paper_arm`` arms, so a ticket
+    bound to it is bound to the strategy, not to the path it was read from.
+    """
+    prepared = ctx.call_state.get(_PREPARED_ARM)
+    if isinstance(prepared, _ArmRequest):
+        return hashlib.sha256(prepared.pack_bytes).hexdigest()
+    return None
 
 
 def _venue_of(params: dict) -> str:
@@ -598,9 +713,9 @@ def _draft(ctx: ToolContext, params: dict) -> dict:
     service = StrategyDraftService(ctx.home, clock=ctx.clock)
     try:
         if parent_revision_id:
-            summary = service.edit(str(parent_revision_id), pack)
+            summary = service.edit(str(parent_revision_id), pack, origin=ctx.actor.label)
         else:
-            summary = service.create(pack)
+            summary = service.create(pack, origin=ctx.actor.label)
     except RevisionNotFound as exc:
         return invalid_request("draft", f"revision not found: {exc}").to_dict()
     except StrategyIdMismatch as exc:
@@ -634,41 +749,6 @@ def _validate(ctx: ToolContext, params: dict) -> dict:
     }
 
 
-def _backtest(ctx: ToolContext, params: dict) -> dict:
-    pack_path = params.get("pack_path")
-    dataset_csv = params.get("dataset_csv")
-    if pack_path is None:
-        return invalid_request("backtest", "backtest requires pack_path").to_dict()
-    request = ResearchRequest(
-        pack_path=Path(pack_path),
-        dataset_csv=Path(dataset_csv) if dataset_csv is not None else None,
-        venue=str(params.get("venue", "kraken")),
-        pair=params.get("pair"),
-        timeframe=params.get("timeframe"),
-        allow_gaps=bool(params.get("allow_gaps", False)),
-    )
-    # Offline by default: no fetch means refuse without network/keyring.
-    result = ResearchService(home=ctx.home, fetch=ctx.fetch).run(request)
-    if not result.ok:
-        refusal = result.refusal or {}
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "ok": False,
-            "effect": "refused",
-            "tool": "backtest",
-            "code": str(refusal.get("code") or "research_refused"),
-            "message": str(refusal.get("message") or "backtest refused"),
-        }
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "ok": True,
-        "effect": "unchanged",
-        "tool": "backtest",
-        "legacy_receipt": result.legacy_receipt,
-        "detail": result.detail,
-    }
-
-
 @dataclass(frozen=True)
 class _ArmRequest:
     """A ``paper_arm`` call resolved from one read of its pack's bytes.
@@ -695,20 +775,20 @@ MAX_PACK_BYTES = 1024 * 1024
 MESSAGE_PACK_UNREADABLE = "the pack must be a readable regular file of at most 1 MiB"
 
 
-def _read_pack_bytes(path: Path) -> bytes | None:
-    """Read an agent-named pack file, bounded; ``None`` when it is not acceptable.
+def read_regular_file_bounded(path: Path, max_bytes: int) -> bytes | None:
+    """Read an agent-named file, bounded; ``None`` when it is not acceptable.
 
-    Only a regular file (after following symlinks) of at most
-    :data:`MAX_PACK_BYTES` is read. The file is opened non-blocking and
-    checked again on the open descriptor, so a path swapped for a FIFO or a
-    device after the first check cannot block or flood the read, and at most
-    one byte more than the limit is ever read.
+    Only a regular file (after following symlinks) of at most ``max_bytes``
+    is read. The file is opened non-blocking and checked again on the open
+    descriptor, so a path swapped for a FIFO or a device after the first
+    check cannot block or flood the read, and at most one byte more than the
+    limit is ever read.
     """
     try:
         info = os.stat(path)
     except (OSError, ValueError):
         return None
-    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PACK_BYTES:
+    if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
         return None
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
     try:
@@ -717,12 +797,12 @@ def _read_pack_bytes(path: Path) -> bytes | None:
         return None
     try:
         opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_size > MAX_PACK_BYTES:
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size > max_bytes:
             return None
         chunks: list[bytes] = []
         total = 0
-        while total <= MAX_PACK_BYTES:
-            chunk = os.read(fd, MAX_PACK_BYTES + 1 - total)
+        while total <= max_bytes:
+            chunk = os.read(fd, max_bytes + 1 - total)
             if not chunk:
                 break
             chunks.append(chunk)
@@ -731,9 +811,14 @@ def _read_pack_bytes(path: Path) -> bytes | None:
         return None
     finally:
         os.close(fd)
-    if total > MAX_PACK_BYTES:
+    if total > max_bytes:
         return None
     return b"".join(chunks)
+
+
+def _read_pack_bytes(path: Path) -> bytes | None:
+    """Read an agent-named pack file of at most :data:`MAX_PACK_BYTES`, or ``None``."""
+    return read_regular_file_bounded(path, MAX_PACK_BYTES)
 
 
 def _arm_request(ctx: ToolContext, params: dict) -> _ArmRequest | dict:
@@ -1006,7 +1091,14 @@ def _paper_arm(ctx: ToolContext, params: dict) -> dict:
 
 
 def _builtin_specs() -> tuple[ToolSpec, ...]:
-    """The five existing MCP verbs. Schemas are built fresh per core."""
+    """The five existing MCP verbs. Schemas are built fresh per core.
+
+    ``backtest`` lives with the other research tools in
+    :mod:`krellbot.agent.tools_research`, which imports this module, so it is
+    imported here, when a core is built.
+    """
+    from krellbot.agent.tools_research import backtest_spec
+
     return (
         ToolSpec(
             name="read",
@@ -1049,28 +1141,7 @@ def _builtin_specs() -> tuple[ToolSpec, ...]:
             description="Lint a stored draft revision. A clean pack becomes validated and runnable on paper.",
             handler=_validate,
         ),
-        ToolSpec(
-            name="backtest",
-            effect="research",
-            cost="heavy",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "pack_path": {"type": "string"},
-                    "dataset_csv": {"type": "string", "description": "Local OHLCV CSV."},
-                    "venue": {"type": "string", "default": "kraken"},
-                    "pair": {"type": "string"},
-                    "timeframe": {"type": "string"},
-                    "allow_gaps": {"type": "boolean", "default": False},
-                },
-                "required": ["pack_path"],
-            },
-            labels=(LABEL_SIMULATED,),
-            description=(
-                "Backtest a pack offline against a local dataset. Results are simulated, not market performance."
-            ),
-            handler=_backtest,
-        ),
+        backtest_spec(),
         ToolSpec(
             name="paper_arm",
             effect="change",
@@ -1114,6 +1185,9 @@ __all__ = [
     "CODE_AGENT_LIMIT_PAIR",
     "CODE_AGENT_LIMIT_RISK_CAP",
     "CODE_AGENT_LIMIT_VENUE",
+    "CODE_CONFIRM_MISMATCH",
+    "CODE_CONFIRM_REQUIRED",
+    "CODE_CONFIRM_UNKNOWN",
     "CODE_INVALID_REQUEST",
     "CODE_KEY_READ_REFUSED",
     "CODE_LIVE_ARM_REFUSED",
@@ -1157,6 +1231,7 @@ __all__ = [
     "normalize_tool_name",
     "path_id_refusal",
     "policy_denied",
+    "read_regular_file_bounded",
     "secret_param_refused",
     "unknown_tool",
 ]
