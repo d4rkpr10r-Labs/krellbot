@@ -58,6 +58,7 @@ from krellbot.agent.confirm import CODE_CONFIRM_UNKNOWN, MESSAGE_CONFIRM_UNKNOWN
 from krellbot.agent.conversation_store import ConversationStore, Profile, StoredMessage, StoreError
 from krellbot.agent.core import SCHEMA_VERSION, AgentToolCore
 from krellbot.agent.persona import MODE_QUESTION, OPENING_LINE, system_prompt
+from krellbot.agent.tools_change import register_change_tools
 from krellbot.agent.tools_read import register_read_tools
 from krellbot.agent.tools_research import register_research_tools
 from krellbot.ai.connections import Connection, ConnectionRefused, ConnectionStore, provider_host
@@ -205,15 +206,14 @@ def build_krell_core(home: Path, *, clock: Callable[[], float], ledger: ConfirmL
     """Krell's agent tool core: built once per app, with the engine's confirm ledger on the same clock.
 
     The core passes ``now=`` from ``clock`` to the ledger, so ticket expiry
-    follows this clock. Registration is idempotent (``core.has``).
+    follows this clock. Registration is idempotent (``core.has``). The change
+    tools (pause, resume, disarm) act on paper strategies only: a live target
+    is refused before the confirm step, so Krell never shows a card for it.
     """
     core = AgentToolCore(home, clock=clock, confirm=ledger)
     register_read_tools(core)
     register_research_tools(core)
-    # ---- M38.6 hook ------------------------------------------------------
-    # When M38.6 (paper pause, resume and disarm for agents) merges, register
-    # its change tools here: ``register_change_tools(core)``. It is not on
-    # this branch's base yet, so it is not imported.
+    register_change_tools(core)
     return core
 
 
@@ -951,6 +951,7 @@ __all__ = [
     "CODE_STORE_UNAVAILABLE",
     "CODE_TOOLS_UNAVAILABLE",
     "CODE_TOOL_CAP",
+    "DECISIONS",
     "HIGHLIGHT_TOOL",
     "MAX_MESSAGE_CHARS",
     "MAX_PROFILE_ANSWER_CHARS",
@@ -958,6 +959,7 @@ __all__ = [
     "MAX_TICKET_ID_CHARS",
     "MAX_TOOL_CALLS_PER_TURN",
     "MESSAGES",
+    "MODES",
     "NOTE_AWAITING_HUMAN",
     "NOTE_CHAT_ONLY",
     "NOTE_OPENING_SHOWN",

@@ -17,9 +17,11 @@ socket). Every candle is synthetic and every paper arm is simulated.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import json
 import time
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -31,11 +33,13 @@ from krellbot.agent.confirm import CODE_CONFIRM_UNKNOWN
 from krellbot.agent.conversation_store import ConversationStore
 from krellbot.agent.core import CODE_SECRET_PARAM_REFUSED
 from krellbot.agent.persona import MODE_QUESTION, OPENING_LINE
+from krellbot.agent.tools_change import CODE_AGENT_LIVE_CHANGE_REFUSED
 from krellbot.ai.connections import ConnectionStore
 from krellbot.ai.disclosure import egress_disclosure
 from krellbot.ai.http import TransportError
 from krellbot.application import user_policy
 from krellbot.application.strategy import StrategyDraftService
+from krellbot.config import ArmedPack, Config, config_path, save_config
 from krellbot.journal import read_records_lenient
 from tests.fakes.fake_ai_transport import FakeAiTransport, sse
 from tests.test_ns06_api import TEST_PORT, _ascii_headers, _bootstrap_and_get_csrf, _build_app, asgi_call
@@ -579,6 +583,52 @@ def test_the_confirm_route_needs_a_real_ticket_and_decision_and_an_empty_one_is_
     model.then(reply_text("Armed."))
     client.stream("/api/v1/krell/confirm", {"ticket_id": ticket, "decision": "confirm"})
     assert _armed(home) == [("kraken", "SUIUSD", "paper")]
+
+
+def test_a_live_strategy_pause_is_refused_without_a_confirm_card(home, live_capable_release):
+    # live_capable_release only lets the fixture store a live record; Krell's tools still act on paper only.
+    _connect(home)
+    pack = home / "packs" / "live-btc.json"
+    pack.parent.mkdir(parents=True, exist_ok=True)
+    pack.write_text(json.dumps({"id": "live-btc", "markets": [{"venue": "kraken", "pair": "BTCUSD"}]}), "utf-8")
+    live = ArmedPack(
+        pack_path=str(pack),
+        pack_sha256=hashlib.sha256(pack.read_bytes()).hexdigest(),
+        pack_id="live-btc",
+        pack_version="1.0.0",
+        venue="kraken",
+        pair="BTCUSD",
+        cap=Decimal(2),
+        stop=Decimal(5),
+        mode="live",
+        starting_cash=Decimal(1000),
+        requires_license=False,
+        armed_at_ts=1_700_000_000,
+    )
+    save_config(home, Config(armed=[live]))
+    before = config_path(home).read_bytes()
+    market = {"venue": "kraken", "pair": "BTCUSD"}
+    model = ScriptedModel(
+        [reply_tools(("pause_entries", market)), reply_text("That strategy is live, so pausing it is yours to do.")]
+    )
+    client = Client(home, model)
+
+    events = client.stream("/api/v1/krell/messages", {"text": "Pause my BTC strategy."})
+
+    # No card: a human is never asked to confirm a change to a live strategy.
+    assert _of(events, "confirm_request") == []
+    [result] = _of(events, "tool_result")
+    assert (result["name"], result["result"]["effect"]) == ("pause_entries", "refused")
+    assert result["result"]["code"] == CODE_AGENT_LIVE_CHANGE_REFUSED
+    assert config_path(home).read_bytes() == before
+    # A refusal is not a card, so the turn goes on and Krell can explain it.
+    assert model.calls == 2
+    assert [(r["tool"], r["outcome"], r["code"], r["confirm_ticket"]) for r in _agent_rows(home)] == [
+        ("pause_entries", "refused", CODE_AGENT_LIVE_CHANGE_REFUSED, None)
+    ]
+    offered = {t["function"]["name"] for t in model.bodies[0]["tools"]}
+    assert {"pause_entries", "resume_entries", "disarm"} <= offered
+    assert "close_position" not in offered
 
 
 # ---- hard stops ------------------------------------------------------------------------
