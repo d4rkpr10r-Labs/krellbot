@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import threading
 import time
 import urllib.error
 from collections.abc import Callable
@@ -121,6 +122,13 @@ class _AppState:
     alert_notifier: object = None  # Notifier; tests inject FakeNotifier
     referral_transport: object = None  # referral.Transport; tests inject FakeTransport
     ai_transport: object = None  # ai.http.HttpTransport; tests inject FakeAiTransport
+    # Krell (M38.15), built once per app on first use: her agent tool core, the
+    # engine's confirm ledger (same clock), a () -> KrellLoop factory, and a lock
+    # so one Krell stream (or a clear) runs at a time on the shared conversation.
+    krell_core: object = None  # agent.core.AgentToolCore
+    krell_ledger: object = None  # agent.confirm.ConfirmLedger
+    krell_loop_factory: object = None  # Callable[[], agent.krell_loop.KrellLoop]
+    krell_lock: object = None  # threading.Lock
 
 
 def _app_now(s: _AppState) -> int:
@@ -5108,6 +5116,241 @@ def create_app(
         except ConnectionRefused as exc:
             return _ai_refused(exc)
         return await _ai_probe_and_record(s, store, conn)
+
+    # ---- Krell (M38.15) ---------------------------------------------------
+    #
+    # Krell's conversation loop runs in the engine (krellbot.agent.krell_loop)
+    # on the user's own model. The streaming routes are POSTs behind the full
+    # state-change gate (session, CSRF, loopback origin); the conversation GET
+    # needs the session. A confirm token reaches the agent tool core only from
+    # ``POST /api/v1/krell/confirm``: the human's button, never the model.
+    # Provider and tool calls run in a worker thread so a slow model cannot
+    # freeze the API.
+
+    _KRELL_SSE_HEADERS = {"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
+    _KRELL_END = object()
+
+    def _krell_factory(s: _AppState):
+        """Build Krell's core, ledger and loop factory once per app; return the factory."""
+
+        if s.krell_loop_factory is None:
+            from krellbot.agent.confirm import ConfirmLedger
+            from krellbot.agent.conversation_store import ConversationStore
+            from krellbot.agent.krell_loop import KrellLoop, build_krell_core
+
+            def clock() -> float:
+                # The app clock (tests inject one), read at call time; ledger and core share it.
+                return float(s.clock()) if s.clock is not None else time.time()
+
+            s.krell_ledger = ConfirmLedger(clock=clock)
+            s.krell_core = build_krell_core(s.home, clock=clock, ledger=s.krell_ledger)
+            s.krell_lock = threading.Lock()
+
+            def factory():
+                return KrellLoop(
+                    s.home,
+                    core=s.krell_core,
+                    store=ConversationStore(s.home, clock=clock),
+                    connections=_ai_store(s),
+                    clock=clock,
+                    transport=s.ai_transport,
+                    ledger=s.krell_ledger,
+                )
+
+            s.krell_loop_factory = factory
+        return s.krell_loop_factory
+
+    def _krell_json(body: dict, status_code: int = 200) -> Response:
+        return JSONResponse(
+            {"schema_version": SCHEMA_VERSION, **body},
+            status_code=status_code,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    def _krell_refused(code: str, status_code: int) -> Response:
+        from krellbot.agent.krell_loop import MESSAGES
+
+        return _krell_json({"ok": False, "effect": "refused", "code": code, "detail": MESSAGES[code]}, status_code)
+
+    def _krell_invalid_body() -> Response:
+        from krellbot.agent.krell_loop import CODE_BODY_INVALID
+
+        return _krell_refused(CODE_BODY_INVALID, 400)
+
+    async def _krell_body(request: Request) -> dict | None:
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _krell_sse(s: _AppState, open_events: Callable) -> Response:
+        """Stream one Krell generator as SSE frames (the ``_format_sse`` style of ``/api/v1/events``).
+
+        One worker thread owns the generator from first event to close, and
+        holds ``krell_lock`` while it runs: a second Krell stream meanwhile
+        gets ``krell_busy``. If the client goes away, the worker stops after
+        its current event and closes the generator.
+        """
+
+        from krellbot.agent.krell_loop import busy_events, internal_error_events
+
+        factory = _krell_factory(s)
+        lock = s.krell_lock
+
+        async def _emit():
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue = asyncio.Queue()
+            stop = threading.Event()
+
+            def push(item: object) -> None:
+                with contextlib.suppress(RuntimeError):  # the event loop is already closed
+                    loop.call_soon_threadsafe(queue.put_nowait, item)
+
+            def work() -> None:
+                try:
+                    if not lock.acquire(blocking=False):
+                        for event in busy_events():
+                            push(event)
+                        return
+                    try:
+                        events = open_events(factory())
+                        try:
+                            for event in events:
+                                push(event)
+                                if stop.is_set():
+                                    break
+                        finally:
+                            events.close()
+                    finally:
+                        lock.release()
+                except Exception:  # noqa: BLE001 — the stream still ends with a typed error and done.
+                    for event in internal_error_events():
+                        push(event)
+                finally:
+                    push(_KRELL_END)
+
+            worker = loop.run_in_executor(None, work)
+            try:
+                count = 0
+                while True:
+                    item = await queue.get()
+                    if item is _KRELL_END:
+                        break
+                    count += 1
+                    yield _format_sse(event_id=str(count), event_name=item["type"], data_payload=item)
+                await worker
+            finally:
+                stop.set()
+
+        return StreamingResponse(_emit(), media_type="text/event-stream", headers=_KRELL_SSE_HEADERS)
+
+    @app.get("/api/v1/krell/conversation")
+    async def krell_conversation(request: Request) -> Response:
+        """The stored conversation: ``{messages, profile, budget, connection, disclosure}``. No keychain read."""
+
+        from krellbot.agent.krell_loop import CODE_STORE_UNAVAILABLE
+        from krellbot.storage.database import StoreError
+
+        s = _state(request.app)
+        denied = _gate_get(request, s)
+        if denied is not None:
+            return denied
+        factory = _krell_factory(s)
+        try:
+            body = await asyncio.to_thread(lambda: factory().conversation())
+        except StoreError:
+            return _krell_refused(CODE_STORE_UNAVAILABLE, 503)
+        return _krell_json({"ok": True, "effect": "unchanged", **body})
+
+    @app.delete("/api/v1/krell/conversation")
+    async def krell_conversation_clear(request: Request) -> Response:
+        """Clear the conversation and every pending confirm ticket (usage rows stay for the month)."""
+
+        from krellbot.agent.krell_loop import CODE_BUSY, CODE_STORE_UNAVAILABLE
+        from krellbot.storage.database import StoreError
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        factory = _krell_factory(s)
+        lock = s.krell_lock
+        if not lock.acquire(blocking=False):
+            return _krell_refused(CODE_BUSY, 409)
+        try:
+            await asyncio.to_thread(lambda: factory().clear())
+        except StoreError:
+            return _krell_refused(CODE_STORE_UNAVAILABLE, 503)
+        finally:
+            lock.release()
+        return _krell_json({"ok": True, "effect": "changed"})
+
+    @app.post("/api/v1/krell/start")
+    async def krell_start(request: Request) -> Response:
+        """SSE: the egress disclosure and the opening, from the engine. No provider call."""
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        return _krell_sse(s, lambda krell: krell.start())
+
+    @app.post("/api/v1/krell/messages")
+    async def krell_messages(request: Request) -> Response:
+        """SSE: the person's message ``{text}``, then one Krell turn."""
+
+        from krellbot.agent.krell_loop import valid_message
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        payload = await _krell_body(request)
+        text = payload.get("text") if payload is not None else None
+        if not valid_message(text):
+            return _krell_invalid_body()
+        return _krell_sse(s, lambda krell: krell.send(text))
+
+    @app.post("/api/v1/krell/confirm")
+    async def krell_confirm(request: Request) -> Response:
+        """SSE: the person's Confirm or Not now ``{ticket_id, decision}`` on a confirm card.
+
+        The only route that hands a confirm token to the agent tool core. A
+        missing, empty or malformed ticket is refused here; it never becomes a
+        token (absent is ``None``, never ``""``).
+        """
+
+        from krellbot.agent.krell_loop import DECISIONS, token_or_none
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        payload = await _krell_body(request)
+        if payload is None:
+            return _krell_invalid_body()
+        token = token_or_none(payload.get("ticket_id"))
+        decision = payload.get("decision")
+        if token is None or decision not in DECISIONS:
+            return _krell_invalid_body()
+        return _krell_sse(s, lambda krell: krell.resolve_confirm(token, decision))
+
+    @app.post("/api/v1/krell/profile")
+    async def krell_profile(request: Request) -> Response:
+        """SSE: the person's mode ``{mode}`` (standard or advanced), then one Krell turn in that mode."""
+
+        from krellbot.agent.krell_loop import MODES
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        payload = await _krell_body(request)
+        mode = payload.get("mode") if payload is not None else None
+        if mode not in MODES:
+            return _krell_invalid_body()
+        return _krell_sse(s, lambda krell: krell.set_mode(mode))
 
     # ---- operator user policy (M22.2) ---------------------------------
 
