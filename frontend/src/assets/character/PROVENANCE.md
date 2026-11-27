@@ -28,6 +28,19 @@ are unchanged original staged bytes.
 Filename mapping stays stable for `data-wizard-visual` assertions.
 Full-size webp are the authoritative welcome and choose copies.
 
+## Krell conversation avatar (M38.16)
+
+Krell's avatar in the conversation is a downscaled face crop of the
+existing `krell_portrait.png`; nothing was regenerated or repainted.
+It was made with Pillow as
+`Image.open("krell_portrait.png").crop((185,110,485,410)).resize((160,160), Image.LANCZOS).save("krell-pfp-160.webp", "WEBP", quality=90)`.
+It appears only inside the Krell conversation, never on the Krell tab or
+the "Ask Krell" button.
+
+| File | Role | SHA256 |
+| --- | --- | --- |
+| `krell-pfp-160.webp` | Conversation avatar, face crop of `krell_portrait.png`, box 185,110,485,410 | `d39e3e540bfdaa5d31deea10f66bf43c99174374d25c789b5f601ba3e101301f` |
+
 ## Unchanged staged originals
 
 These two files were not regenerated. Hashes match the earlier staged

@@ -66,6 +66,7 @@ export function resolveSettingsSectionFromSearch(
 }
 
 const KNOWN_VIEWS: ReadonlySet<string> = new Set([
+  "krell",
   "home",
   "workstation",
   "strategies",

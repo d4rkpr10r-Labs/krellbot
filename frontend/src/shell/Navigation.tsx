@@ -2,6 +2,7 @@ import { useEffect, useId, useState, type JSX, type KeyboardEvent } from "react"
 import "./Navigation.signal.css";
 
 export type View =
+  | "krell"
   | "home"
   | "workstation"
   | "strategies"
@@ -14,8 +15,12 @@ export type View =
 
 type NavItem = { id: View; label: string };
 
-/** Primary strip — core destinations plus Settings. */
+/**
+ * Primary strip — Krell (M38.16) first, then core destinations plus
+ * Settings. Labels are text only: Krell's avatar never appears here.
+ */
 export const PRIMARY_VIEWS: ReadonlyArray<NavItem> = [
+  { id: "krell", label: "Krell" },
   { id: "home", label: "Workspace" },
   { id: "workstation", label: "Run" },
   { id: "strategies", label: "Strategies" },

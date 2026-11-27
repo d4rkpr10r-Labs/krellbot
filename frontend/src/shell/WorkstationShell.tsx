@@ -78,6 +78,9 @@ import { PacksView } from "../features/packs/PacksView";
 import { createPacksHttpClient } from "../features/packs/client";
 import type { PackLibraryClient, PacksClient } from "../features/packs/client";
 import { SettingsView } from "../features/settings/SettingsView";
+import { KrellConversationProvider } from "../features/krell/KrellConversationProvider";
+import { AskKrellButton, KrellSidePanel, useKrellSheet } from "../features/krell/KrellSidePanel";
+import { focusKrellComposer, KrellView } from "../features/krell/KrellView";
 import { ensureLoopbackSession } from "../loopbackSession";
 import {
   issueReconnectToken,
@@ -255,6 +258,31 @@ export function WorkstationShell({
     setOperationsRefreshKey((key) => key + 1);
     celebrateFirstPaperWin();
   }, [celebrateFirstPaperWin]);
+  /** M38.16: the Ask Krell side panel; the Krell tab shows the same conversation. */
+  const [krellPanelOpen, setKrellPanelOpen] = useState(false);
+  // As a phone sheet the panel is modal and everything behind it is inert.
+  const krellSheet = useKrellSheet();
+  const krellModal = krellPanelOpen && krellSheet;
+  const askKrellRef = useRef<HTMLButtonElement>(null);
+  /** Where focus goes once the panel has closed (and nothing is inert). */
+  const [krellFocus, setKrellFocus] = useState<"ask" | "composer" | null>(null);
+  useEffect(() => {
+    // The Krell tab already shows the conversation (any route: nav, palette, back).
+    if (active === "krell") {
+      setKrellPanelOpen(false);
+    }
+  }, [active]);
+  useEffect(() => {
+    if (krellFocus === null || krellPanelOpen) {
+      return;
+    }
+    if (krellFocus === "ask") {
+      askKrellRef.current?.focus();
+    } else {
+      focusKrellComposer();
+    }
+    setKrellFocus(null);
+  }, [krellFocus, krellPanelOpen]);
   const navigateTo = useCallback(
     (view: View, section?: SettingsSection): void => {
       setActiveState(view);
@@ -1238,9 +1266,13 @@ export function WorkstationShell({
     }
   }, [savedRevision, workingPack, client]);
 
-  return (
-    <div className="kbot-shell" data-testid="kbot-shell" data-bootstrap-done={bootstrapDone ? "1" : "0"}>
-      <header className="kbot-shell__header">
+  const shell = (
+    <div
+      className={"kbot-shell" + (krellPanelOpen ? " kbot-shell--krell-docked" : "")}
+      data-testid="kbot-shell"
+      data-bootstrap-done={bootstrapDone ? "1" : "0"}
+    >
+      <header className="kbot-shell__header" inert={krellModal || undefined}>
         <div className="kbot-shell__brandbar">
           <button
             type="button"
@@ -1263,6 +1295,18 @@ export function WorkstationShell({
               setOpenedResearchJob({ id, revisionKey: researchRevisionKey });
               setActive("research");
             }} />
+            <AskKrellButton
+              ref={askKrellRef}
+              open={krellPanelOpen}
+              onToggle={() => {
+                // On the Krell tab the conversation is already here.
+                if (active === "krell") {
+                  focusKrellComposer();
+                  return;
+                }
+                setKrellPanelOpen((open) => !open);
+              }}
+            />
             <button
               type="button"
               className="kbot-shell__palette-hint"
@@ -1279,7 +1323,8 @@ export function WorkstationShell({
           </div>
         </div>
       </header>
-      <main className="kbot-shell__main">
+      <main className="kbot-shell__main" inert={krellModal || undefined}>
+        {active === "krell" ? <KrellView /> : null}
         {active === "home" ? (
           <AppHome
             onNavigate={setActive}
@@ -1770,6 +1815,20 @@ export function WorkstationShell({
           </>
         ) : null}
       </main>
+      {krellPanelOpen ? (
+        <KrellSidePanel
+          modal={krellModal}
+          onClose={() => {
+            setKrellPanelOpen(false);
+            setKrellFocus("ask");
+          }}
+          onOpenTab={() => {
+            setKrellPanelOpen(false);
+            setKrellFocus("composer");
+            setActive("krell");
+          }}
+        />
+      ) : null}
       <CommandPalette
         open={paletteOpen}
         onClose={() => setPaletteOpen(false)}
@@ -1821,7 +1880,9 @@ export function WorkstationShell({
             researchDetachedRef.current,
           )
         : null}
-      {setupTour.status === "active" && typeof document !== "undefined"
+      {/* The tour (portaled outside the inert header and main) waits while the
+          Krell sheet is modal, and comes back when it closes. */}
+      {setupTour.status === "active" && !krellModal && typeof document !== "undefined"
         ? createPortal(
             <WorkspaceSetupTour
               stepId={setupTour.stepId}
@@ -1861,5 +1922,13 @@ export function WorkstationShell({
         }}
       />
     </div>
+  );
+
+  // One Krell conversation for the tab and the panel; nothing is read
+  // until one of them is first shown.
+  return (
+    <KrellConversationProvider surface={active === "krell" ? "tab" : krellPanelOpen ? "panel" : null}>
+      {shell}
+    </KrellConversationProvider>
   );
 }
