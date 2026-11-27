@@ -77,6 +77,21 @@ export type ResearchCosts = {
   };
 };
 
+/**
+ * The run identity read from `GET /api/v1/jobs/{id}/run`. `null` means the
+ * run never resolved that value (for example every input of the id); it is
+ * never a guessed zero.
+ */
+export type ResearchRunIdentity = {
+  /** Hex sha256 over the run's 13 canonical inputs. */
+  run_id: string | null;
+  /**
+   * Distinct packs tried for this strategy on this dataset, failed and
+   * cancelled runs included.
+   */
+  variants_tried: number | null;
+};
+
 export type ResearchClient = {
   submitRun(request: RunRequest): Promise<ResearchJobSummary>;
   cancelJob(jobId: string): Promise<void>;
@@ -87,9 +102,39 @@ export type ResearchClient = {
   getFills?(jobId: string): Promise<ResearchFills | null>;
   /** `null` when the job has no cost side-car (404) or it is malformed. */
   getCosts?(jobId: string): Promise<ResearchCosts | null>;
+  /** `null` when the job has no run record (404) or the body is malformed. */
+  getRun?(jobId: string): Promise<ResearchRunIdentity | null>;
 };
 
 const DECIMAL_TEXT = /^-?\d+(\.\d+)?$/;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+/**
+ * Validate a run-record body. A wrong-typed field makes the whole identity
+ * unavailable rather than showing an invented id or count.
+ */
+export function readResearchRunIdentity(raw: unknown): ResearchRunIdentity | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const obj = raw as Record<string, unknown>;
+  const run = obj.run;
+  if (run === null || typeof run !== "object" || Array.isArray(run)) {
+    return null;
+  }
+  const runId = (run as Record<string, unknown>).run_id;
+  if (runId !== null && !(typeof runId === "string" && SHA256_HEX.test(runId))) {
+    return null;
+  }
+  const variants = obj.variants_tried;
+  if (
+    variants !== null &&
+    !(typeof variants === "number" && Number.isSafeInteger(variants) && variants >= 0)
+  ) {
+    return null;
+  }
+  return { run_id: runId, variants_tried: variants };
+}
 
 function readFiniteNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -385,6 +430,12 @@ export function createHttpClient(): ResearchClient {
         `/api/v1/jobs/${encodeURIComponent(jobId)}/costs`,
       );
       return readResearchCosts(raw);
+    },
+    async getRun(jobId: string): Promise<ResearchRunIdentity | null> {
+      const raw = await getJson(
+        `/api/v1/jobs/${encodeURIComponent(jobId)}/run`,
+      );
+      return readResearchRunIdentity(raw);
     },
     async getResultDownload(jobId: string): Promise<Response> {
       const response = await fetch(

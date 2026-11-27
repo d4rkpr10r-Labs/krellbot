@@ -317,7 +317,7 @@ def test_fills_route_serves_the_side_car_and_leaves_the_stored_result_alone(home
     # The side-car is not a *.json file under research-jobs/.
     assert sorted(p.name for p in (home / "research-jobs").iterdir()) == [f"{job_id}.json"]
     persisted = json.loads((home / "research-jobs" / f"{job_id}.json").read_text(encoding="utf-8"))
-    assert set(persisted) == {"job", "result"}
+    assert set(persisted) == {"job", "result", "run"}
     assert set(persisted["result"]) == {"legacy_receipt", "trace"}
 
 
