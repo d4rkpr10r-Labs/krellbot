@@ -31,6 +31,7 @@ import errno
 import hashlib
 import json
 import os
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -54,9 +55,10 @@ def snapshot_dir(home: Path) -> Path:
 def snapshot_pack(home: Path, raw: bytes) -> Path:
     """Store ``raw`` as ``<home>/agent-packs/<sha256 of raw>.json`` and return its path.
 
-    The directory is 0700 and the file 0600, written atomically. A snapshot
-    that already holds exactly these bytes is never rewritten; one whose
-    bytes no longer match its name is replaced.
+    The directory is 0700 and the file 0600, written atomically through a
+    temp file unique to this call, so concurrent calls with the same bytes
+    never share one. A snapshot that already holds exactly these bytes is
+    never rewritten; one whose bytes no longer match its name is replaced.
     """
     digest = hashlib.sha256(raw).hexdigest()
     directory = snapshot_dir(home)
@@ -69,8 +71,34 @@ def snapshot_pack(home: Path, raw: bytes) -> Path:
             return path
     except FileNotFoundError:
         pass
-    atomic_write(path, raw, mode=0o600)
+    _write_unique_then_replace(path, raw)
     return path
+
+
+def _write_unique_then_replace(path: Path, raw: bytes) -> None:
+    """Write ``raw`` to a per-call temp file (0600) beside ``path``, then replace ``path``."""
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        try:
+            view = memoryview(raw)
+            while view:
+                view = view[os.write(fd, view) :]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if os.name != "nt":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    if os.name != "nt":
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
 
 class AgentArmRegistryUnreadable(ValueError):

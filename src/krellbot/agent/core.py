@@ -44,7 +44,9 @@ agents and tests already depend on them.
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -689,7 +691,49 @@ class _ArmRequest:
 _PREPARED_ARM = "paper_arm.prepared"
 
 MESSAGE_BAD_LOSS_LIMIT = "daily_loss_limit_pct must be a plain percent above 0 and at most 100, e.g. 5 or 2.5"
-MESSAGE_PACK_UNREADABLE = "the pack file cannot be read"
+MAX_PACK_BYTES = 1024 * 1024
+MESSAGE_PACK_UNREADABLE = "the pack must be a readable regular file of at most 1 MiB"
+
+
+def _read_pack_bytes(path: Path) -> bytes | None:
+    """Read an agent-named pack file, bounded; ``None`` when it is not acceptable.
+
+    Only a regular file (after following symlinks) of at most
+    :data:`MAX_PACK_BYTES` is read. The file is opened non-blocking and
+    checked again on the open descriptor, so a path swapped for a FIFO or a
+    device after the first check cannot block or flood the read, and at most
+    one byte more than the limit is ever read.
+    """
+    try:
+        info = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PACK_BYTES:
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags)
+    except (OSError, ValueError):
+        return None
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size > MAX_PACK_BYTES:
+            return None
+        chunks: list[bytes] = []
+        total = 0
+        while total <= MAX_PACK_BYTES:
+            chunk = os.read(fd, MAX_PACK_BYTES + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if total > MAX_PACK_BYTES:
+        return None
+    return b"".join(chunks)
 
 
 def _arm_request(ctx: ToolContext, params: dict) -> _ArmRequest | dict:
@@ -719,9 +763,8 @@ def _arm_request(ctx: ToolContext, params: dict) -> _ArmRequest | dict:
             "paper_arm",
             "paper_arm requires pack_path or revision_id",
         ).to_dict()
-    try:
-        pack_bytes = resolved_path.read_bytes()
-    except OSError:
+    pack_bytes = _read_pack_bytes(resolved_path)
+    if pack_bytes is None:
         return invalid_request("paper_arm", MESSAGE_PACK_UNREADABLE).to_dict()
 
     paper_balance = params.get("paper_balance")
@@ -864,26 +907,36 @@ def _settle_agent_arm(
 ) -> dict:
     """Settle an agent arm attempt and return the tool result.
 
-    This call's record is identified by identity only: on ``request.venue``,
-    a key not armed ``before`` the call, and ``pack_path`` equal to the
-    snapshot. A record with any other ``pack_path`` is never touched.
+    - A refusal (already armed, config busy, minimum not met, invalid pack,
+      kill switch, policy...) wrote nothing, so it is returned unchanged and
+      no record is touched. A record of the same snapshot can then only be
+      another call's arm of byte-identical pack bytes.
+    - Otherwise (success, an exception, or ``loss_limit_rollback_failed``),
+      this call's record is identified by identity only: on
+      ``request.venue``, a key not armed ``before`` the call, and
+      ``pack_path`` equal to the snapshot. A record with any other
+      ``pack_path`` is never touched.
 
-    - No record, and the arm was refused or failed before writing: the
-      refusal stands (a failure is re-raised as ``agent_tool_error``).
-    - The arm succeeded (or its rollback failed) but no record, or more than
-      one, matches: ``agent_arm_cleanup_failed`` (may still be running); any
-      matched records are counted.
-    - One record, and the arm failed or was refused after writing it: undone.
-    - One record and the arm succeeded: the stored record is checked and the
-      arm counted (:func:`limits.settle_agent_arm`); anything wrong undoes it.
+      - No record after an exception: nothing was written; the exception is
+        re-raised (``agent_tool_error``).
+      - No record after a success or a failed rollback, more than one, or an
+        unreadable config: ``agent_arm_cleanup_failed`` (may still be
+        running); any matched records are counted.
+      - One record after an exception or a failed rollback: undone.
+      - One record after a success: the stored record is checked and the arm
+        counted (:func:`limits.settle_agent_arm`); anything wrong undoes it.
     """
     ok = result is not None and result.ok
     rollback_failed = result is not None and result.code == CODE_LOSS_LIMIT_ROLLBACK_FAILED
+    if failure is None and not ok and not rollback_failed:
+        return _arm_result(result)
     try:
         mine = new_arms_of(load_config(ctx.home), venue=request.venue, pack_path=request.snapshot, before=before)
     except Exception:  # noqa: BLE001 — an unreadable config is reported below.
         mine = None
-    if mine is None or len(mine) > 1 or (not mine and (ok or rollback_failed)):
+    if mine == [] and failure is not None:
+        raise failure
+    if mine is None or len(mine) != 1:
         for armed in mine or []:
             _count_anyway(ctx, armed, request)
         return _journal_refusal(
@@ -894,14 +947,9 @@ def _settle_agent_arm(
                 "so it was not checked or disarmed and may still be running; check the armed list"
             ),
         )
-    if not mine:
-        if failure is not None:
-            raise failure
-        out = result.to_dict()
-        out["tool"] = "paper_arm"
-        return out
     armed = mine[0]
     if not ok:
+        # An exception or a failed rollback left this call's record behind.
         return _undo_agent_arm(ctx, paper, armed, request, (CODE_AGENT_ARM_UNVERIFIED, MESSAGE_ARM_FAILED_AFTER_WRITE))
     try:
         refusal = limits.settle_agent_arm(ctx.home, ctx.actor, armed, revision_id=request.revision_id)
@@ -914,6 +962,10 @@ def _settle_agent_arm(
         refusal = (CODE_AGENT_ARM_UNVERIFIED, MESSAGE_ARM_NOT_SETTLED)
     if refusal is not None:
         return _undo_agent_arm(ctx, paper, armed, request, refusal)
+    return _arm_result(result)
+
+
+def _arm_result(result: Any) -> dict:
     out = result.to_dict()
     out["tool"] = "paper_arm"
     return out
@@ -1075,10 +1127,12 @@ __all__ = [
     "LABEL_NOT_ADVICE",
     "LABEL_PAPER",
     "LABEL_SIMULATED",
+    "MAX_PACK_BYTES",
     "MESSAGE_BAD_PACK_ID",
     "MESSAGE_BAD_REVISION_ID",
     "MESSAGE_KEY_READ_REFUSED",
     "MESSAGE_LIVE_ARM_REFUSED",
+    "MESSAGE_PACK_UNREADABLE",
     "MESSAGE_SECRET_PARAM_REFUSED",
     "MESSAGE_TOOL_ERROR",
     "MESSAGE_UNKNOWN_TOOL",

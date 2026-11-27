@@ -29,7 +29,7 @@ from krellbot import config as kb_config
 from krellbot import run as kb_run
 from krellbot.agent import arm_registry
 from krellbot.agent.actors import KRELL, Actor
-from krellbot.agent.core import AgentToolCore, ToolSpec
+from krellbot.agent.core import MAX_PACK_BYTES, MESSAGE_PACK_UNREADABLE, AgentToolCore, ToolSpec
 from krellbot.api.app import CSRF_HEADER, SESSION_COOKIE
 from krellbot.application import paper as paper_app
 from krellbot.application import user_policy
@@ -683,6 +683,33 @@ def test_failure_after_an_agent_arm_disarms_it_or_says_it_may_still_run(home: Pa
     _assert_limit_refusal(_agent_arm(home, _pack(home, pair="SOLUSD")), CODE_AGENT_LIMIT_MAX_ARMS)
 
 
+def test_a_refused_twin_arm_never_undoes_the_other_calls_arm(home: Path, monkeypatch: pytest.MonkeyPatch):
+    # Two overlapping agent calls arm byte-identical packs, so they share a
+    # snapshot. The late call takes its "before" keys, then the twin arms
+    # in full; the late call's own arm is refused as already armed and
+    # wrote nothing, so it must not touch the twin's record.
+    pack = _pack(home)
+    real_arm = PaperService.arm
+    twin: list[dict] = []
+
+    def arm_while_a_twin_arms(self, *args, **kwargs):
+        if not twin:
+            twin.append({})
+            twin[0] = _agent_arm(home, pack, actor=KRELL)
+        return real_arm(self, *args, **kwargs)
+
+    monkeypatch.setattr(PaperService, "arm", arm_while_a_twin_arms)
+    late = _agent_arm(home, pack)
+    assert twin[0]["ok"] is True, twin[0]
+    assert late["ok"] is False
+    assert late["code"] == paper_app.CODE_ALREADY_ARMED
+    assert late["effect"] == "refused"
+    [armed] = _armed(home)
+    assert armed.pair == "SUIUSD"
+    assert [(r["pair"], r["actor"]) for r in arm_registry.running_agent_arms(home)] == [("SUIUSD", "krell")]
+    assert _refused_rows(home) == []
+
+
 def test_two_agent_arms_that_both_passed_the_count_cannot_exceed_the_limit(home: Path, monkeypatch: pytest.MonkeyPatch):
     _write_policy(home, _v2(max_agent_arms=1))
     real_arm = PaperService.arm
@@ -832,6 +859,58 @@ def test_agent_arms_arm_a_private_content_addressed_snapshot(home: Path):
     snapshot.write_bytes(b"{}")
     assert _agent_arm(home, pack)["ok"] is True
     assert snapshot.read_bytes() == raw
+
+
+def test_concurrent_snapshots_of_the_same_bytes_never_share_a_temp_file(home: Path, monkeypatch: pytest.MonkeyPatch):
+    raw = _pack(home).read_bytes()
+    target = arm_registry.snapshot_dir(home) / f"{_sha256(raw)}.json"
+    real_fsync = os.fsync
+    started: list[bool] = []
+    twin: list[Path] = []
+
+    def fsync_then_a_twin_snapshots(fd: int) -> None:
+        # The first writer has written its temp file; before it replaces the
+        # target, a second call snapshots the same bytes in full.
+        real_fsync(fd)
+        if not started:
+            started.append(True)
+            twin.append(arm_registry.snapshot_pack(home, raw))
+
+    monkeypatch.setattr(os, "fsync", fsync_then_a_twin_snapshots)
+    assert arm_registry.snapshot_pack(home, raw) == target
+    assert twin == [target]
+    assert target.read_bytes() == raw
+    assert [p.name for p in target.parent.iterdir()] == [target.name]
+    if os.name != "nt":
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_agent_pack_reads_are_bounded_to_a_regular_file_of_at_most_one_mib(home: Path):
+    pack = _pack(home)
+    raw = pack.read_bytes()
+    too_big = home / "too-big.json"
+    too_big.write_bytes(raw + b" " * (MAX_PACK_BYTES + 1 - len(raw)))
+    refused = [too_big, home, home / "missing.json"]
+    if os.name != "nt":
+        fifo = home / "pipe.json"
+        os.mkfifo(fifo)
+        refused.append(fifo)
+        if Path("/dev/zero").exists():
+            zero_link = home / "zero.json"
+            zero_link.symlink_to("/dev/zero")
+            refused.extend([Path("/dev/zero"), zero_link])
+    for path in refused:
+        result = _agent_arm(home, path)
+        assert result["ok"] is False, path
+        assert result["code"] == CODE_INVALID_REQUEST, path
+        assert result["message"] == MESSAGE_PACK_UNREADABLE, path
+    assert not kb_config.config_path(home).exists()
+    assert not arm_registry.snapshot_dir(home).exists()
+
+    # Exactly 1 MiB (the pack padded with trailing whitespace) is read and armed.
+    at_limit = home / "at-limit.json"
+    at_limit.write_bytes(raw + b" " * (MAX_PACK_BYTES - len(raw)))
+    assert _agent_arm(home, at_limit)["ok"] is True
 
 
 def test_an_agent_arm_of_a_catalog_pack_still_requires_a_license(home: Path):
