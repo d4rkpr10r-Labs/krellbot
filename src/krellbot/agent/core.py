@@ -50,6 +50,7 @@ agents and tests already depend on them.
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
 import re
 import stat
@@ -537,17 +538,23 @@ class AgentToolCore:
 
         - no ledger on this core: refused, ``agent_confirm_required``, with
           no ticket (fail closed);
-        - no token: ``needs_confirm`` with a new ticket bound to the params
+        - no token: the confirm card's limits are read, then a ticket is
+          issued (so a failing policy read leaves no ticket) and
+          ``needs_confirm`` returned. The ticket is bound to the params
           exactly as the agent sent them (params with no plain-JSON form are
-          refused, ``mcp_invalid_request``);
+          refused, ``mcp_invalid_request``) and, for ``paper_arm``, to the
+          sha256 of the pack bytes the policy step checked (``pack_sha256``);
         - a token: the ledger spends it; ``agent_confirm_unknown`` or
-          ``agent_confirm_mismatch`` refuse, ``ok`` lets the handler run.
+          ``agent_confirm_mismatch`` (another tool, other params, or a pack
+          file that now holds other bytes) refuse, ``ok`` lets the handler run.
 
+        Expiry follows this core's clock: ``now`` is passed to the ledger.
         The policy step runs before this one on every call, so a ticketless
         ``paper_arm`` was already checked (and its prepared arm is dropped
-        with this call's context), and a confirmed one is checked again.
-        External MCP actors never get or spend tickets: their client asks
-        the human before each call.
+        with this call's context), and a confirmed one is checked again; a
+        refusal there never presents the ticket, which stays live. External
+        MCP actors never get or spend tickets: their client asks the human
+        before each call.
         """
         if ctx.actor.kind != "krell":
             return None, None
@@ -565,13 +572,16 @@ class AgentToolCore:
         ledger = self._confirm
         if ledger is None:
             return ToolRefusal(CODE_CONFIRM_REQUIRED, MESSAGE_CONFIRM_UNAVAILABLE, spec.name).to_dict(), None
+        pack_sha256 = _prepared_pack_sha256(ctx)
         if confirm_token is None:
+            # Read the limits first: a failing policy read must not leave a ticket behind.
+            agent_limits = confirm_limits(ctx.home, spec.name)
             try:
-                ticket = ledger.issue(ctx.actor, spec.name, params)
+                ticket = ledger.issue(ctx.actor, spec.name, params, now=ctx.clock(), pack_sha256=pack_sha256)
             except ConfirmParamsError:
                 return invalid_request(spec.name, MESSAGE_CONFIRM_PARAMS).to_dict(), None
-            return _needs_confirm(ticket, cost.to_dict(), confirm_limits(ctx.home, spec.name)), None
-        verdict = ledger.consume(confirm_token, spec.name, params)
+            return _needs_confirm(ticket, cost.to_dict(), agent_limits), None
+        verdict = ledger.consume(confirm_token, spec.name, params, now=ctx.clock(), pack_sha256=pack_sha256)
         if verdict == "ok":
             return None, confirm_token
         if verdict == "mismatch":
@@ -639,8 +649,21 @@ def _needs_confirm(ticket: ConfirmTicket, cost: dict, agent_limits: dict) -> dic
             "estimate": cost,
             "limits": agent_limits,
             "expires_at": ticket.expires_at,
+            "pack_sha256": ticket.pack_sha256,
         },
     }
+
+
+def _prepared_pack_sha256(ctx: ToolContext) -> str | None:
+    """The sha256 of the pack bytes this call's policy step checked and snapshotted, if it prepared an arm.
+
+    It is the content address of the snapshot ``paper_arm`` arms, so a ticket
+    bound to it is bound to the strategy, not to the path it was read from.
+    """
+    prepared = ctx.call_state.get(_PREPARED_ARM)
+    if isinstance(prepared, _ArmRequest):
+        return hashlib.sha256(prepared.pack_bytes).hexdigest()
+    return None
 
 
 def _venue_of(params: dict) -> str:

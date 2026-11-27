@@ -29,11 +29,12 @@ from krellbot.agent.confirm import (
     CODE_CONFIRM_MISMATCH,
     CODE_CONFIRM_REQUIRED,
     CODE_CONFIRM_UNKNOWN,
+    MAX_LIVE_TICKETS_PER_ACTOR,
     TICKET_TTL_S,
     ConfirmLedger,
     ConfirmParamsError,
 )
-from krellbot.agent.core import CODE_INVALID_REQUEST, AgentToolCore, ToolSpec
+from krellbot.agent.core import CODE_INVALID_REQUEST, CODE_TOOL_ERROR, AgentToolCore, ToolSpec
 from krellbot.agent.tools_research import register_research_tools
 from krellbot.api.jobs import canonical_receipt_bytes
 from krellbot.application import user_policy
@@ -48,11 +49,12 @@ pytestmark = pytest.mark.usefixtures("fresh_keyring")
 
 CURSOR = Actor.mcp("cursor")
 START = 1_700_000_000.0
-CONFIRM_KEYS = {"ticket_id", "tool", "params", "estimate", "limits", "expires_at"}
+CONFIRM_KEYS = {"ticket_id", "tool", "params", "estimate", "limits", "expires_at", "pack_sha256"}
+COMPARE_PARAMS = {"revision_ids": ["0" * 64, "1" * 64]}
 
 
 class _Clock:
-    """A fake clock the test moves by hand; the core and the ledger share it."""
+    """A fake clock the test moves by hand."""
 
     def __init__(self, now: float = START) -> None:
         self.now = now
@@ -61,9 +63,14 @@ class _Clock:
         return self.now
 
 
+def _ledger_clock_never_read() -> float:
+    raise AssertionError("the core passes now= from its own clock; the ledger's clock is never read")
+
+
 def _krell_core(home: Path) -> tuple[_Clock, ConfirmLedger, AgentToolCore]:
+    """A core on a fake clock. Its ledger's own clock must never be read: expiry follows the core's clock."""
     clock = _Clock()
-    ledger = ConfirmLedger(clock=clock)
+    ledger = ConfirmLedger(clock=_ledger_clock_never_read)
     core = AgentToolCore(home, clock=clock, confirm=ledger)
     register_research_tools(core)
     return clock, ledger, core
@@ -187,6 +194,10 @@ def test_krell_paper_arm_without_ticket_returns_needs_confirm_and_changes_nothin
     }
     assert confirm["expires_at"] == START + TICKET_TTL_S == START + 600
     assert isinstance(confirm["ticket_id"], str) and len(confirm["ticket_id"]) >= 22
+    # The card names the exact pack bytes that were checked (the snapshot that would be armed).
+    pack_sha256 = hashlib.sha256(Path(params["pack_path"]).read_bytes()).hexdigest()
+    assert confirm["pack_sha256"] == pack_sha256
+    assert (arm_registry.snapshot_dir(home) / f"{pack_sha256}.json").is_file()
     json.dumps(result)  # the confirm card payload is plain JSON
 
     # Nothing was armed or counted.
@@ -390,6 +401,7 @@ def test_krell_change_tools_need_a_ticket_and_a_ticket_confirms_only_its_own_too
     assert pause["code"] == CODE_CONFIRM_REQUIRED
     assert pause["confirm"]["estimate"]["cost"] == "light"
     assert pause["confirm"]["limits"] == {"krell_allow_pause_resume": True}
+    assert pause["confirm"]["pack_sha256"] is None
     assert core.call(KRELL, "disarm", params)["confirm"]["limits"] == {"krell_allow_disarm": True}
     assert ran == []
 
@@ -420,6 +432,119 @@ def test_confirmed_arm_is_checked_against_the_limits_again(home: Path):
     _assert_refused(refused, CODE_AGENT_LIMIT_BALANCE)
     assert _armed(home) == []
     assert arm_registry.running_agent_arms(home) == []
+
+
+def test_a_limit_refusal_at_confirm_keeps_the_ticket_and_a_mismatch_spends_it(home: Path):
+    _clock, _ledger, core = _krell_core(home)
+    params = _arm_params(home, balance="5000")
+    ticket = _ticket(core.call(KRELL, "paper_arm", params))
+
+    # The limits refuse before the confirm step, so the ticket is not presented
+    # and stays live: once the operator raises the limit again, the human's
+    # confirm runs, checked against the limits again.
+    _write_policy(home, max_paper_balance="1000")
+    _assert_refused(core.call(KRELL, "paper_arm", params, confirm_token=ticket), CODE_AGENT_LIMIT_BALANCE)
+    assert _armed(home) == []
+    _write_policy(home, max_paper_balance="5000")
+    assert core.call(KRELL, "paper_arm", params, confirm_token=ticket)["ok"] is True
+    assert [a.pair for a in _armed(home)] == ["SUIUSD"]
+
+    # A mismatch is presented at the confirm step, so it spends the ticket.
+    other = _arm_params(home, pair="BTCUSD")
+    ticket = _ticket(core.call(KRELL, "paper_arm", other))
+    _assert_refused(
+        core.call(KRELL, "paper_arm", {**other, "paper_balance": "999"}, confirm_token=ticket), CODE_CONFIRM_MISMATCH
+    )
+    _assert_refused(core.call(KRELL, "paper_arm", other, confirm_token=ticket), CODE_CONFIRM_UNKNOWN)
+    assert [a.pair for a in _armed(home)] == ["SUIUSD"]
+
+
+def test_paper_arm_ticket_is_bound_to_the_pack_bytes_not_the_path(home: Path):
+    _clock, _ledger, core = _krell_core(home)
+    params = _arm_params(home)
+    pack = Path(params["pack_path"])
+    original = pack.read_bytes()
+    asked = core.call(KRELL, "paper_arm", params)
+    assert asked["confirm"]["pack_sha256"] == hashlib.sha256(original).hexdigest()
+    ticket = _ticket(asked)
+
+    # Before the human confirms, the file at the same path becomes another
+    # strategy that still passes every limit; the params still match.
+    swapped_pack = json.loads(original)
+    swapped_pack["risk"]["stop"]["pct"] = 3
+    swapped_pack["exit"] = ["close", "<", 1]
+    pack.write_text(json.dumps(swapped_pack), encoding="utf-8")
+    swapped = core.call(KRELL, "paper_arm", params, confirm_token=ticket)
+    _assert_refused(swapped, CODE_CONFIRM_MISMATCH)
+    assert _armed(home) == []
+    assert arm_registry.running_agent_arms(home) == []
+
+    # The mismatch spent the ticket: restoring the confirmed bytes does not revive it.
+    pack.write_bytes(original)
+    _assert_refused(core.call(KRELL, "paper_arm", params, confirm_token=ticket), CODE_CONFIRM_UNKNOWN)
+    assert _armed(home) == []
+
+
+def test_each_actor_keeps_at_most_16_live_tickets(home: Path):
+    assert MAX_LIVE_TICKETS_PER_ACTOR == 16
+    ledger = ConfirmLedger(clock=_Clock())
+    tickets = [ledger.issue(KRELL, "compare", {"n": n}) for n in range(MAX_LIVE_TICKETS_PER_ACTOR + 1)]
+    # The 17th evicted the oldest; the other 16 are live.
+    assert ledger.consume(tickets[0].id, "compare", {"n": 0}) == "unknown"
+    for n, ticket in enumerate(tickets[1:], start=1):
+        assert ledger.consume(ticket.id, "compare", {"n": n}) == "ok"
+
+    # Repeated heavy requests through the core never hold more than 16 tickets.
+    _clock, _ledger, core = _krell_core(home)
+    asked = [_ticket(core.call(KRELL, "compare", COMPARE_PARAMS)) for _ in range(20)]
+    for evicted in asked[:4]:
+        _assert_refused(
+            core.call(KRELL, "compare", COMPARE_PARAMS, confirm_token=evicted), CODE_CONFIRM_UNKNOWN, "compare"
+        )
+    # The oldest live one still runs (its handler then refuses the unknown revisions).
+    live = core.call(KRELL, "compare", COMPARE_PARAMS, confirm_token=asked[4])
+    assert live["code"] == CODE_INVALID_REQUEST, live
+
+
+def test_ticket_expiry_follows_the_core_clock_not_the_ledgers(home: Path):
+    # The ledger's own clock is never read when the caller passes now=.
+    ledger = ConfirmLedger(clock=_ledger_clock_never_read)
+    ticket = ledger.issue(KRELL, "compare", {}, now=100.0)
+    assert ticket.expires_at == 100.0 + TICKET_TTL_S
+    assert ledger.consume(ticket.id, "compare", {}, now=100.0 + TICKET_TTL_S - 1) == "ok"
+    ticket = ledger.issue(KRELL, "compare", {}, now=100.0)
+    assert ledger.consume(ticket.id, "compare", {}, now=100.0 + TICKET_TTL_S) == "unknown"
+
+    # The core passes its clock: here the core's clock moves and the ledger's would raise.
+    clock, _ledger, core = _krell_core(home)
+    asked = core.call(KRELL, "compare", COMPARE_PARAMS)
+    assert asked["confirm"]["expires_at"] == START + TICKET_TTL_S
+    clock.now += TICKET_TTL_S
+    _assert_refused(
+        core.call(KRELL, "compare", COMPARE_PARAMS, confirm_token=_ticket(asked)), CODE_CONFIRM_UNKNOWN, "compare"
+    )
+
+
+def test_a_failing_policy_read_leaves_no_orphan_ticket(home: Path, monkeypatch: pytest.MonkeyPatch):
+    _clock, ledger, core = _krell_core(home)
+    issued = []
+    real_issue = ledger.issue
+
+    def recording_issue(*args, **kwargs):
+        ticket = real_issue(*args, **kwargs)
+        issued.append(ticket)
+        return ticket
+
+    def unreadable_policy(*_args, **_kwargs):
+        raise OSError("user-policy.json is unreadable")
+
+    monkeypatch.setattr(ledger, "issue", recording_issue)
+    monkeypatch.setattr("krellbot.agent.core.confirm_limits", unreadable_policy)
+    failed = core.call(KRELL, "compare", COMPARE_PARAMS)
+    assert failed["ok"] is False
+    assert failed["code"] == CODE_TOOL_ERROR
+    assert "confirm" not in failed
+    assert issued == []
 
 
 # ---- who gets tickets ------------------------------------------------------
@@ -505,13 +630,13 @@ def test_only_plain_json_params_can_be_confirmed(home: Path):
     assert _armed(home) == []
 
     with pytest.raises(ConfirmParamsError):
-        ledger.issue(KRELL, "paper_arm", {**params, "paper_balance": Decimal(1000)})
+        ledger.issue(KRELL, "paper_arm", {**params, "paper_balance": Decimal(1000)}, now=START)
     assert issubclass(ConfirmParamsError, ValueError)
 
     # Consume treats params the same way: a non-JSON value never matches, and spends the ticket.
-    ticket = ledger.issue(KRELL, "paper_arm", params)
-    assert ledger.consume(ticket.id, "paper_arm", {**params, "paper_balance": Decimal(1000)}) == "mismatch"
-    assert ledger.consume(ticket.id, "paper_arm", params) == "unknown"
+    ticket = ledger.issue(KRELL, "paper_arm", params, now=START)
+    assert ledger.consume(ticket.id, "paper_arm", {**params, "paper_balance": Decimal(1000)}, now=START) == "mismatch"
+    assert ledger.consume(ticket.id, "paper_arm", params, now=START) == "unknown"
 
 
 def test_tickets_have_random_ids_and_keep_the_params_they_were_issued_for(home: Path):
