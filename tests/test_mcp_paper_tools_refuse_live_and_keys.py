@@ -161,10 +161,16 @@ def test_mcp_key_read_tools_refused_without_keyring(home: Path, monkeypatch: pyt
 
 
 def test_mcp_draft_validate_backtest_paper_arm_happy_path(home: Path):
-    """Smoke the five verbs offline; does not claim the owner P3 gate."""
+    """Smoke the five verbs offline; does not claim the owner P3 gate.
+
+    The arm stays within the default agent limits (M38.3): a risk cap of at
+    most 2% and a daily loss limit passed on the arm.
+    """
     mcp = McpTools(home)
 
-    draft = mcp.call("draft", pack=_valid_pack_dict())
+    agent_pack = _valid_pack_dict()
+    agent_pack["risk"]["max_account_pct"] = 2
+    draft = mcp.call("draft", pack=agent_pack)
     assert draft["ok"] is True
     revision_id = draft["result"]["revision_id"]
 
@@ -206,6 +212,7 @@ def test_mcp_draft_validate_backtest_paper_arm_happy_path(home: Path):
         venue="kraken",
         mode="paper",
         paper_balance=Decimal(1000),
+        daily_loss_limit_pct="5",
         correlation_id="mcp-smoke",
     )
     assert armed["ok"] is True

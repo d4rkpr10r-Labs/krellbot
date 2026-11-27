@@ -65,12 +65,19 @@ below rather than scraping authenticated browser cookies.
 | `read` | Inventory: owned drafts, pack library rows, armed paper records | _(none)_ |
 | `draft` | Create or edit a strategy draft | `pack`, optional `parent_revision_id` |
 | `validate` | Lint a draft revision | `revision_id` |
-| `backtest` | Offline research | `pack_path`, prefer `dataset_csv` (no live fetch / keys) |
+| `backtest` | Offline research (simulated); returns the receipt and the run identity (`run_id`, receipt digest) the workstation records for the same inputs | `revision_id` **or** `pack_path`, `dataset_csv`, optional `venue`, `pair`, `timeframe`, costs and window |
+| `compare` | Backtest 2 to 4 draft revisions on one dataset, side by side (simulated) | `revision_ids`, `dataset_csv` |
 | `paper_arm` | Paper-arm a pack or validated revision | `venue`, `mode="paper"`, `pack_path` **or** `revision_id`, optional `paper_balance` |
 
+`compare` is added to the agent core by the hosts that offer it, which call `register_research_tools`.
+
 Happy path for an agent: **`validate` → `backtest` → `paper_arm`**.
-Call `read` first when you need ids/paths. Prefer offline `dataset_csv`
-for backtest so CI and agents stay fake-transport / offline.
+Call `read` first when you need ids/paths. Research files must live in the
+Krellbot home: a `pack_path` is a `.json` under `packs/`, `drafts/` or
+`agent-packs/` (or pass a draft's `revision_id`), and a `dataset_csv` is a
+`.csv` under `cache/` or `datasets/imported/`, or directly in the home
+folder. Anything else is refused without echoing the path. Use offline
+`dataset_csv` so CI and agents stay fake-transport / offline.
 
 Example paper-arm shape (never `mode=live`):
 

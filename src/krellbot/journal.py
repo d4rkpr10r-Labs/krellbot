@@ -84,6 +84,16 @@ def summarize_record(record: dict, *, mode: str | None = None) -> str:
             return detail.strip()
         return kind or "—"
 
+    if kind == "agent_action":
+        # "<actor> <tool>: <outcome> (<code>)"; the code is omitted when it
+        # only repeats the outcome (a plain ``ok``).
+        actor = str(detail.get("actor") or "agent")
+        tool = str(detail.get("tool") or "?")
+        outcome = str(detail.get("outcome") or "?")
+        code = str(detail.get("code") or "")
+        suffix = f" ({code})" if code and code != outcome else ""
+        return f"{actor} {tool}: {outcome}{suffix}"
+
     pair = str(detail.get("pair") or "")
     venue = str(record.get("venue") or "")
     pack = str(record.get("pack") or "")
