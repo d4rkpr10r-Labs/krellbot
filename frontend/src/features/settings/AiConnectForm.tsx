@@ -13,6 +13,19 @@
  * onConnected path as a key add. Stopping, leaving the form and giving up
  * all cancel the sign-in on the engine, so an abandoned sign-in can never add
  * a connection later.
+ *
+ * Continue with ChatGPT (M38.23) follows the same start, waiting, cancel and
+ * done pattern for the OpenAI provider. The engine returns its own loopback
+ * launch address (which redirects to OpenAI), so no OpenAI URL or token is
+ * ever held here. A sign-in that did not allow ChatGPT plan use is kept but
+ * not probed, and the form explains the API-key alternative. The first
+ * plan-enabled sign-in of a connection shows "You're using your ChatGPT
+ * plan" once; the engine remembers that it was shown. With `reauth`, the form
+ * signs an existing ChatGPT connection in again. Saved ChatGPT accounts with
+ * no connection are offered as "Continue as <email>", which reuses that
+ * account's registration; "Use a different ChatGPT account" registers anew.
+ * The buttons are text labels: no OpenAI logo asset ships with Krellbot
+ * (owner branding review).
  */
 import { useEffect, useId, useRef, useState, type JSX } from "react";
 import {
@@ -22,9 +35,12 @@ import {
   getSigninStatus,
   listConnections,
   listProviders,
+  markChatgptWelcome,
   probeConnection,
+  startChatgptSignin,
   startOpenRouterSignin,
   type AiCapability,
+  type AiChatgptAccount,
   type AiConnection,
   type AiProbe,
   type AiProvider,
@@ -47,6 +63,54 @@ const SIGNIN_BAD_URL =
   "Krellbot received a sign-in address that is not OpenRouter's, so it did not open it.";
 const SIGNIN_GAVE_UP = "The sign-in did not finish. Start it again.";
 const SIGNIN_LOCAL_ONLY = "ai_signin_local_only";
+
+/** ChatGPT's sign-in starts at the engine's own one-shot launch address, which redirects to OpenAI. */
+const CHATGPT_LAUNCH_URL = /^http:\/\/127\.0\.0\.1:\d{1,5}\/auth\/start\/[A-Za-z0-9_-]+$/;
+const CHATGPT_LOCAL_ONLY = "ai_chatgpt_local_only";
+export const CHATGPT_NOTE =
+  "Or continue with ChatGPT to use your ChatGPT plan instead of an API key. Krellbot opens OpenAI's sign-in in a new tab, and the sign-in is kept in your keychain.";
+const CHATGPT_BAD_URL =
+  "Krellbot received a sign-in address that is not its own ChatGPT sign-in address, so it did not open it.";
+export const CHATGPT_PLAN_DISABLED =
+  "You signed in with ChatGPT, but ChatGPT plan use was not allowed, so Krell cannot use this connection. Choose Continue with ChatGPT again and allow plan use, or connect an OpenAI API key instead: enter the key and choose Connect.";
+const CHATGPT_REAUTH_SIGNIN =
+  "This ChatGPT sign-in has ended. Continue with ChatGPT to sign in again with the same account.";
+const CHATGPT_REAUTH_PLAN =
+  "ChatGPT plan use is not allowed for this sign-in. Continue with ChatGPT and allow it, or connect an OpenAI API key instead.";
+export const CHATGPT_WELCOME_TITLE = "You're using your ChatGPT plan";
+const CHATGPT_WELCOME_BODY =
+  "Krell's requests on this connection use your ChatGPT plan. You can review and manage that usage in ChatGPT settings.";
+
+/** OpenAI refused a first registration's code; Try again reuses that registration. */
+const CHATGPT_CODE_REJECTED = "ai_chatgpt_code_rejected";
+
+/**
+ * "Continue as <email>" for a saved account. When the email would not tell
+ * two saved accounts apart (the same email, or none), a short suffix from the
+ * account's random id, stable across reloads, makes each label distinct.
+ */
+export function continueAsLabel(account: AiChatgptAccount, all: readonly AiChatgptAccount[]): string {
+  const twins = all.filter((other) => other.id !== account.id && other.email === account.email);
+  if (account.email && twins.length === 0) return `Continue as ${account.email}`;
+  const short = account.id.slice(0, 6);
+  const suffix = twins.some((other) => other.id.slice(0, 6) === short) ? account.id : short;
+  return account.email
+    ? `Continue as ${account.email} (${suffix})`
+    : `Continue as saved ChatGPT account ${suffix}`;
+}
+
+type SigninKind = "openrouter" | "chatgpt";
+
+const SIGNIN_COPY: Record<SigninKind, { waiting: string; open: string }> = {
+  openrouter: {
+    waiting: "Waiting for OpenRouter. Finish signing in on the tab that opened.",
+    open: "Open the OpenRouter sign-in page",
+  },
+  chatgpt: {
+    waiting: "Waiting for ChatGPT. Finish signing in on the tab that opened.",
+    open: "Open the ChatGPT sign-in page",
+  },
+};
 
 const COPY_TOOLS = "Ready for Krell";
 const COPY_CHAT_ONLY = "Chat only: Krell can explain but not use tools";
@@ -124,10 +188,12 @@ export type AiConnectFormProps = {
     probe: { capability: AiCapability; message: string },
   ): void;
   onCancel?(): void;
+  /** Sign this existing ChatGPT connection in again (its saved account and registration). */
+  reauth?: AiConnection;
 };
 
 export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
-  const { onConnected, onAdded, onCancel } = props;
+  const { onConnected, onAdded, onCancel, reauth } = props;
   const ids = useId();
   const keyRef = useRef<HTMLInputElement>(null);
   const [providers, setProviders] = useState<AiProvider[] | null>(null);
@@ -144,11 +210,16 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
   const [signin, setSignin] = useState<{
     flowId: string;
     authorizeUrl: string;
+    kind: SigninKind;
   } | null>(null);
-  // Set when the engine refuses sign-in from this browser (a remote session).
-  const [signinUnavailable, setSigninUnavailable] = useState<string | null>(
-    null,
-  );
+  // Set when the engine refuses a sign-in from this browser (a remote session).
+  const [unavailable, setUnavailable] = useState<Partial<Record<SigninKind, string>>>({});
+  // A ChatGPT sign-in that did not allow plan use.
+  const [planNote, setPlanNote] = useState<string | null>(null);
+  // OpenAI refused a first registration's code: offer Try again with that registration.
+  const [retryRegistration, setRetryRegistration] = useState(false);
+  // "You're using your ChatGPT plan", waiting for Got it.
+  const [welcome, setWelcome] = useState<{ connectionId: string; done(): void } | null>(null);
   // Sign-ins this form is done with; any other is cancelled when its polling ends.
   const settledFlows = useRef(new Set<string>());
 
@@ -203,29 +274,69 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
     if (ready) onConnected(conn);
   }
 
+  async function storedConnection(connectionId: string): Promise<AiConnection | undefined> {
+    const listed = await listConnections();
+    return listed.ok ? listed.connections.find((c) => c.id === connectionId) : undefined;
+  }
+
+  /** Show the ChatGPT plan welcome and wait for Got it. */
+  function showWelcome(connectionId: string): Promise<void> {
+    return new Promise((done) => setWelcome({ connectionId, done }));
+  }
+
   /**
    * A sign-in stored a connection: probe it and finish like a key add. If
    * the probe fails, the connection is still stored, so the parent hears
-   * about it through onAdded as unprobed.
+   * about it through onAdded as unprobed. A ChatGPT sign-in without plan use
+   * is not probed (the engine would refuse it); a connection's first
+   * plan-enabled sign-in shows the welcome before the parent hears about it.
    */
   async function finishSignin(
     connectionId: string,
+    plan: "enabled" | "disabled" | null,
     isLive: () => boolean,
   ): Promise<void> {
-    const probed = await probeConnection(connectionId);
-    if (!isLive()) return;
-    if (probed.ok) {
-      await finishAdded(probed);
+    if (plan === "disabled") {
+      setPlanNote(CHATGPT_PLAN_DISABLED);
+      const stored = await storedConnection(connectionId);
+      if (stored && isLive()) {
+        onAdded?.(stored, { capability: stored.capability, message: CHATGPT_PLAN_DISABLED });
+      }
       return;
     }
-    setError(`${probed.message} (${probed.code})`);
-    const listed = await listConnections();
-    const stored = listed.ok
-      ? listed.connections.find((c) => c.id === connectionId)
-      : undefined;
-    if (stored && isLive()) {
-      onAdded?.(stored, { capability: "unprobed", message: probed.message });
+    const probed = await probeConnection(connectionId);
+    if (!isLive()) return;
+    if (!probed.ok) setError(`${probed.message} (${probed.code})`);
+    const stored = probed.ok
+      ? probed.connection
+      : plan === "enabled"
+        ? await storedConnection(connectionId)
+        : undefined;
+    if (stored?.chatgpt?.welcome && isLive()) {
+      await showWelcome(connectionId);
+      if (!isLive()) return;
     }
+    if (probed.ok) {
+      const chatgpt = probed.connection.chatgpt;
+      await finishAdded({
+        ...probed,
+        connection: { ...probed.connection, chatgpt: chatgpt && { ...chatgpt, welcome: false } },
+      });
+      return;
+    }
+    const known = stored ?? (await storedConnection(connectionId));
+    if (known && isLive()) {
+      onAdded?.(known, { capability: "unprobed", message: probed.message });
+    }
+  }
+
+  async function gotIt(): Promise<void> {
+    if (!welcome) return;
+    const { connectionId, done } = welcome;
+    const marked = await markChatgptWelcome(connectionId);
+    if (!marked.ok) setError(`${marked.message} (${marked.code})`);
+    setWelcome(null);
+    done();
   }
 
   // The polling effect outlives renders; it always calls the latest finisher.
@@ -259,24 +370,36 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
     }
   }
 
-  async function startSignin(): Promise<void> {
-    if (!provider || busy || signin) return;
+  async function startSignin(kind: SigninKind, account?: string, retry = false): Promise<void> {
+    if ((!provider && !reauth) || busy || signin) return;
     setBusy(true);
     setError(null);
     setProbe(null);
+    setPlanNote(null);
+    setRetryRegistration(false);
     try {
-      const started = await startOpenRouterSignin(model.trim());
+      const started =
+        kind === "chatgpt"
+          ? await startChatgptSignin(
+              reauth ? { connectionId: reauth.id } : { model: model.trim(), account, retry },
+            )
+          : await startOpenRouterSignin(model.trim());
       if (!started.ok) {
-        if (started.code === SIGNIN_LOCAL_ONLY) setSigninUnavailable(started.message);
-        else setError(`${started.message} (${started.code})`);
+        if (started.code === SIGNIN_LOCAL_ONLY || started.code === CHATGPT_LOCAL_ONLY) {
+          setUnavailable((current) => ({ ...current, [kind]: started.message }));
+        } else setError(`${started.message} (${started.code})`);
         return;
       }
-      if (!started.authorizeUrl.startsWith(OPENROUTER_AUTHORIZE_PREFIX)) {
-        setError(SIGNIN_BAD_URL);
+      const trusted =
+        kind === "chatgpt"
+          ? CHATGPT_LAUNCH_URL.test(started.authorizeUrl)
+          : started.authorizeUrl.startsWith(OPENROUTER_AUTHORIZE_PREFIX);
+      if (!trusted) {
+        setError(kind === "chatgpt" ? CHATGPT_BAD_URL : SIGNIN_BAD_URL);
         return;
       }
       window.open(started.authorizeUrl, "_blank", "noopener,noreferrer");
-      setSignin({ flowId: started.flowId, authorizeUrl: started.authorizeUrl });
+      setSignin({ flowId: started.flowId, authorizeUrl: started.authorizeUrl, kind });
     } finally {
       setBusy(false);
     }
@@ -335,13 +458,14 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
         return;
       }
       if (status.state !== "connected" || !status.connectionId) {
+        if (status.code === CHATGPT_CODE_REJECTED) setRetryRegistration(true);
         settle(`${status.message} (${status.code || status.state})`);
         return;
       }
       settledFlows.current.add(flowId);
       setBusy(true);
       try {
-        await finishSigninRef.current(status.connectionId, isLive);
+        await finishSigninRef.current(status.connectionId, status.plan, isLive);
       } finally {
         setBusy(false);
         settle(null);
@@ -357,6 +481,120 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
       }
     };
   }, [signin]);
+
+  const locked = busy || signin !== null;
+
+  const welcomeDialog = welcome ? (
+    <div
+      className="kbot-settings__welcome"
+      role="dialog"
+      aria-labelledby={`${ids}-welcome-title`}
+      data-testid="ai-chatgpt-welcome"
+    >
+      <h3 className="kbot-settings__welcome-title" id={`${ids}-welcome-title`}>
+        {CHATGPT_WELCOME_TITLE}
+      </h3>
+      <p className="kbot-settings__card-copy">{CHATGPT_WELCOME_BODY}</p>
+      <button
+        type="button"
+        className="kbot-settings__btn kbot-settings__btn--primary"
+        onClick={() => void gotIt()}
+        autoFocus
+      >
+        Got it
+      </button>
+    </div>
+  ) : null;
+
+  const waiting = signin ? (
+    <div data-testid="ai-signin-waiting">
+      <p className="kbot-settings__card-copy" role="status">
+        {SIGNIN_COPY[signin.kind].waiting}
+      </p>
+      <div className="kbot-settings__inline-actions">
+        <a
+          className="kbot-settings__link-btn"
+          href={signin.authorizeUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          {SIGNIN_COPY[signin.kind].open}
+        </a>
+        {busy ? null : (
+          <button
+            type="button"
+            className="kbot-settings__link-btn"
+            onClick={() => void stopWaiting()}
+          >
+            Stop waiting
+          </button>
+        )}
+      </div>
+    </div>
+  ) : null;
+
+  const feedback = (
+    <>
+      {error ? (
+        <p className="kbot-settings__error" role="alert">
+          {error}
+        </p>
+      ) : null}
+      {planNote ? (
+        <p className="kbot-settings__card-copy" role="status" data-testid="ai-chatgpt-plan-disabled">
+          {planNote}
+        </p>
+      ) : null}
+      {probe ? (
+        <AiCapabilityStatus
+          capability={probe.capability}
+          message={probe.message}
+        />
+      ) : null}
+    </>
+  );
+
+  if (reauth) {
+    return (
+      <div className="kbot-settings__card" data-testid="ai-chatgpt-reauth">
+        {welcomeDialog ?? (
+          <>
+            <p className="kbot-settings__card-copy">
+              {reauth.chatgpt?.plan === "disabled" ? CHATGPT_REAUTH_PLAN : CHATGPT_REAUTH_SIGNIN}
+            </p>
+            {unavailable.chatgpt ? (
+              <p className="kbot-settings__card-copy" data-testid="ai-signin-unavailable">
+                {unavailable.chatgpt}
+              </p>
+            ) : null}
+            {waiting}
+            {feedback}
+            <div className="kbot-settings__inline-actions">
+              <button
+                type="button"
+                className="kbot-settings__btn"
+                data-oai-siwc-button=""
+                onClick={() => void startSignin("chatgpt")}
+                disabled={locked || unavailable.chatgpt !== undefined}
+              >
+                Continue with ChatGPT
+              </button>
+              {onCancel ? (
+                <button
+                  type="button"
+                  className="kbot-settings__btn"
+                  onClick={onCancel}
+                  disabled={busy}
+                >
+                  Cancel
+                </button>
+              ) : null}
+            </div>
+          </>
+        )}
+      </div>
+    );
+  }
 
   if (loadError) {
     return (
@@ -375,7 +613,12 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
 
   const keyOptional = provider.credential === "optional";
   const offersSignin = provider.signin === "openrouter";
-  const locked = busy || signin !== null;
+  const offersChatgpt = provider.signin === "chatgpt";
+  const savedAccounts = offersChatgpt ? provider.chatgptAccounts : [];
+
+  if (welcomeDialog) {
+    return <div className="kbot-settings__card">{welcomeDialog}</div>;
+  }
 
   return (
     <form
@@ -488,57 +731,33 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
         {disclosureFor(provider, baseUrl)}
       </p>
 
-      {offersSignin && signinUnavailable ? (
+      {offersSignin && unavailable.openrouter ? (
         <p
           className="kbot-settings__card-copy"
           data-testid="ai-signin-unavailable"
         >
-          {signinUnavailable}
+          {unavailable.openrouter}
         </p>
       ) : offersSignin ? (
         <p className="kbot-settings__card-copy" data-testid="ai-signin-note">
           {SIGNIN_NOTE}
         </p>
       ) : null}
-
-      {signin ? (
-        <div data-testid="ai-signin-waiting">
-          <p className="kbot-settings__card-copy" role="status">
-            Waiting for OpenRouter. Finish signing in on the tab that opened.
-          </p>
-          <div className="kbot-settings__inline-actions">
-            <a
-              className="kbot-settings__link-btn"
-              href={signin.authorizeUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              Open the OpenRouter sign-in page
-            </a>
-            {busy ? null : (
-              <button
-                type="button"
-                className="kbot-settings__link-btn"
-                onClick={() => void stopWaiting()}
-              >
-                Stop waiting
-              </button>
-            )}
-          </div>
-        </div>
-      ) : null}
-
-      {error ? (
-        <p className="kbot-settings__error" role="alert">
-          {error}
+      {offersChatgpt && unavailable.chatgpt ? (
+        <p
+          className="kbot-settings__card-copy"
+          data-testid="ai-signin-unavailable"
+        >
+          {unavailable.chatgpt}
+        </p>
+      ) : offersChatgpt ? (
+        <p className="kbot-settings__card-copy" data-testid="ai-chatgpt-note">
+          {CHATGPT_NOTE}
         </p>
       ) : null}
-      {probe ? (
-        <AiCapabilityStatus
-          capability={probe.capability}
-          message={probe.message}
-        />
-      ) : null}
+
+      {waiting}
+      {feedback}
 
       <div className="kbot-settings__inline-actions">
         <button type="submit" className="kbot-settings__btn" disabled={locked}>
@@ -548,10 +767,44 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
           <button
             type="button"
             className="kbot-settings__btn"
-            onClick={() => void startSignin()}
-            disabled={locked || signinUnavailable !== null}
+            onClick={() => void startSignin("openrouter")}
+            disabled={locked || unavailable.openrouter !== undefined}
           >
             Sign in with OpenRouter
+          </button>
+        ) : null}
+        {savedAccounts.map((account) => (
+          <button
+            key={account.id}
+            type="button"
+            className="kbot-settings__btn"
+            data-oai-siwc-button=""
+            onClick={() => void startSignin("chatgpt", account.id)}
+            disabled={locked || unavailable.chatgpt !== undefined}
+          >
+            {continueAsLabel(account, savedAccounts)}
+          </button>
+        ))}
+        {offersChatgpt && retryRegistration ? (
+          <button
+            type="button"
+            className="kbot-settings__btn"
+            data-oai-siwc-button=""
+            onClick={() => void startSignin("chatgpt", undefined, true)}
+            disabled={locked || unavailable.chatgpt !== undefined}
+          >
+            Try again
+          </button>
+        ) : null}
+        {offersChatgpt ? (
+          <button
+            type="button"
+            className="kbot-settings__btn"
+            data-oai-siwc-button=""
+            onClick={() => void startSignin("chatgpt")}
+            disabled={locked || unavailable.chatgpt !== undefined}
+          >
+            {savedAccounts.length > 0 ? "Use a different ChatGPT account" : "Continue with ChatGPT"}
           </button>
         ) : null}
         {onCancel ? (

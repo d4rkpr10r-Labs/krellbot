@@ -11,6 +11,9 @@ export type AiCapability = "tools" | "chat_only" | "failed" | "unprobed";
 export type AiFormat = "openai_compatible" | "anthropic_messages";
 export type AiSignin = "none" | "openrouter" | "chatgpt";
 
+/** A saved ChatGPT account with no connection now: "Continue as" reuses its registration. */
+export type AiChatgptAccount = { id: string; email: string | null };
+
 export type AiProvider = {
   id: string;
   label: string;
@@ -20,6 +23,20 @@ export type AiProvider = {
   credential: "required" | "optional";
   /** A browser sign-in the engine offers for this provider, besides a key. */
   signin: AiSignin;
+  /** ChatGPT sign-in only: saved accounts to continue as. */
+  chatgptAccounts: AiChatgptAccount[];
+};
+
+/**
+ * A ChatGPT sign-in's state (M38.23), from the engine's non-secret record:
+ * never a token. `welcome` is true until "You're using your ChatGPT plan"
+ * was shown once for this connection.
+ */
+export type AiChatgptState = {
+  plan: "enabled" | "disabled";
+  signedIn: boolean;
+  welcome: boolean;
+  account: string | null;
 };
 
 export type AiConnection = {
@@ -34,6 +51,8 @@ export type AiConnection = {
   capability: AiCapability;
   active: boolean;
   disclosure: string;
+  /** Set only for a Sign in with ChatGPT connection. */
+  chatgpt: AiChatgptState | null;
 };
 
 export type AiProbe = {
@@ -50,9 +69,14 @@ export type AiSigninState = "waiting" | "connected" | "failed" | "expired";
 export type AiSigninStatus = {
   state: AiSigninState;
   connectionId: string | null;
+  /** ChatGPT only: whether the sign-in allowed ChatGPT plan use. */
+  plan: "enabled" | "disabled" | null;
   code: string;
   message: string;
 };
+
+/** How OpenAI answered a ChatGPT sign-out or removal's revocation. */
+export type AiRevocation = "confirmed" | "not_confirmed" | "none";
 
 export type AiAddInput = {
   preset: string;
@@ -88,6 +112,33 @@ function asSigninState(value: unknown): AiSigninState {
     : "failed";
 }
 
+function toChatgpt(raw: unknown): AiChatgptState | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  return {
+    plan: r.plan === "enabled" ? "enabled" : "disabled",
+    signedIn: r.signed_in === true,
+    welcome: r.welcome === true,
+    account: typeof r.account === "string" ? r.account : null,
+  };
+}
+
+function toAccounts(raw: unknown): AiChatgptAccount[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => (item ?? {}) as Record<string, unknown>)
+    .filter((r) => typeof r.id === "string" && /^[0-9a-f]{16}$/.test(r.id))
+    .map((r) => ({ id: String(r.id), email: typeof r.email === "string" ? r.email : null }));
+}
+
+function asPlan(value: unknown): "enabled" | "disabled" | null {
+  return value === "enabled" || value === "disabled" ? value : null;
+}
+
+function asRevocation(value: unknown): AiRevocation {
+  return value === "confirmed" || value === "not_confirmed" ? value : "none";
+}
+
 function toConnection(raw: unknown): AiConnection {
   const r = (raw ?? {}) as Record<string, unknown>;
   return {
@@ -102,6 +153,7 @@ function toConnection(raw: unknown): AiConnection {
     capability: asCapability(r.capability),
     active: r.active === true,
     disclosure: str(r.disclosure),
+    chatgpt: toChatgpt(r.chatgpt),
   };
 }
 
@@ -186,6 +238,7 @@ export async function listProviders(): Promise<
           custom: r.custom === true,
           credential: r.credential === "optional" ? "optional" : "required",
           signin: asSignin(r.signin),
+          chatgptAccounts: toAccounts(r.chatgpt_accounts),
         };
       }),
     };
@@ -234,11 +287,55 @@ export async function addConnection(
   }
 }
 
-export async function removeConnection(id: string): Promise<AiResult<unknown>> {
+/**
+ * Removes a connection. A ChatGPT sign-in is revoked at OpenAI first;
+ * `detail` explains a revocation OpenAI did not confirm.
+ */
+export async function removeConnection(
+  id: string,
+): Promise<AiResult<{ revocation: AiRevocation; detail: string }>> {
   try {
     const parsed = await send(
       "DELETE",
       `/api/v1/ai/connections/${encodeURIComponent(id)}`,
+    );
+    if (parsed.ok === false) return refusal(parsed);
+    return {
+      ok: true,
+      revocation: asRevocation(parsed.revocation),
+      detail: str(parsed.detail),
+    };
+  } catch {
+    return networkFailure();
+  }
+}
+
+/** Sign a ChatGPT connection out: the engine revokes it at OpenAI and clears its tokens. */
+export async function signOutConnection(
+  id: string,
+): Promise<AiResult<{ revocation: AiRevocation; detail: string }>> {
+  try {
+    const parsed = await send(
+      "POST",
+      `/api/v1/ai/connections/${encodeURIComponent(id)}/signout`,
+    );
+    if (parsed.ok === false) return refusal(parsed);
+    return {
+      ok: true,
+      revocation: asRevocation(parsed.revocation),
+      detail: str(parsed.detail),
+    };
+  } catch {
+    return networkFailure();
+  }
+}
+
+/** Record in the engine that this connection's ChatGPT plan welcome was shown. */
+export async function markChatgptWelcome(id: string): Promise<AiResult<unknown>> {
+  try {
+    const parsed = await send(
+      "POST",
+      `/api/v1/ai/connections/${encodeURIComponent(id)}/welcome`,
     );
     return parsed.ok === false ? refusal(parsed) : { ok: true };
   } catch {
@@ -301,6 +398,37 @@ export async function startOpenRouterSignin(
   }
 }
 
+/**
+ * Start Continue with ChatGPT (M38.23): a new sign-in with `model`, or a
+ * sign-in again for an existing ChatGPT connection. The engine returns its
+ * own loopback launch address, which redirects to OpenAI; every token goes
+ * straight to the keychain and never reaches the browser.
+ */
+export async function startChatgptSignin(
+  input: { model: string; account?: string; retry?: boolean } | { connectionId: string },
+): Promise<AiResult<{ flowId: string; authorizeUrl: string }>> {
+  let body: Record<string, unknown>;
+  if ("connectionId" in input) {
+    body = { connection_id: input.connectionId };
+  } else {
+    body = { model: input.model };
+    if (input.account) body.account = input.account;
+    // Try again after OpenAI refused a first registration's code: reuse that registration.
+    if (input.retry) body.retry = true;
+  }
+  try {
+    const parsed = await send("POST", "/api/v1/ai/signin/chatgpt", body);
+    if (parsed.ok === false) return refusal(parsed);
+    return {
+      ok: true,
+      flowId: str(parsed.flow_id),
+      authorizeUrl: str(parsed.authorize_url),
+    };
+  } catch {
+    return networkFailure();
+  }
+}
+
 export async function getSigninStatus(
   flowId: string,
 ): Promise<AiResult<{ status: AiSigninStatus }>> {
@@ -344,6 +472,7 @@ function toSigninStatus(parsed: Record<string, unknown>): AiSigninStatus {
     state: asSigninState(parsed.state),
     connectionId:
       typeof parsed.connection_id === "string" ? parsed.connection_id : null,
+    plan: asPlan(parsed.plan),
     code: str(parsed.code),
     message: str(parsed.detail, GENERIC_MESSAGE),
   };

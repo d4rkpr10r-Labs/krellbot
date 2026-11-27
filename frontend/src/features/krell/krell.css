@@ -364,6 +364,74 @@
   font-weight: 700;
 }
 
+/* ChatGPT plan use (M38.23), near the composer: a muted line with a seafoam
+ * link, or the compact usage-limit state. Existing tokens only. */
+.kbot-krell__plan {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.kbot-krell__plan-link {
+  color: var(--seafoam);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.kbot-krell__plan-limit {
+  display: grid;
+  gap: 4px;
+  justify-items: start;
+  padding: 8px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  font-size: 12.5px;
+}
+
+.kbot-krell__plan-limit p {
+  margin: 0;
+}
+
+.kbot-krell__plan-limit-head {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.kbot-krell__plan-limit-title {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.kbot-krell__plan-limit-copy {
+  color: var(--muted);
+}
+
+.kbot-krell__plan-limit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-tight);
+}
+
+/* A provider error's request id, for support: kept with the stored notice. */
+.kbot-krell__request-id {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* Manage usage is a link styled as the state's action button. */
+.kbot-krell a.kbot-krell__go,
+.kbot-krell a.kbot-krell__btn {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
 /* Token budget: conversation and month usage against the limits. */
 .kbot-krell__budget {
   display: grid;

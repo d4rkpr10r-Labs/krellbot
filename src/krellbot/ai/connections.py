@@ -10,6 +10,7 @@ that shape before it reaches a path or the keychain.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -51,6 +52,8 @@ _MAX_URL = 2048
 _MAX_MODEL = 256
 _MAX_LABEL = 80
 _MAX_CREDENTIAL = 4096
+# A sign-in's credential record (JSON: identity, client id, tokens, scopes, expiry), M38.23.
+_MAX_CREDENTIAL_RECORD = 64 * 1024
 _FORBIDDEN_URL_CHARS = frozenset("@?#; \\")
 
 # Every store for one file shares a lock: routes run store writes in worker threads.
@@ -85,6 +88,28 @@ REFUSAL_MESSAGES: dict[str, str] = {
     "ai_connection_not_found": "There is no AI connection with that id.",
     "ai_connections_unreadable": "The AI connections file could not be read, so it was left unchanged.",
     "ai_body_invalid": "The request body is not a valid AI connection request.",
+    # Sign in with ChatGPT (M38.23).
+    "ai_chatgpt_signin_required": (
+        "This ChatGPT sign-in has ended. Choose Continue with ChatGPT for this connection to sign in again; "
+        "the conversation is kept."
+    ),
+    "ai_chatgpt_plan_disabled": (
+        "ChatGPT plan use was not allowed for this sign-in, so Krell cannot use it. Choose Continue with "
+        "ChatGPT again and allow plan use, or connect an OpenAI API key instead."
+    ),
+    "ai_chatgpt_refresh_unavailable": (
+        "OpenAI could not be reached to renew the ChatGPT sign-in. The sign-in is kept; try again later."
+    ),
+    "ai_chatgpt_client_invalid": (
+        "OpenAI no longer accepts this ChatGPT registration. Remove the connection and choose Continue with "
+        "ChatGPT to register again."
+    ),
+    "ai_chatgpt_state_unreadable": (
+        "Krellbot's ChatGPT sign-in file could not be read, so nothing was changed. Fix or remove "
+        "ai/chatgpt.json in the Krellbot home folder."
+    ),
+    "ai_chatgpt_not_chatgpt": "That connection is not a ChatGPT sign-in.",
+    "ai_chatgpt_account_unknown": "That saved ChatGPT account is no longer known. Choose Continue with ChatGPT.",
 }
 
 
@@ -157,12 +182,20 @@ def check_endpoint(conn: Connection) -> ProviderPreset:
     return preset
 
 
+def is_chatgpt(conn: Connection) -> bool:
+    """A Sign in with ChatGPT connection: OAuth to OpenAI, served by the Responses API path."""
+
+    return conn.auth == "oauth" and conn.preset == "openai"
+
+
 def build_adapter(conn: Connection, credential: str | None, transport: HttpTransport) -> ChatAdapter:
-    """The streaming adapter for ``conn``."""
+    """The streaming adapter for ``conn``. For a ChatGPT sign-in, ``credential`` is its access token."""
 
     preset = check_endpoint(conn)
     if conn.format == "anthropic_messages":
         return AnthropicMessagesAdapter(conn.base_url, credential, transport)
+    if is_chatgpt(conn):
+        return OpenAICompatAdapter(conn.base_url, credential, transport, api="responses")
     return OpenAICompatAdapter(conn.base_url, credential, transport, token_limit_field=preset.token_limit_field)
 
 
@@ -170,6 +203,196 @@ def _service(conn_id: str) -> str:
     if not is_connection_id(conn_id):
         raise ConnectionRefused("ai_connection_not_found")
     return KEYRING_SERVICE_PREFIX + conn_id
+
+
+# ---- chunked keychain values ----------------------------------------------------------
+#
+# Windows Credential Manager holds at most 2560 bytes (1280 UTF-16 characters)
+# per secret, and a sign-in's credential record carries two JWTs and a refresh
+# token. A value longer than _CHUNK_CHARS is stored in pieces under the SAME
+# service: ``credential.<generation>.<i>`` hold the pieces and ``credential``
+# holds a header naming the generation, the piece count and the total length.
+# The generation is a random id made for each write (never derived from the
+# value), and every piece starts with it. Pieces are written first and the
+# header last; the previous generation's pieces are deleted only after the new
+# value reads back whole. A reader requires every piece 1..N to carry the
+# header's generation and the lengths to add up: anything else is a torn or
+# stale write and fails closed (``TornSecret``), never a partial value. A
+# short value (an API key) stays one plain ``credential`` entry, as before.
+#
+# A write that dies part way (or a best-effort delete that fails) could leave
+# pieces no header names. So before a write touches any piece it records, in
+# ``credential.pending``, the generation it is writing and the one it
+# replaces (generation ids and counts only, nothing of the value). The next
+# write, replacement or removal of that connection sweeps whichever of those
+# generations the header does not name, then clears the marker; removal
+# deletes the marker too.
+
+_CHUNK_CHARS = 1000
+_MAX_CHUNKS = 128
+_CHUNK_HEADER_RE = re.compile(r"krellbot-chunked-v1:([0-9a-f]{32}):([1-9][0-9]{0,2}):([1-9][0-9]{0,6})")
+
+
+_MARKER_USERNAME = f"{KEYRING_USERNAME}.pending"
+_MARKER_PART_RE = re.compile(r"([0-9a-f]{32}):([1-9][0-9]{0,2})")
+
+
+def _marker_value(new: tuple[str, int] | None, old: tuple[str, int] | None) -> str:
+    def part(gen: tuple[str, int] | None) -> str:
+        return "-" if gen is None else f"{gen[0]}:{gen[1]}"
+
+    return f"krellbot-pending-v1 new={part(new)} old={part(old)}"
+
+
+def _parse_marker(value: object) -> list[tuple[str, int]] | None:
+    """The generations a marker names (new, then old), or None when it is not a marker."""
+
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"krellbot-pending-v1 new=(\S+) old=(\S+)", value)
+    if match is None:
+        return None
+    out = []
+    for part in match.groups():
+        if part == "-":
+            continue
+        found = _MARKER_PART_RE.fullmatch(part)
+        if found is None or int(found.group(2)) > _MAX_CHUNKS:
+            return None
+        out.append((found.group(1), int(found.group(2))))
+    return out
+
+
+def _generation_names(generation: str, count: int) -> list[str]:
+    return [f"{KEYRING_USERNAME}.{generation}.{index}" for index in range(1, count + 1)]
+
+
+def _sweep_marked(backend: object, service: str, header_value: str | None) -> None:
+    """Delete the pieces of every marked generation the header does not name, then the marker. Raises on a
+    backend read failure; deletions are best effort."""
+
+    raw = backend.get_password(service, _MARKER_USERNAME)  # type: ignore[attr-defined]
+    if raw is None:
+        return
+    header = _parse_chunk_header(header_value)
+    live = header[0] if header is not None else None
+    for generation, count in _parse_marker(raw) or []:
+        if generation != live:
+            _delete_names(backend, service, _generation_names(generation, count))
+    _delete_names(backend, service, [_MARKER_USERNAME])
+
+
+def _sweep_quietly(backend: object, service: str) -> None:
+    """Sweep against the header now in place, best effort (after a write committed or was undone)."""
+
+    with contextlib.suppress(Exception):
+        _sweep_marked(backend, service, backend.get_password(service, KEYRING_USERNAME))  # type: ignore[attr-defined]
+
+
+class TornSecret(Exception):
+    """A chunked keychain value whose pieces do not match its header: a torn or stale write."""
+
+
+def _parse_chunk_header(value: object) -> tuple[str, int, int] | None:
+    """``(generation, count, total_length)`` from a header, or None for a plain value."""
+
+    match = _CHUNK_HEADER_RE.fullmatch(value) if isinstance(value, str) else None
+    if match is None or int(match.group(2)) > _MAX_CHUNKS:
+        return None
+    return match.group(1), int(match.group(2)), int(match.group(3))
+
+
+def _chunk_names(header: tuple[str, int, int] | None) -> list[str]:
+    if header is None:
+        return []
+    generation, count, _total = header
+    return [f"{KEYRING_USERNAME}.{generation}.{index}" for index in range(1, count + 1)]
+
+
+def _read_secret(backend: object, service: str) -> str | None:
+    """A plain entry, or its pieces joined. Raises TornSecret when a piece is missing, carries another
+    generation, or the lengths do not add up."""
+
+    value = backend.get_password(service, KEYRING_USERNAME)  # type: ignore[attr-defined]
+    header = _parse_chunk_header(value)
+    if header is None:
+        return value
+    generation, _count, total = header
+    prefix = generation + ":"
+    parts = []
+    for name in _chunk_names(header):
+        part = backend.get_password(service, name)  # type: ignore[attr-defined]
+        if not isinstance(part, str) or not part.startswith(prefix) or len(part) == len(prefix):
+            raise TornSecret("a piece is missing or belongs to another write")
+        parts.append(part[len(prefix) :])
+    whole = "".join(parts)
+    if len(whole) != total:
+        raise TornSecret("the pieces do not add up to the recorded length")
+    return whole
+
+
+def _write_secret(backend: object, service: str, secret: str, previous: str | None) -> bool:
+    """Write ``secret`` (chunked when long), header last. Raises on any backend failure, cleaning up its pieces.
+
+    Returns True when it left an in-flight marker for the caller to sweep.
+    """
+
+    old = _parse_chunk_header(previous)
+    old_generation = (old[0], old[1]) if old is not None else None
+    if len(secret) <= _CHUNK_CHARS and _parse_chunk_header(secret) is None:
+        if old_generation is not None:
+            # The previous value's pieces become garbage once this commits: mark them first.
+            backend.set_password(service, _MARKER_USERNAME, _marker_value(None, old_generation))  # type: ignore[attr-defined]
+        backend.set_password(service, KEYRING_USERNAME, secret)  # type: ignore[attr-defined]
+        return old_generation is not None
+    pieces = [secret[i : i + _CHUNK_CHARS] for i in range(0, len(secret), _CHUNK_CHARS)]
+    if len(pieces) > _MAX_CHUNKS:
+        raise ValueError("value too long")
+    # A random id for this write, never derived from the value.
+    generation = stdlib_secrets.token_hex(16)
+    while old is not None and generation == old[0]:
+        generation = stdlib_secrets.token_hex(16)
+    header = (generation, len(pieces), len(secret))
+    names = _chunk_names(header)
+    # Before any piece is written: which generation is in flight, and which it replaces.
+    backend.set_password(service, _MARKER_USERNAME, _marker_value((generation, len(pieces)), old_generation))  # type: ignore[attr-defined]
+    try:
+        for name, piece in zip(names, pieces, strict=True):
+            backend.set_password(service, name, f"{generation}:{piece}")  # type: ignore[attr-defined]
+        backend.set_password(  # type: ignore[attr-defined]
+            service, KEYRING_USERNAME, f"krellbot-chunked-v1:{generation}:{len(pieces)}:{len(secret)}"
+        )
+    except BaseException:
+        _delete_names(backend, service, names)
+        raise
+    return True
+
+
+def _delete_names(backend: object, service: str, names: list[str]) -> None:
+    for name in names:
+        with contextlib.suppress(Exception):  # best effort; a stale piece is unreadable without its header
+            backend.delete_password(service, name)  # type: ignore[attr-defined]
+
+
+def _delete_chunks(backend: object, service: str, header_value: str | None) -> None:
+    """Delete the pieces a (previous) header names. Best effort."""
+
+    _delete_names(backend, service, _chunk_names(_parse_chunk_header(header_value)))
+
+
+def _restore_secret(backend: object, service: str, previous: str | None) -> None:
+    """Put a replacement back as it was: the previous header (its pieces were never touched), or nothing."""
+
+    current = None
+    with contextlib.suppress(Exception):
+        current = backend.get_password(service, KEYRING_USERNAME)  # type: ignore[attr-defined]
+    with contextlib.suppress(Exception):
+        if previous is None:
+            backend.delete_password(service, KEYRING_USERNAME)  # type: ignore[attr-defined]
+        else:
+            backend.set_password(service, KEYRING_USERNAME, previous)  # type: ignore[attr-defined]
+    if current != previous:
+        _delete_chunks(backend, service, current)
 
 
 def keychain_is_safe(backend: object, *, allow_injected_fake_backend: bool = False) -> bool:
@@ -214,12 +437,17 @@ class ConnectionStore:
         clock: Callable[[], str] | None = None,
         allow_injected_fake_backend: bool = False,
     ) -> None:
-        self._dir = Path(home) / "ai"
+        self.home = Path(home)
+        self._dir = self.home / "ai"
         self._path = self._dir / "connections.json"
         self._clock = clock or _now_iso
         # Tests-only: admit the in-tree FakeKeyring, as the exchange-key routes do.
         self._allow_fake = allow_injected_fake_backend
         self._lock = _lock_for(self._path)
+
+    @property
+    def allow_injected_fake_backend(self) -> bool:
+        return self._allow_fake
 
     # ---- reads ------------------------------------------------------------
 
@@ -239,9 +467,16 @@ class ConnectionStore:
         return found
 
     def credential(self, conn_id: str) -> str | None:
+        """The stored value: a single entry, or its chunks reassembled.
+
+        A torn or stale chunked value (a piece missing, from another write, or
+        lengths that do not add up) fails closed as ``ai_keychain_unavailable``;
+        a partial value is never returned.
+        """
+
         service = _service(conn_id)
         try:
-            return keyring.get_keyring().get_password(service, KEYRING_USERNAME)
+            return _read_secret(keyring.get_keyring(), service)
         except Exception:  # noqa: BLE001 — backend errors can carry arbitrary text; never surfaced
             raise ConnectionRefused("ai_keychain_unavailable") from None
 
@@ -257,6 +492,12 @@ class ConnectionStore:
 
     def adapter(self, conn: Connection, transport: HttpTransport | None = None) -> ChatAdapter:
         check_endpoint(conn)  # before the keychain is touched
+        if is_chatgpt(conn):
+            # The access token comes from the sign-in's record, renewed near expiry. Imported here:
+            # the sign-in module imports this one.
+            from krellbot.ai.oauth import chatgpt_adapter
+
+            return chatgpt_adapter(self, conn, transport=transport or UrllibTransport())
         return build_adapter(conn, self.credential_for(conn), transport or UrllibTransport())
 
     # ---- writes -----------------------------------------------------------
@@ -350,6 +591,74 @@ class ConnectionStore:
             raise
         return conn
 
+    def add_record(self, preset: str, *, model: str, record: str, label: str | None = None) -> Connection:
+        """Store a new ``oauth`` connection whose keychain entry is a sign-in's credential record.
+
+        ``record`` is a JSON object (identity, client id, tokens, scopes,
+        expiry); it goes only to the keychain, never to the metadata file.
+        """
+
+        clean = self._clean_record(record)
+        with self._lock:
+            conns, active = self._load()
+            spec = PRESETS.get(preset) if isinstance(preset, str) else None
+            if spec is None:
+                raise ConnectionRefused("ai_preset_unknown")
+            if spec.custom or spec.signin == "none":
+                raise ConnectionRefused("ai_auth_invalid")
+            clean_model = _clean_text(model, _MAX_MODEL)
+            if clean_model is None:
+                raise ConnectionRefused("ai_model_invalid")
+            clean_label = _clean_text(spec.label if label is None else label, _MAX_LABEL)
+            if clean_label is None:
+                raise ConnectionRefused("ai_label_invalid")
+            taken = {c.id for c in conns}
+            conn_id = stdlib_secrets.token_hex(8)
+            while conn_id in taken:
+                conn_id = stdlib_secrets.token_hex(8)
+            conn = Connection(
+                id=conn_id,
+                preset=spec.id,
+                label=clean_label,
+                format=spec.format,
+                base_url=spec.base_url,
+                model=clean_model,
+                auth="oauth",
+                capability="unprobed",
+                created_at=self._clock(),
+            )
+            self._store_secret(conn_id, clean)
+            try:
+                self._save([*conns, conn], active)
+            except BaseException:
+                self._forget_secret(conn_id, strict=False)
+                raise
+            return conn
+
+    def replace_record(self, conn_id: str, record: str) -> None:
+        """Replace an ``oauth`` connection's credential record in one keychain write (a whole token set)."""
+
+        clean = self._clean_record(record)
+        with self._lock:
+            found = next((c for c in self._load()[0] if c.id == conn_id), None) if is_connection_id(conn_id) else None
+            if found is None:
+                raise ConnectionRefused("ai_connection_not_found")
+            if found.auth != "oauth":
+                raise ConnectionRefused("ai_auth_invalid")
+            self._store_secret(conn_id, clean, keep_on_failure=True)
+
+    @staticmethod
+    def _clean_record(record: object) -> str:
+        if not isinstance(record, str) or not record or len(record) > _MAX_CREDENTIAL_RECORD:
+            raise ConnectionRefused("ai_credential_invalid")
+        try:
+            parsed = json.loads(record)
+        except (ValueError, RecursionError):
+            raise ConnectionRefused("ai_credential_invalid") from None
+        if not isinstance(parsed, dict):
+            raise ConnectionRefused("ai_credential_invalid")
+        return record
+
     def remove(self, conn_id: str) -> None:
         """Delete the keychain entry first, so a failure leaves a keyed connection listed and removable.
 
@@ -403,24 +712,64 @@ class ConnectionStore:
             raise ConnectionRefused("ai_credential_invalid")
         return value
 
-    def _store_secret(self, conn_id: str, secret: str) -> None:
+    def _store_secret(self, conn_id: str, secret: str, *, keep_on_failure: bool = False) -> None:
+        """Write and read back (chunked when long). A failed new entry is deleted; a failed replacement
+        (``keep_on_failure``) is put back as it was."""
+
         service = _service(conn_id)
         backend = keyring.get_keyring()
         if not keychain_is_safe(backend, allow_injected_fake_backend=self._allow_fake):
             raise ConnectionRefused("ai_keychain_unavailable")
+        previous: str | None = None
+        if keep_on_failure:
+            # A replacement: the value it replaces names the chunks to delete, or to keep on failure.
+            # A new connection's id is fresh, so it has no previous value to read.
+            try:
+                previous = backend.get_password(service, KEYRING_USERNAME)
+                # A write that died part way last time: sweep the pieces no header names.
+                _sweep_marked(backend, service, previous)
+            except Exception:  # noqa: BLE001 — backend errors can carry arbitrary text; never surfaced
+                raise ConnectionRefused("ai_keychain_unavailable") from None
+        marked = False
         try:
-            backend.set_password(service, KEYRING_USERNAME, secret)
-            stored = backend.get_password(service, KEYRING_USERNAME)
-        except Exception:  # noqa: BLE001 — backend errors can carry arbitrary text; never surfaced
+            marked = _write_secret(backend, service, secret, previous)
+            stored = _read_secret(backend, service)
+        except Exception:  # noqa: BLE001
             stored = None
+            marked = True  # a chunked write may have marked before failing; the sweep below is cheap
         if stored != secret:
-            self._forget_secret(conn_id, strict=False)
+            if keep_on_failure:
+                _restore_secret(backend, service, previous)
+            else:
+                self._forget_secret(conn_id, strict=False)
+            if marked:
+                _sweep_quietly(backend, service)
             raise ConnectionRefused("ai_keychain_unavailable")
+        # Only now that the new value reads back whole: drop the previous generation's chunks.
+        _delete_chunks(backend, service, previous)
+        if marked:
+            _sweep_quietly(backend, service)
 
     @staticmethod
     def _forget_secret(conn_id: str, *, strict: bool) -> None:
+        """Delete the entry and any chunks under its service."""
+
         service = _service(conn_id)
         backend = keyring.get_keyring()
+        try:
+            header = backend.get_password(service, KEYRING_USERNAME)
+        except Exception:  # noqa: BLE001
+            if strict:
+                raise ConnectionRefused("ai_keychain_unavailable") from None
+            header = None
+        marker = None
+        if _parse_chunk_header(header) is not None or strict:
+            # A marker exists only beside chunked values; a plain entry's removal needs no extra read.
+            try:
+                marker = backend.get_password(service, _MARKER_USERNAME)
+            except Exception:  # noqa: BLE001
+                if strict:
+                    raise ConnectionRefused("ai_keychain_unavailable") from None
         try:
             backend.delete_password(service, KEYRING_USERNAME)
         except keyring.errors.PasswordDeleteError:
@@ -429,13 +778,24 @@ class ConnectionStore:
             if strict:
                 raise ConnectionRefused("ai_keychain_unavailable") from None
             return
+        # The header's pieces, every marked generation's pieces (an interrupted write), and the marker.
+        marked = [name for gen, count in _parse_marker(marker) or [] for name in _generation_names(gen, count)]
+        chunks = _chunk_names(_parse_chunk_header(header)) + marked + ([_MARKER_USERNAME] if marker is not None else [])
+        for name in chunks:
+            try:
+                backend.delete_password(service, name)
+            except keyring.errors.PasswordDeleteError:
+                pass
+            except Exception:  # noqa: BLE001
+                if strict:
+                    raise ConnectionRefused("ai_keychain_unavailable") from None
         if not strict:
             return
         try:
-            leftover = backend.get_password(service, KEYRING_USERNAME)
+            leftovers = [backend.get_password(service, name) for name in (KEYRING_USERNAME, *chunks)]
         except Exception:  # noqa: BLE001
             raise ConnectionRefused("ai_keychain_unavailable") from None
-        if leftover is not None:
+        if any(value is not None for value in leftovers):
             raise ConnectionRefused("ai_keychain_unavailable")
 
     # ---- file -------------------------------------------------------------

@@ -71,6 +71,7 @@ from krellbot.agent.persona import MODE_QUESTION, OPENING_LINE, system_prompt
 from krellbot.ai.connections import Connection, ConnectionRefused, ConnectionStore, provider_host
 from krellbot.ai.disclosure import egress_disclosure
 from krellbot.ai.http import HttpTransport
+from krellbot.ai.oauth import chatgpt_plan_in_use
 from krellbot.ai.types import ChatAdapter, ChatMessage, ProviderError, TextDelta, ToolCall, ToolCallDone, ToolDef, Usage
 from krellbot.application import user_policy
 
@@ -144,6 +145,16 @@ PROVIDER_MESSAGES: dict[str, str] = {
     "provider_rate_limited": "The provider is rate limiting requests. Wait a moment, then send the message again.",
     "provider_unavailable": "The provider could not be reached. Send the message again later.",
     "provider_bad_response": "The provider sent a reply Krellbot could not use, so nothing ran. Send the message again.",
+    # ChatGPT plan usage (M38.23): these stop the turn; nothing is retried or billed another way.
+    "provider_usage_limit": (
+        "You reached a ChatGPT usage limit, for your plan or for Krellbot, so Krell paused. "
+        "Use Manage usage to review the limit in ChatGPT settings."
+    ),
+    "provider_plan_not_eligible": (
+        "OpenAI did not allow ChatGPT plan usage for this account, workspace or region, so nothing was retried. "
+        "You can connect an OpenAI API key instead."
+    ),
+    "provider_plan_unsupported": "ChatGPT plan usage does not support part of this request, so it was not sent again.",
 }
 
 # ---- what the loop adds to the persona's system prompt ---------------------
@@ -401,6 +412,48 @@ def _connection_view(conn: Connection) -> dict:
     return {"id": conn.id, "label": conn.label, "host": provider_host(conn.base_url), "model": conn.model}
 
 
+MAX_PROVIDER_DETAIL_CHARS = 300
+
+# Credential-shaped text a provider body could echo: a JWT (three base64url segments), a
+# ``Bearer <token>`` value, and ``sk-`` / ``sess-`` style keys with their tails.
+_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer [redacted]"),
+    (re.compile(r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "[redacted-jwt]"),
+    (re.compile(r"(?i)\b(?:sk|sess)[-_][A-Za-z0-9._-]+"), "[redacted-key]"),
+)
+
+
+def redact_diagnostic(text: str) -> str:
+    """``text`` with JWT-shaped, Bearer and ``sk-``/``sess-`` key values replaced, before it is stored."""
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _provider_diagnostics(failure: ProviderError) -> dict:
+    """What a provider error kept: ``provider`` (status, code, param, request id) for the event and the
+    stored notice, and ``stored`` (a short body excerpt) for the stored notice only.
+
+    The body is diagnostic text from the provider: never the message, never
+    on the live event. It reaches the browser with the stored conversation,
+    so credential-shaped values in it are redacted before it is kept.
+    """
+    facts = {
+        "status": failure.status,
+        "code": failure.provider_code,
+        "param": failure.param,
+        "request_id": failure.request_id,
+    }
+    kept = {key: value for key, value in facts.items() if value is not None}
+    if not kept:
+        return {}
+    out: dict[str, Any] = {"provider": kept}
+    if failure.detail:
+        # Redact the whole body first, so a credential cut by the excerpt's end is still caught.
+        out["stored"] = {"detail": redact_diagnostic(failure.detail)[:MAX_PROVIDER_DETAIL_CHARS]}
+    return out
+
+
 def _call_record(call: ToolCall) -> dict:
     record: dict[str, Any] = {"id": call.id, "name": call.name, "arguments": call.arguments}
     if call.provider_data is not None:
@@ -558,11 +611,17 @@ class KrellLoop:
             conn = self._connections.active()
         except ConnectionRefused:
             conn = None
+        connection = None
+        if conn is not None:
+            connection = {**_connection_view(conn), "capability": conn.capability}
+            if chatgpt_plan_in_use(self._home, conn):
+                # The workstation shows "Using ChatGPT plan" near the composer (M38.23).
+                connection["plan"] = "chatgpt"
         return {
             "messages": [{"id": m.id, "role": m.role, "payload": m.payload, "ts": m.ts} for m in history],
             "profile": {"mode": profile.mode, "answers": profile.answers},
             "budget": asdict(self._budget_state()),
-            "connection": None if conn is None else {**_connection_view(conn), "capability": conn.capability},
+            "connection": connection,
             "disclosure": None if conn is None else egress_disclosure(conn),
         }
 
@@ -725,7 +784,11 @@ class KrellLoop:
                 # No tool runs on a failed stream, and the call is not retried.
                 if text:
                     self._store.append("assistant", {"text": text})
-                yield from self._fail(failure.code, PROVIDER_MESSAGES.get(failure.code))
+                yield from self._fail(
+                    failure.code,
+                    PROVIDER_MESSAGES.get(failure.code) or failure.message,
+                    **_provider_diagnostics(failure),
+                )
                 return
             self._store.append("assistant", {"text": text, "tool_calls": [_call_record(c) for c in calls]})
             yield {"type": "message_done", "text": text}
@@ -840,9 +903,18 @@ class KrellLoop:
         yield self._budget_event()
 
     def _fail(self, code: str, message: str | None, **extra: Any) -> Iterator[dict]:
-        """End a turn with a typed error, kept in the conversation so a reload shows it."""
+        """End a turn with a typed error, kept in the conversation so a reload shows it.
+
+        A provider error's diagnostics (status, code, param, request id, and a
+        short excerpt of the body) are kept with it, so the request id survives
+        a reload. The excerpt is stored only, never shown as the message.
+        """
+        stored_extra = extra.pop("stored", {})
         event = error_event(code, message, **extra)
-        self._store.append("notice", {"kind": "error", "code": code, "message": event["message"]})
+        payload: dict[str, Any] = {"kind": "error", "code": code, "message": event["message"]}
+        if "provider" in extra:
+            payload["provider"] = {**extra["provider"], **stored_extra}
+        self._store.append("notice", payload)
         yield event
 
     def _connection(self) -> Connection | dict:

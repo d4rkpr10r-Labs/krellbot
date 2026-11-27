@@ -25,6 +25,8 @@ export type KrellConnection = {
   host: string;
   model: string;
   capability: string;
+  /** "chatgpt" when Krell's requests use the person's ChatGPT plan (M38.23). */
+  plan?: "chatgpt" | null;
 };
 
 export type KrellToolResult = Record<string, unknown>;
@@ -49,7 +51,8 @@ export type KrellEvent =
   | { type: "tool_result"; id: string; name: string; result: KrellToolResult }
   | { type: "highlight"; test_id: string }
   | { type: "confirm_request"; id: string; confirm: Record<string, unknown> }
-  | { type: "error"; code: string; message: string }
+  /** `provider`: a provider error's status, code, param and request id (M38.23); never its body. */
+  | { type: "error"; code: string; message: string; provider?: Record<string, unknown> }
   | { type: "done" };
 
 /** One stored conversation row: `role` is user, assistant, tool or notice. */
@@ -202,6 +205,7 @@ function toConnection(raw: unknown): KrellConnection | null {
     host: str(raw.host),
     model: str(raw.model),
     capability: str(raw.capability),
+    plan: raw.plan === "chatgpt" ? "chatgpt" : null,
   };
 }
 

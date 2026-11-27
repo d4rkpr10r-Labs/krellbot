@@ -4891,6 +4891,14 @@ def create_app(
         "ai_signin_not_found": 404,
         "ai_signin_listener_failed": 503,
         "ai_signin_local_only": 403,
+        "ai_chatgpt_local_only": 403,
+        "ai_chatgpt_not_chatgpt": 404,
+        "ai_chatgpt_account_unknown": 404,
+        "ai_chatgpt_signin_required": 409,
+        "ai_chatgpt_plan_disabled": 409,
+        "ai_chatgpt_client_invalid": 409,
+        "ai_chatgpt_state_unreadable": 409,
+        "ai_chatgpt_refresh_unavailable": 503,
     }
 
     def _ai_json(body: dict, status_code: int = 200) -> Response:
@@ -4924,10 +4932,10 @@ def create_app(
         )
 
     def _ai_connection_view(conn, active_id: str | None) -> dict:
-        from krellbot.ai.connections import provider_host
+        from krellbot.ai.connections import is_chatgpt, provider_host
         from krellbot.ai.disclosure import egress_disclosure
 
-        return {
+        view = {
             "id": conn.id,
             "preset": conn.preset,
             "label": conn.label,
@@ -4941,11 +4949,17 @@ def create_app(
             "active": conn.id == active_id,
             "disclosure": egress_disclosure(conn),
         }
+        if is_chatgpt(conn):
+            from krellbot.ai.oauth import chatgpt_connection_view
+
+            # Plan and sign-in state from ai/chatgpt.json: never a token, never a keychain read.
+            view["chatgpt"] = chatgpt_connection_view(home, conn.id)
+        return view
 
     async def _ai_probe_and_record(s: _AppState, store, conn) -> Response:
         """Probe ``conn`` off the event loop, record its capability, and answer."""
 
-        from krellbot.ai.connections import ConnectionRefused, build_adapter, check_endpoint
+        from krellbot.ai.connections import ConnectionRefused, build_adapter, check_endpoint, is_chatgpt
         from krellbot.ai.http import UrllibTransport
         from krellbot.ai.probe import probe
         from krellbot.ai.providers import fetch_model_ids
@@ -4953,16 +4967,29 @@ def create_app(
         transport = s.ai_transport or UrllibTransport()
         try:
             check_endpoint(conn)  # before the keychain is touched
-            credential = await asyncio.to_thread(store.credential_for, conn)
-            adapter = build_adapter(conn, credential, transport)
+            if is_chatgpt(conn):
+                from krellbot.ai.oauth import chatgpt_access_token
+                from krellbot.ai.openai_compat import fetch_chatgpt_models
+
+                # The access token, renewed near expiry; a plan-disabled sign-in is refused here.
+                access = await asyncio.to_thread(
+                    chatgpt_access_token, store, conn, transport=transport, clock=lambda: _app_now(s)
+                )
+                adapter = build_adapter(conn, access, transport)
+
+                def list_models() -> list[str]:
+                    return fetch_chatgpt_models(conn.base_url, access, transport)
+
+            else:
+                credential = await asyncio.to_thread(store.credential_for, conn)
+                adapter = build_adapter(conn, credential, transport)
+
+                def list_models() -> list[str]:
+                    return fetch_model_ids(conn.format, conn.base_url, credential, transport)
+
         except ConnectionRefused as exc:
             return _ai_refused(exc)
-        result = await asyncio.to_thread(
-            probe,
-            conn,
-            adapter,
-            list_models=lambda: fetch_model_ids(conn.format, conn.base_url, credential, transport),
-        )
+        result = await asyncio.to_thread(probe, conn, adapter, list_models=list_models)
         try:
             updated = await asyncio.to_thread(store.set_capability, conn.id, result.capability)
             active = store.active()
@@ -5005,6 +5032,12 @@ def create_app(
             }
             for p in PRESETS.values()
         ]
+        from krellbot.ai.oauth import chatgpt_saved_accounts
+
+        for provider in providers:
+            if provider["signin"] == "chatgpt":
+                # Saved ChatGPT accounts with no connection now ("Continue as"); no token, no client id.
+                provider["chatgpt_accounts"] = chatgpt_saved_accounts(s.home)
         return _ai_json({"ok": True, "effect": "unchanged", "providers": providers})
 
     @app.get("/api/v1/ai/connections")
@@ -5073,9 +5106,15 @@ def create_app(
 
     @app.delete("/api/v1/ai/connections/{conn_id}")
     async def ai_connections_remove(conn_id: str, request: Request) -> Response:
-        """Remove a connection and delete its keychain entry."""
+        """Remove a connection and delete its keychain entry.
 
-        from krellbot.ai.connections import ConnectionRefused, is_connection_id
+        A ChatGPT sign-in first revokes its refresh token at OpenAI (M38.23);
+        ``revocation`` says whether OpenAI confirmed it, and ``detail``
+        explains an unconfirmed one. The tokens are cleared either way.
+        """
+
+        from krellbot.ai.connections import ConnectionRefused, is_chatgpt, is_connection_id
+        from krellbot.ai.http import UrllibTransport
 
         s = _state(request.app)
         denied = _gate_state_change(request, s)
@@ -5083,11 +5122,86 @@ def create_app(
             return denied
         if not is_connection_id(conn_id):
             return _ai_not_found()
+        store = _ai_store(s)
         try:
-            await asyncio.to_thread(_ai_store(s).remove, conn_id)
+            conn = store.get(conn_id)
+            if is_chatgpt(conn):
+                from krellbot.ai.oauth import remove_chatgpt_connection
+
+                result = await asyncio.to_thread(
+                    remove_chatgpt_connection, store, conn, transport=s.ai_transport or UrllibTransport()
+                )
+                body = {"ok": True, "effect": "changed", "removed": conn_id, "revocation": result.revocation}
+                if result.message:
+                    body["detail"] = result.message
+                return _ai_json(body)
+            await asyncio.to_thread(store.remove, conn_id)
         except ConnectionRefused as exc:
             return _ai_refused(exc)
         return _ai_json({"ok": True, "effect": "changed", "removed": conn_id})
+
+    @app.post("/api/v1/ai/connections/{conn_id}/signout")
+    async def ai_connections_signout(conn_id: str, request: Request) -> Response:
+        """Sign a ChatGPT connection out: revoke its refresh token, clear its tokens, keep the connection.
+
+        The account-to-client mapping and this install's host id are kept for
+        a later sign-in. The connection is marked unprobed until it signs in
+        again.
+        """
+
+        from krellbot.ai.connections import ConnectionRefused, is_chatgpt, is_connection_id
+        from krellbot.ai.http import UrllibTransport
+        from krellbot.ai.oauth import chatgpt_sign_out
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        if not is_connection_id(conn_id):
+            return _ai_not_found()
+        store = _ai_store(s)
+        try:
+            conn = store.get(conn_id)
+            if not is_chatgpt(conn):
+                raise ConnectionRefused("ai_chatgpt_not_chatgpt")
+            result = await asyncio.to_thread(
+                chatgpt_sign_out, store, conn, transport=s.ai_transport or UrllibTransport()
+            )
+            updated = await asyncio.to_thread(store.set_capability, conn_id, "unprobed")
+            active = store.active()
+        except ConnectionRefused as exc:
+            return _ai_refused(exc)
+        body = {
+            "ok": True,
+            "effect": "changed",
+            "revocation": result.revocation,
+            "connection": _ai_connection_view(updated, active.id if active else None),
+        }
+        if result.message:
+            body["detail"] = result.message
+        return _ai_json(body)
+
+    @app.post("/api/v1/ai/connections/{conn_id}/welcome")
+    async def ai_connections_welcome(conn_id: str, request: Request) -> Response:
+        """Record that "You're using your ChatGPT plan" was shown for this connection, so it shows once."""
+
+        from krellbot.ai.connections import ConnectionRefused, is_chatgpt, is_connection_id
+        from krellbot.ai.oauth import mark_chatgpt_welcome_shown
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        if not is_connection_id(conn_id):
+            return _ai_not_found()
+        store = _ai_store(s)
+        try:
+            if not is_chatgpt(store.get(conn_id)):
+                raise ConnectionRefused("ai_chatgpt_not_chatgpt")
+            changed = await asyncio.to_thread(mark_chatgpt_welcome_shown, s.home, conn_id)
+        except ConnectionRefused as exc:
+            return _ai_refused(exc)
+        return _ai_json({"ok": True, "effect": "changed" if changed else "unchanged"})
 
     @app.post("/api/v1/ai/connections/{conn_id}/activate")
     async def ai_connections_activate(conn_id: str, request: Request) -> Response:
@@ -5147,6 +5261,8 @@ def create_app(
         body: dict = {"flow_id": flow_id, "state": status["state"]}
         if "connection_id" in status:
             body["connection_id"] = status["connection_id"]
+        if "plan" in status:
+            body["plan"] = status["plan"]
         if "code" in status:
             body["code"] = status["code"]
             body["detail"] = status["message"]
@@ -5184,6 +5300,70 @@ def create_app(
                 transport=s.ai_transport or UrllibTransport(),
                 listener_factory=s.ai_signin_listener_factory,
                 registry=_ai_signins(s),
+                allow_injected_fake_backend=s.keys_allow_fake_backend,
+            )
+        except (ConnectionRefused, SigninRefused) as exc:
+            return _ai_refused(exc)
+        return _ai_json({"ok": True, "effect": "changed", "flow_id": flow.id, "authorize_url": flow.authorize_url})
+
+    # ---- Sign in with ChatGPT (M38.23) ---------------------------------
+    #
+    # Same shape as OpenRouter's: a one-shot listener on 127.0.0.1 (not a
+    # route here), the shared status and cancel routes, local-only start. The
+    # browser gets the listener's launch address, which redirects to OpenAI;
+    # codes, tokens and the authorize URL (which may carry id_token_hint)
+    # never pass through these routes.
+
+    @app.post("/api/v1/ai/signin/chatgpt")
+    async def ai_signin_chatgpt(request: Request) -> Response:
+        """Start Continue with ChatGPT.
+
+        Body: ``model`` for a new connection, optionally with ``account`` (a
+        saved account's id: "Continue as", reusing its issued client) or
+        ``retry: true`` ("Try again" after OpenAI refused a first
+        registration's code), or ``connection_id`` to sign that connection in
+        again.
+        """
+
+        from krellbot.ai.connections import ConnectionRefused
+        from krellbot.ai.http import UrllibTransport
+        from krellbot.ai.oauth import SigninRefused, start_chatgpt_signin
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        peer = request.client.host if request.client is not None else None
+        if tailnet_access is not None or peer not in ("127.0.0.1", "::1"):
+            return _ai_refused(SigninRefused("ai_chatgpt_local_only"))
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            return _ai_invalid_body()
+        if not isinstance(payload, dict):
+            return _ai_invalid_body()
+        model, connection_id, account = payload.get("model"), payload.get("connection_id"), payload.get("account")
+        if any(v is not None and not isinstance(v, str) for v in (connection_id, account)):
+            return _ai_invalid_body()
+        if connection_id is not None and account is not None:
+            return _ai_invalid_body()
+        if connection_id is None and not isinstance(model, str):
+            return _ai_invalid_body()
+        retry = payload.get("retry", False)
+        if not isinstance(retry, bool):
+            return _ai_invalid_body()
+        try:
+            flow = await asyncio.to_thread(
+                start_chatgpt_signin,
+                s.home,
+                model=model if isinstance(model, str) else None,
+                clock=lambda: _app_now(s),
+                transport=s.ai_transport or UrllibTransport(),
+                listener_factory=s.ai_signin_listener_factory,
+                registry=_ai_signins(s),
+                connection_id=connection_id,
+                account=account,
+                retry=retry,
                 allow_injected_fake_backend=s.keys_allow_fake_backend,
             )
         except (ConnectionRefused, SigninRefused) as exc:

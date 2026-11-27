@@ -326,6 +326,32 @@
   overflow-wrap: anywhere;
 }
 
+/* The one primary on a surface (the ChatGPT plan welcome's Got it, M38.23). */
+.kbot-settings__btn--primary {
+  background: var(--action-primary-bg);
+  color: var(--action-primary-text);
+  border-color: var(--action-primary-bg);
+  font-weight: 700;
+}
+
+.kbot-settings__btn--primary:hover:not(:disabled) {
+  border-color: var(--seafoam, #a8d8d1);
+}
+
+/* "You're using your ChatGPT plan": shown once, in place of the form until Got it. */
+.kbot-settings__welcome {
+  display: grid;
+  gap: 10px;
+  justify-items: start;
+}
+
+.kbot-settings__welcome-title {
+  margin: 0;
+  color: var(--text, #e9f0f5);
+  font-size: 15px;
+  font-weight: 700;
+}
+
 .kbot-settings__error {
   margin: 0;
   font-size: 12.5px;
