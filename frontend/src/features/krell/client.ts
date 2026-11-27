@@ -15,6 +15,9 @@ import { getCsrf } from "../../session";
 export type KrellMode = "standard" | "advanced";
 export type KrellDecision = "confirm" | "decline";
 
+/** The opening's quick replies (the engine's `QUICK_REPLIES`), keyed by the mode each sends. */
+export const MODE_REPLIES: Readonly<Record<KrellMode, string>> = { standard: "Standard", advanced: "Advanced" };
+
 /** The active model as the conversation route reports it (no secrets). */
 export type KrellConnection = {
   id: string;
@@ -60,6 +63,8 @@ export type KrellConversationBody = {
   messages: KrellStoredMessage[];
   connection: KrellConnection | null;
   budget: KrellBudget | null;
+  /** The stored mode; null until the person (or Krell, with `set_profile`) chooses one. */
+  mode: KrellMode | null;
 };
 
 export type KrellRefusal = { ok: false; code: string; message: string };
@@ -223,6 +228,11 @@ export function toBudget(raw: unknown): KrellBudget | null {
   };
 }
 
+/** A mode the engine sent: standard or advanced, else null. */
+export function toMode(value: unknown): KrellMode | null {
+  return value === "standard" || value === "advanced" ? value : null;
+}
+
 function toStored(raw: unknown): KrellStoredMessage | null {
   if (!isRecord(raw) || typeof raw.role !== "string" || !isRecord(raw.payload)) return null;
   return { id: typeof raw.id === "number" ? raw.id : 0, role: raw.role, payload: raw.payload };
@@ -243,6 +253,7 @@ export function createKrellClient(): KrellClient {
           messages: rows.map(toStored).filter((m): m is KrellStoredMessage => m !== null),
           connection: toConnection(record.connection),
           budget: toBudget(record.budget),
+          mode: toMode(isRecord(record.profile) ? record.profile.mode : null),
         };
       } catch {
         return { ok: false, code: "network_error", message: NETWORK_MESSAGE };
