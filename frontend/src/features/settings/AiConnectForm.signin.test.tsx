@@ -4,7 +4,9 @@
  * The engine returns an authorize URL; the form opens it in a new tab
  * (noopener), polls the sign-in status every 2 s while it is `waiting`, and
  * on `connected` runs the same probe, activate and onConnected path as a key
- * add. `failed` and `expired` show the server's message. Fetch is a fake.
+ * add. `failed` and `expired` show the server's message. Stopping, leaving
+ * and giving up cancel the sign-in on the engine, so an abandoned sign-in can
+ * never add a connection later. Fetch is a fake.
  */
 import {
   act,
@@ -72,7 +74,7 @@ function ok(body: Record<string, unknown>): Reply {
   return { json: { schema_version: "1", ok: true, effect: "unchanged", ...body } };
 }
 
-function installFetch(handler: (call: Call) => Reply): Call[] {
+function installFetch(handler: (call: Call) => Reply | Promise<Reply>): Call[] {
   const calls: Call[] = [];
   vi.stubGlobal(
     "fetch",
@@ -84,7 +86,7 @@ function installFetch(handler: (call: Call) => Reply): Call[] {
         at: Date.now(),
       };
       calls.push(call);
-      const out = handler(call);
+      const out = await handler(call);
       return new Response(JSON.stringify(out.json), {
         status: out.status ?? 200,
         headers: { "Content-Type": "application/json" },
@@ -118,7 +120,20 @@ async function signIn(model = "openrouter/auto"): Promise<void> {
 }
 
 const statusCalls = (calls: Call[]): Call[] =>
-  calls.filter((c) => c.path === `/api/v1/ai/signin/${FLOW_ID}`);
+  calls.filter((c) => c.method === "GET" && c.path === `/api/v1/ai/signin/${FLOW_ID}`);
+const cancelCalls = (calls: Call[]): Call[] =>
+  calls.filter((c) => c.method === "DELETE" && c.path === `/api/v1/ai/signin/${FLOW_ID}`);
+
+function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+const STARTED = (): Reply =>
+  ok({ effect: "changed", flow_id: FLOW_ID, authorize_url: AUTHORIZE_URL });
 
 let openSpy: ReturnType<typeof vi.fn>;
 
@@ -281,22 +296,203 @@ describe("AiConnectForm sign in with OpenRouter", () => {
     expect(statusCalls(calls)).toHaveLength(0);
   });
 
-  it("stops polling when the user stops waiting", async () => {
+  it("cancels the sign-in on the engine and stops polling when the user stops waiting", async () => {
     const calls = installFetch((c) => {
       if (c.path === "/api/v1/ai/providers") return ok({ providers: PROVIDERS });
-      if (c.path === "/api/v1/ai/signin/openrouter") {
-        return ok({ effect: "changed", flow_id: FLOW_ID, authorize_url: AUTHORIZE_URL });
+      if (c.path === "/api/v1/ai/signin/openrouter") return STARTED();
+      if (c.method === "DELETE") {
+        return ok({
+          effect: "changed",
+          cancelled: true,
+          flow_id: FLOW_ID,
+          state: "failed",
+          code: "ai_signin_cancelled",
+          detail: "The sign-in was cancelled, so nothing was stored.",
+        });
       }
+      return ok({ flow_id: FLOW_ID, state: "waiting" });
+    });
+    const { onAdded } = await renderForm();
+    await signIn();
+    await advance(2000);
+    expect(statusCalls(calls)).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: /stop waiting/i }));
+    await advance(0);
+    expect(cancelCalls(calls)).toHaveLength(1);
+    expect(cancelCalls(calls)[0].body).toBeUndefined();
+    await advance(10_000);
+    expect(statusCalls(calls)).toHaveLength(1);
+    expect(screen.queryByTestId("ai-signin-waiting")).toBeNull();
+    const button = screen.getByRole("button", { name: /sign in with openrouter/i });
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+    // Unmounting later does not cancel again.
+    cleanup();
+    await advance(0);
+    expect(cancelCalls(calls)).toHaveLength(1);
+    expect(onAdded).not.toHaveBeenCalled();
+  });
+
+  it("keeps following a sign-in whose callback already arrived when the user stops waiting", async () => {
+    const statuses = ["waiting", "connected"];
+    const calls = installFetch((c) => {
+      if (c.path === "/api/v1/ai/providers") return ok({ providers: PROVIDERS });
+      if (c.path === "/api/v1/ai/signin/openrouter") return STARTED();
+      if (c.method === "DELETE") {
+        return ok({ cancelled: false, flow_id: FLOW_ID, state: "waiting" });
+      }
+      if (c.path === `/api/v1/ai/signin/${FLOW_ID}`) {
+        const state = statuses.shift() ?? "connected";
+        return ok({
+          flow_id: FLOW_ID,
+          state,
+          ...(state === "connected" ? { connection_id: "aaaaaaaaaaaaaaaa" } : {}),
+        });
+      }
+      if (c.path.endsWith("/probe")) {
+        return ok({ effect: "changed", connection: conn(), probe: { capability: "tools", message: "ok" } });
+      }
+      if (c.path === "/api/v1/ai/connections") return ok({ active: null, connections: [conn()] });
+      if (c.path.endsWith("/activate")) {
+        return ok({ effect: "changed", active: "aaaaaaaaaaaaaaaa", connection: conn({ active: true }) });
+      }
+      throw new Error(`unexpected ${c.method} ${c.path}`);
+    });
+    const { onConnected, onAdded } = await renderForm();
+    await signIn();
+    await advance(2000);
+    fireEvent.click(screen.getByRole("button", { name: /stop waiting/i }));
+    await advance(0);
+    expect(cancelCalls(calls)).toHaveLength(1);
+    expect(screen.getByTestId("ai-signin-waiting")).toBeTruthy();
+    await advance(2000);
+    expect(statusCalls(calls)).toHaveLength(2);
+    expect(onAdded).toHaveBeenCalledTimes(1);
+    expect(onConnected).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides Stop waiting during the post-connect probe and never leaves the controls disabled", async () => {
+    const probe = deferred<Reply>();
+    installFetch((c) => {
+      if (c.path === "/api/v1/ai/providers") return ok({ providers: PROVIDERS });
+      if (c.path === "/api/v1/ai/signin/openrouter") return STARTED();
+      if (c.path === `/api/v1/ai/signin/${FLOW_ID}` && c.method === "GET") {
+        return ok({ flow_id: FLOW_ID, state: "connected", connection_id: "aaaaaaaaaaaaaaaa" });
+      }
+      if (c.path.endsWith("/probe")) return probe.promise;
+      if (c.path === "/api/v1/ai/connections") return ok({ active: null, connections: [conn()] });
+      if (c.path.endsWith("/activate")) {
+        return ok({ effect: "changed", active: "aaaaaaaaaaaaaaaa", connection: conn({ active: true }) });
+      }
+      throw new Error(`unexpected ${c.method} ${c.path}`);
+    });
+    const { onConnected } = await renderForm();
+    await signIn();
+    expect(screen.getByRole("button", { name: /stop waiting/i })).toBeTruthy();
+    await advance(2000);
+    // The probe is in flight: nothing can strand the form in its busy state.
+    expect(screen.queryByRole("button", { name: /stop waiting/i })).toBeNull();
+    probe.resolve(
+      ok({ effect: "changed", connection: conn(), probe: { capability: "tools", message: "ok" } }),
+    );
+    await advance(0);
+    expect(onConnected).toHaveBeenCalledTimes(1);
+    for (const name of [/^connect$/i, /sign in with openrouter/i]) {
+      expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(false);
+    }
+    expect((screen.getByLabelText(/^model$/i) as HTMLInputElement).disabled).toBe(false);
+    expect((screen.getByLabelText(/^provider$/i) as HTMLSelectElement).disabled).toBe(false);
+  });
+
+  it("cancels the sign-in on the engine when the form goes away", async () => {
+    const calls = installFetch((c) => {
+      if (c.path === "/api/v1/ai/providers") return ok({ providers: PROVIDERS });
+      if (c.path === "/api/v1/ai/signin/openrouter") return STARTED();
+      if (c.method === "DELETE") return ok({ cancelled: true, flow_id: FLOW_ID, state: "failed" });
       return ok({ flow_id: FLOW_ID, state: "waiting" });
     });
     await renderForm();
     await signIn();
     await advance(2000);
-    expect(statusCalls(calls)).toHaveLength(1);
-    fireEvent.click(screen.getByRole("button", { name: /stop waiting/i }));
+    cleanup();
+    await advance(0);
+    expect(cancelCalls(calls)).toHaveLength(1);
     await advance(10_000);
     expect(statusCalls(calls)).toHaveLength(1);
-    expect(screen.queryByTestId("ai-signin-waiting")).toBeNull();
-    expect(screen.getByRole("button", { name: /sign in with openrouter/i })).toBeTruthy();
+  });
+
+  it("cancels the sign-in on the engine when it gives up waiting", async () => {
+    const calls = installFetch((c) => {
+      if (c.path === "/api/v1/ai/providers") return ok({ providers: PROVIDERS });
+      if (c.path === "/api/v1/ai/signin/openrouter") return STARTED();
+      if (c.method === "DELETE") return ok({ cancelled: true, flow_id: FLOW_ID, state: "failed" });
+      return ok({ flow_id: FLOW_ID, state: "waiting" });
+    });
+    await renderForm();
+    await signIn();
+    await advance(400_000);
+    expect(screen.getByRole("alert").textContent).toBe("The sign-in did not finish. Start it again.");
+    expect(cancelCalls(calls)).toHaveLength(1);
+    const polls = statusCalls(calls).length;
+    expect(polls).toBeLessThanOrEqual(170);
+    await advance(10_000);
+    expect(statusCalls(calls)).toHaveLength(polls);
+  });
+
+  it("disables the sign-in with a one-line reason when the engine says it is local-only", async () => {
+    const reason =
+      "Sign in with OpenRouter from Krellbot on this computer. OpenRouter returns to this computer's own address, which a remote browser cannot reach.";
+    installFetch((c) => {
+      if (c.path === "/api/v1/ai/providers") return ok({ providers: PROVIDERS });
+      return { status: 403, json: { ok: false, effect: "refused", code: "ai_signin_local_only", detail: reason } };
+    });
+    await renderForm();
+    await signIn();
+    const button = screen.getByRole("button", { name: /sign in with openrouter/i }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(screen.getByTestId("ai-signin-unavailable").textContent).toBe(reason);
+    expect(screen.queryByTestId("ai-signin-note")).toBeNull();
+    expect(openSpy).not.toHaveBeenCalled();
+    // Connecting with a key still works.
+    expect((screen.getByRole("button", { name: /^connect$/i }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("still reports the stored connection through onAdded when the post-connect probe fails", async () => {
+    const stored = conn({ capability: "unprobed" });
+    installFetch((c) => {
+      if (c.path === "/api/v1/ai/providers") return ok({ providers: PROVIDERS });
+      if (c.path === "/api/v1/ai/signin/openrouter") return STARTED();
+      if (c.path === `/api/v1/ai/signin/${FLOW_ID}`) {
+        return ok({ flow_id: FLOW_ID, state: "connected", connection_id: "aaaaaaaaaaaaaaaa" });
+      }
+      if (c.path.endsWith("/probe")) {
+        return {
+          status: 503,
+          json: {
+            ok: false,
+            effect: "refused",
+            code: "ai_keychain_unavailable",
+            detail: "The OS keychain is not available, so the key was not stored or changed.",
+          },
+        };
+      }
+      if (c.path === "/api/v1/ai/connections") return ok({ active: null, connections: [stored] });
+      throw new Error(`unexpected ${c.method} ${c.path}`);
+    });
+    const { onConnected, onAdded } = await renderForm();
+    await signIn();
+    await advance(2000);
+    expect(screen.getByRole("alert").textContent).toBe(
+      "The OS keychain is not available, so the key was not stored or changed. (ai_keychain_unavailable)",
+    );
+    expect(onAdded).toHaveBeenCalledTimes(1);
+    expect(onAdded.mock.calls[0][0]).toMatchObject({ id: "aaaaaaaaaaaaaaaa", auth: "oauth" });
+    expect(onAdded.mock.calls[0][1]).toEqual({
+      capability: "unprobed",
+      message: "The OS keychain is not available, so the key was not stored or changed.",
+    });
+    expect(onConnected).not.toHaveBeenCalled();
+    expect(
+      (screen.getByRole("button", { name: /sign in with openrouter/i }) as HTMLButtonElement).disabled,
+    ).toBe(false);
   });
 });

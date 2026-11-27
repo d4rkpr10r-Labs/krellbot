@@ -309,17 +309,42 @@ export async function getSigninStatus(
       `/api/v1/ai/signin/${encodeURIComponent(flowId)}`,
     );
     if (parsed.ok === false) return refusal(parsed);
+    return { ok: true, status: toSigninStatus(parsed) };
+  } catch {
+    return networkFailure();
+  }
+}
+
+/**
+ * Cancel a sign-in still waiting for OpenRouter, so it can never add a
+ * connection later. One whose callback already arrived is left to finish:
+ * `cancelled` is false and `status` says where it is.
+ */
+export async function cancelSignin(
+  flowId: string,
+): Promise<AiResult<{ cancelled: boolean; status: AiSigninStatus }>> {
+  try {
+    const parsed = await send(
+      "DELETE",
+      `/api/v1/ai/signin/${encodeURIComponent(flowId)}`,
+    );
+    if (parsed.ok === false) return refusal(parsed);
     return {
       ok: true,
-      status: {
-        state: asSigninState(parsed.state),
-        connectionId:
-          typeof parsed.connection_id === "string" ? parsed.connection_id : null,
-        code: str(parsed.code),
-        message: str(parsed.detail, GENERIC_MESSAGE),
-      },
+      cancelled: parsed.cancelled === true,
+      status: toSigninStatus(parsed),
     };
   } catch {
     return networkFailure();
   }
+}
+
+function toSigninStatus(parsed: Record<string, unknown>): AiSigninStatus {
+  return {
+    state: asSigninState(parsed.state),
+    connectionId:
+      typeof parsed.connection_id === "string" ? parsed.connection_id : null,
+    code: str(parsed.code),
+    message: str(parsed.detail, GENERIC_MESSAGE),
+  };
 }

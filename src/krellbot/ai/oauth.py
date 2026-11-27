@@ -34,6 +34,7 @@ import http.server
 import json
 import re
 import secrets as stdlib_secrets  # the standard library module, not krellbot.secrets
+import socket
 import socketserver
 import threading
 import time
@@ -70,8 +71,8 @@ _MAX_EXCHANGE_BYTES = 64 * 1024
 _MAX_CODE = 2048
 _MAX_QUERY_FIELDS = 16
 _KEEP_FINISHED_FLOWS = 16
-_POLL_SECONDS = 0.5
-_CONNECTION_TIMEOUT = 10.0  # one slow client cannot hold the listener
+_POLL_SECONDS = 0.25
+_CONNECTION_BUDGET = 5.0  # seconds in all for one connection, so one slow client cannot hold the listener
 
 SigninState = Literal["waiting", "connected", "failed", "expired"]
 
@@ -80,6 +81,11 @@ SIGNIN_MESSAGES: dict[str, str] = {
     "ai_signin_listener_failed": "Krellbot could not open its sign-in address on this computer.",
     "ai_signin_expired": "The sign-in was not finished within 5 minutes. Start it again.",
     "ai_signin_superseded": "A newer sign-in replaced this one.",
+    "ai_signin_cancelled": "The sign-in was cancelled, so nothing was stored.",
+    "ai_signin_local_only": (
+        "Sign in with OpenRouter from Krellbot on this computer. OpenRouter returns to this computer's "
+        "own address, which a remote browser cannot reach."
+    ),
     "ai_signin_no_code": "OpenRouter returned without a sign-in code, so nothing was stored. Start the sign-in again.",
     "ai_signin_rejected": "OpenRouter did not accept the sign-in, so nothing was stored. Start the sign-in again.",
     "ai_signin_unavailable": "OpenRouter could not be reached to finish the sign-in, so nothing was stored.",
@@ -140,9 +146,70 @@ ListenerFactory = Callable[[Dispatch, float], CallbackListener]
 
 
 class _Server(socketserver.TCPServer):
+    """One connection at a time, each with a total time budget, and a hard abort.
+
+    The socket of the connection being served is tracked so another thread
+    can hang it up: the per-connection budget timer, and :meth:`abort` (from
+    ``close()`` or the lifetime timer). A socket is only ever shut down while
+    it is still the active one, under ``_guard``, so a closed descriptor is
+    never touched.
+    """
+
     # TCPServer, not HTTPServer: HTTPServer.server_bind does a reverse DNS lookup.
     allow_reuse_address = False
     request_queue_size = 4
+
+    def __init__(self, address: tuple[str, int], handler: type[socketserver.BaseRequestHandler]) -> None:
+        self._guard = threading.Lock()
+        self._active: socket.socket | None = None
+        self._aborted = False
+        self._closed = False
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address) -> None:
+        with self._guard:
+            admitted = not self._aborted
+            if admitted:
+                self._active = request
+        if not admitted:
+            self.shutdown_request(request)
+            return
+        # A total budget, not a per-read timeout: a client dribbling bytes cannot hold the listener.
+        budget = threading.Timer(_CONNECTION_BUDGET, self._hang_up, (request,))
+        budget.daemon = True
+        budget.start()
+        try:
+            self.finish_request(request, client_address)
+        finally:
+            budget.cancel()
+            with self._guard:
+                self._active = None
+            self.shutdown_request(request)
+
+    def _hang_up(self, request: socket.socket) -> None:
+        with self._guard:
+            if self._active is request:
+                with contextlib.suppress(OSError):
+                    request.shutdown(socket.SHUT_RDWR)
+
+    def abort(self) -> None:
+        """Hang up the active connection and stop accepting, from any thread."""
+
+        with self._guard:
+            self._aborted = True
+            if self._active is not None:
+                with contextlib.suppress(OSError):
+                    self._active.shutdown(socket.SHUT_RDWR)
+            if not self._closed:
+                # Wakes the serving thread and refuses new connections where the OS supports it
+                # (Linux); elsewhere the serving thread closes the socket within one poll.
+                with contextlib.suppress(OSError):
+                    self.socket.shutdown(socket.SHUT_RDWR)
+
+    def server_close(self) -> None:
+        with self._guard:
+            self._closed = True
+            super().server_close()
 
     def handle_error(self, request, client_address) -> None:
         """Silent: a traceback must never reach a log."""
@@ -152,9 +219,12 @@ class LoopbackListener:
     """A one-shot HTTP listener on ``127.0.0.1:<ephemeral>`` in a daemon thread.
 
     Each request goes to ``dispatch``. A reply with ``close`` set stops the
-    listener; its ``after`` step runs on this thread once the socket is
-    closed. The listener stops after ``lifetime`` seconds whatever happens.
-    Nothing is logged: the request line would carry the code.
+    listener once that reply is sent; its ``after`` step runs on this thread
+    once the socket is closed. ``close()`` and the ``lifetime`` timer stop it
+    absolutely: the connection being served is hung up and the listening
+    socket shut, so a slow or dribbling client cannot keep it open. One
+    connection gets ``_CONNECTION_BUDGET`` seconds in all. Nothing is
+    logged: the request line would carry the code.
     """
 
     def __init__(self, dispatch: Dispatch, lifetime: float) -> None:
@@ -164,11 +234,21 @@ class LoopbackListener:
         self._deadline = time.monotonic() + lifetime
         self._server = _Server((CALLBACK_HOST, 0), _handler_for(self))
         self.port: int = self._server.server_address[1]
+        self._lifetime = threading.Timer(lifetime, self.close)
+        self._lifetime.daemon = True
         self._thread = threading.Thread(target=self._run, name="krellbot-ai-signin", daemon=True)
         self._thread.start()
+        self._lifetime.start()
+
+    @property
+    def running(self) -> bool:
+        return self._thread.is_alive()
 
     def close(self) -> None:
+        """Stop now, from any thread: the active connection is hung up and the port stops accepting."""
+
         self._stop.set()
+        self._server.abort()
 
     def join(self, timeout: float | None = None) -> None:
         self._thread.join(timeout)
@@ -179,6 +259,7 @@ class LoopbackListener:
         except Exception:  # noqa: BLE001 — a dispatch bug must not crash or log; refuse quietly
             return CallbackReply(404, _NOT_FOUND_PAGE)
         if reply.close:
+            # Not close(): the reply to this request must still be written. The loop ends after it.
             self._after = reply.after
             self._stop.set()
         return reply
@@ -194,6 +275,7 @@ class LoopbackListener:
                     self._server.timeout = min(remaining, _POLL_SECONDS)
                     self._server.handle_request()
             finally:
+                self._lifetime.cancel()
                 self._server.server_close()
         after, self._after = self._after, None
         if after is not None:
@@ -203,7 +285,7 @@ class LoopbackListener:
 
 def _handler_for(listener: LoopbackListener) -> type[http.server.BaseHTTPRequestHandler]:
     class _Handler(http.server.BaseHTTPRequestHandler):
-        timeout = _CONNECTION_TIMEOUT
+        timeout = _CONNECTION_BUDGET  # per read; the server also caps the connection's total time
         server_version = "krellbot"
         sys_version = ""
 
@@ -211,6 +293,10 @@ def _handler_for(listener: LoopbackListener) -> type[http.server.BaseHTTPRequest
             """Silent: the request line carries the authorization code."""
 
         def do_GET(self) -> None:
+            if self.request_version == "HTTP/0.9":
+                # No browser sends it; a request line cut short by a hang-up parses as one.
+                self._send(CallbackReply(404, _NOT_FOUND_PAGE))
+                return
             self._send(listener._answer(self.command, self.path, self.headers.get("Host", "")))
 
         def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
@@ -228,7 +314,8 @@ def _handler_for(listener: LoopbackListener) -> type[http.server.BaseHTTPRequest
             self.send_header("Cache-Control", "no-store")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Content-Security-Policy", "default-src 'none'")
+            self.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+            self.send_header("X-Frame-Options", "DENY")
             self.send_header("Connection", "close")
             self.end_headers()
             if self.command != "HEAD":
@@ -255,7 +342,8 @@ class _Flow:
     # "waiting" for the callback, "exchanging" once consumed, then a final state.
     phase: str = "waiting"
     connection_id: str | None = None
-    code: str | None = None
+    # The typed refusal code once the flow failed or expired. Never the OAuth code.
+    error_code: str | None = None
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -268,9 +356,9 @@ class _Flow:
             return True
         return False
 
-    def _finish_locked(self, phase: str, code: str | None = None) -> None:
+    def _finish_locked(self, phase: str, error_code: str | None = None) -> None:
         self.phase = phase
-        self.code = code
+        self.error_code = error_code
         self.verifier = None
 
     def dispatch(self, method: str, target: str, host: str) -> CallbackReply:
@@ -317,22 +405,32 @@ class _Flow:
     def status(self) -> dict:
         with self.lock:
             expired = self._expired_locked()
-            phase, code, connection_id = self.phase, self.code, self.connection_id
+            phase, error_code, connection_id = self.phase, self.error_code, self.connection_id
         if expired:
             self.close_listener()
         if phase in ("waiting", "exchanging"):
             return {"state": "waiting"}
         if phase == "connected":
             return {"state": "connected", "connection_id": connection_id}
-        code = code or "ai_signin_failed"
-        return {"state": phase, "code": code, "message": SIGNIN_MESSAGES.get(code) or _refusal_message(code)}
+        error_code = error_code or "ai_signin_failed"
+        message = SIGNIN_MESSAGES.get(error_code) or _refusal_message(error_code)
+        return {"state": phase, "code": error_code, "message": message}
 
-    def supersede(self) -> None:
+    def abandon(self, error_code: str) -> bool:
+        """Fail a flow still waiting for its callback and close its listener.
+
+        A flow whose callback already arrived (exchanging) or that finished
+        is left as it is: returns False.
+        """
+
         with self.lock:
-            if self.phase != "waiting":
-                return
-            self._finish_locked("failed", "ai_signin_superseded")
-        self.close_listener()
+            expired = self._expired_locked()
+            abandoned = not expired and self.phase == "waiting"
+            if abandoned:
+                self._finish_locked("failed", error_code)
+        if expired or abandoned:
+            self.close_listener()
+        return abandoned
 
     def close_listener(self) -> None:
         listener = self.listener
@@ -406,7 +504,7 @@ class SigninRegistry:
                 self._flows.pop(stale.id, None)
             self._flows[flow.id] = flow
         for other in older:
-            other.supersede()
+            other.abandon("ai_signin_superseded")
 
     def get(self, flow_id: object) -> _Flow:
         if not isinstance(flow_id, str) or FLOW_ID_RE.fullmatch(flow_id) is None:
@@ -421,7 +519,7 @@ class SigninRegistry:
         with self._lock:
             flows = list(self._flows.values())
         for flow in flows:
-            flow.supersede()
+            flow.abandon("ai_signin_cancelled")
 
 
 _DEFAULT_REGISTRY = SigninRegistry()
@@ -502,3 +600,15 @@ def signin_status(flow_id: str, *, registry: SigninRegistry | None = None) -> di
     """``{state: waiting|connected|failed|expired}``, plus ``connection_id`` or a fixed ``code`` and ``message``."""
 
     return (registry or _DEFAULT_REGISTRY).get(flow_id).status()
+
+
+def cancel_signin(flow_id: str, *, registry: SigninRegistry | None = None) -> tuple[bool, dict]:
+    """Cancel a sign-in still waiting for its callback; its listener closes and it can never add a connection.
+
+    A flow whose callback already arrived, or that finished, is left alone.
+    Returns ``(cancelled, status)``.
+    """
+
+    flow = (registry or _DEFAULT_REGISTRY).get(flow_id)
+    cancelled = flow.abandon("ai_signin_cancelled")
+    return cancelled, flow.status()

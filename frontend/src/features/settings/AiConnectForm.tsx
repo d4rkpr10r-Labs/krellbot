@@ -10,12 +10,15 @@
  * engine returns an OpenRouter page to open, OpenRouter hands the key to the
  * engine's one-shot loopback listener, and this form only polls the
  * sign-in's state. A finished sign-in takes the same probe, activate and
- * onConnected path as a key add.
+ * onConnected path as a key add. Stopping, leaving the form and giving up
+ * all cancel the sign-in on the engine, so an abandoned sign-in can never add
+ * a connection later.
  */
 import { useEffect, useId, useRef, useState, type JSX } from "react";
 import {
   activateConnection,
   addConnection,
+  cancelSignin,
   getSigninStatus,
   listConnections,
   listProviders,
@@ -43,6 +46,7 @@ const SIGNIN_NOTE =
 const SIGNIN_BAD_URL =
   "Krellbot received a sign-in address that is not OpenRouter's, so it did not open it.";
 const SIGNIN_GAVE_UP = "The sign-in did not finish. Start it again.";
+const SIGNIN_LOCAL_ONLY = "ai_signin_local_only";
 
 const COPY_TOOLS = "Ready for Krell";
 const COPY_CHAT_ONLY = "Chat only: Krell can explain but not use tools";
@@ -141,6 +145,12 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
     flowId: string;
     authorizeUrl: string;
   } | null>(null);
+  // Set when the engine refuses sign-in from this browser (a remote session).
+  const [signinUnavailable, setSigninUnavailable] = useState<string | null>(
+    null,
+  );
+  // Sign-ins this form is done with; any other is cancelled when its polling ends.
+  const settledFlows = useRef(new Set<string>());
 
   useEffect(() => {
     let live = true;
@@ -193,9 +203,34 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
     if (ready) onConnected(conn);
   }
 
+  /**
+   * A sign-in stored a connection: probe it and finish like a key add. If
+   * the probe fails, the connection is still stored, so the parent hears
+   * about it through onAdded as unprobed.
+   */
+  async function finishSignin(
+    connectionId: string,
+    isLive: () => boolean,
+  ): Promise<void> {
+    const probed = await probeConnection(connectionId);
+    if (!isLive()) return;
+    if (probed.ok) {
+      await finishAdded(probed);
+      return;
+    }
+    setError(`${probed.message} (${probed.code})`);
+    const listed = await listConnections();
+    const stored = listed.ok
+      ? listed.connections.find((c) => c.id === connectionId)
+      : undefined;
+    if (stored && isLive()) {
+      onAdded?.(stored, { capability: "unprobed", message: probed.message });
+    }
+  }
+
   // The polling effect outlives renders; it always calls the latest finisher.
-  const finishRef = useRef(finishAdded);
-  finishRef.current = finishAdded;
+  const finishSigninRef = useRef(finishSignin);
+  finishSigninRef.current = finishSignin;
 
   async function submit(event: React.FormEvent): Promise<void> {
     event.preventDefault();
@@ -232,7 +267,8 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
     try {
       const started = await startOpenRouterSignin(model.trim());
       if (!started.ok) {
-        setError(`${started.message} (${started.code})`);
+        if (started.code === SIGNIN_LOCAL_ONLY) setSigninUnavailable(started.message);
+        else setError(`${started.message} (${started.code})`);
         return;
       }
       if (!started.authorizeUrl.startsWith(OPENROUTER_AUTHORIZE_PREFIX)) {
@@ -246,52 +282,79 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
     }
   }
 
+  /**
+   * "Stop waiting": cancel on the engine. A sign-in whose callback already
+   * arrived cannot be cancelled; keep following it so the connection it
+   * stores is reported like any other.
+   */
+  async function stopWaiting(): Promise<void> {
+    if (!signin || busy) return;
+    const { flowId } = signin;
+    const result = await cancelSignin(flowId);
+    if (
+      result.ok &&
+      !result.cancelled &&
+      (result.status.state === "waiting" || result.status.state === "connected")
+    ) {
+      return;
+    }
+    // Cancelled, or already over. On a refusal the effect cleanup tries once more.
+    if (result.ok) settledFlows.current.add(flowId);
+    setSignin((current) => (current?.flowId === flowId ? null : current));
+  }
+
   useEffect(() => {
     if (!signin) return;
+    const { flowId } = signin;
     let live = true;
     let polls = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const stop = (message: string | null): void => {
+    const isLive = (): boolean => live;
+    // Leave the sign-in; unless it settled, the cleanup below cancels it on the engine.
+    const leave = (message: string | null): void => {
       if (!live) return;
       if (message) setError(message);
       setSignin(null);
     };
+    const settle = (message: string | null): void => {
+      settledFlows.current.add(flowId);
+      leave(message);
+    };
     const poll = async (): Promise<void> => {
       polls += 1;
-      const result = await getSigninStatus(signin.flowId);
+      const result = await getSigninStatus(flowId);
       if (!live) return;
       if (!result.ok) {
-        stop(`${result.message} (${result.code})`);
+        leave(`${result.message} (${result.code})`);
         return;
       }
       const { status } = result;
       if (status.state === "waiting") {
-        if (polls >= SIGNIN_MAX_POLLS) stop(SIGNIN_GAVE_UP);
+        if (polls >= SIGNIN_MAX_POLLS) leave(SIGNIN_GAVE_UP);
         else timer = setTimeout(() => void poll(), SIGNIN_POLL_MS);
         return;
       }
       if (status.state !== "connected" || !status.connectionId) {
-        stop(`${status.message} (${status.code || status.state})`);
+        settle(`${status.message} (${status.code || status.state})`);
         return;
       }
+      settledFlows.current.add(flowId);
       setBusy(true);
       try {
-        const probed = await probeConnection(status.connectionId);
-        if (!live) return;
-        if (!probed.ok) {
-          setError(`${probed.message} (${probed.code})`);
-          return;
-        }
-        await finishRef.current(probed);
+        await finishSigninRef.current(status.connectionId, isLive);
       } finally {
-        if (live) setBusy(false);
-        stop(null);
+        setBusy(false);
+        settle(null);
       }
     };
     timer = setTimeout(() => void poll(), SIGNIN_POLL_MS);
     return () => {
       live = false;
       if (timer !== undefined) clearTimeout(timer);
+      if (!settledFlows.current.has(flowId)) {
+        settledFlows.current.add(flowId);
+        void cancelSignin(flowId);
+      }
     };
   }, [signin]);
 
@@ -425,7 +488,14 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
         {disclosureFor(provider, baseUrl)}
       </p>
 
-      {offersSignin ? (
+      {offersSignin && signinUnavailable ? (
+        <p
+          className="kbot-settings__card-copy"
+          data-testid="ai-signin-unavailable"
+        >
+          {signinUnavailable}
+        </p>
+      ) : offersSignin ? (
         <p className="kbot-settings__card-copy" data-testid="ai-signin-note">
           {SIGNIN_NOTE}
         </p>
@@ -445,13 +515,15 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
             >
               Open the OpenRouter sign-in page
             </a>
-            <button
-              type="button"
-              className="kbot-settings__link-btn"
-              onClick={() => setSignin(null)}
-            >
-              Stop waiting
-            </button>
+            {busy ? null : (
+              <button
+                type="button"
+                className="kbot-settings__link-btn"
+                onClick={() => void stopWaiting()}
+              >
+                Stop waiting
+              </button>
+            )}
           </div>
         </div>
       ) : null}
@@ -477,7 +549,7 @@ export function AiConnectForm(props: AiConnectFormProps): JSX.Element {
             type="button"
             className="kbot-settings__btn"
             onClick={() => void startSignin()}
-            disabled={locked}
+            disabled={locked || signinUnavailable !== null}
           >
             Sign in with OpenRouter
           </button>

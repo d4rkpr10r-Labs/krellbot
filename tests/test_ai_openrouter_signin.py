@@ -23,6 +23,8 @@ import http.client
 import json
 import logging
 import re
+import socket
+import threading
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -303,6 +305,8 @@ def test_loopback_listener_binds_127_0_0_1_serves_one_callback_and_logs_nothing(
     assert headers["referrer-policy"] == "no-referrer"
     assert headers["cache-control"] == "no-store"
     assert "default-src 'none'" in headers["content-security-policy"]
+    assert "frame-ancestors 'none'" in headers["content-security-policy"]
+    assert headers["x-frame-options"] == "DENY"
 
     deadline = time.monotonic() + 5
     while oauth.signin_status(flow.id, registry=registry)["state"] == "waiting" and time.monotonic() < deadline:
@@ -327,6 +331,101 @@ def test_loopback_listener_closes_when_its_lifetime_ends():
     listener.join(timeout=5)
     with pytest.raises(OSError):
         http.client.HTTPConnection("127.0.0.1", listener.port, timeout=1).connect()
+
+
+def _not_found(method: str, target: str, host: str):
+    return oauth.CallbackReply(404, b"")
+
+
+class Dribbler:
+    """A client that sends a request line one byte at a time, never finishing it."""
+
+    def __init__(self, port: int, every: float = 0.1) -> None:
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.every = every
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> Dribbler:
+        self.thread.start()
+        return self
+
+    def _run(self) -> None:
+        for byte in b"GET /callback/dribble HTTP/1.1\r\nHost: x\r\n" * 50:
+            if self.stopped.is_set():
+                return
+            try:
+                self.sock.send(bytes([byte]))
+            except OSError:
+                return
+            time.sleep(self.every)
+
+    def stop(self) -> None:
+        self.stopped.set()
+        self.sock.close()
+
+
+def _refuses(port: int) -> bool:
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=1).close()
+    except OSError:
+        return True
+    return False
+
+
+def test_a_dribbling_client_cannot_hold_the_listener_past_its_lifetime():
+    lifetime = 1.0
+    started = time.monotonic()
+    listener = oauth.LoopbackListener(_not_found, lifetime)
+    dribbler = Dribbler(listener.port).start()
+    try:
+        listener.join(timeout=lifetime + 1.0)
+        assert not listener.running, "the listener outlived its lifetime while a client dribbled"
+        assert time.monotonic() - started < lifetime + 1.0
+        assert _refuses(listener.port)
+    finally:
+        dribbler.stop()
+        listener.close()
+
+
+def test_close_stops_the_listener_promptly_while_a_client_dribbles():
+    listener = oauth.LoopbackListener(_not_found, 60)
+    dribbler = Dribbler(listener.port).start()
+    try:
+        time.sleep(0.3)  # the dribbler's request is in progress
+        closing = time.monotonic()
+        listener.close()
+        listener.join(timeout=1.0)
+        assert not listener.running
+        assert time.monotonic() - closing < 1.0
+        assert _refuses(listener.port)
+    finally:
+        dribbler.stop()
+
+
+def test_one_slow_connection_gets_a_total_time_budget_not_a_per_read_one(monkeypatch):
+    monkeypatch.setattr(oauth, "_CONNECTION_BUDGET", 0.5)
+    seen: list[str] = []
+
+    def dispatch(method: str, target: str, host: str):
+        seen.append(target)
+        return oauth.CallbackReply(404, b"")
+
+    listener = oauth.LoopbackListener(dispatch, 60)
+    dribbler = Dribbler(listener.port).start()
+    try:
+        time.sleep(0.2)  # the listener is now busy with the dribbler
+        queued = time.monotonic()
+        conn = http.client.HTTPConnection("127.0.0.1", listener.port, timeout=5)
+        conn.request("GET", "/callback/real", headers={"Host": f"127.0.0.1:{listener.port}"})
+        assert conn.getresponse().status == 404
+        conn.close()
+        # Served once the dribbler's 0.5 s budget ran out, though it kept sending bytes.
+        assert time.monotonic() - queued < 1.5
+        assert seen == ["/callback/real"]
+    finally:
+        dribbler.stop()
+        listener.close()
 
 
 # ---- 4. the exchange and the keychain --------------------------------------------------
@@ -567,3 +666,81 @@ def test_signin_status_route_reports_expiry(home, fresh_keyring):
     assert status == 200
     assert (body["state"], body["code"]) == ("expired", "ai_signin_expired")
     assert factory.last.closed
+
+
+def test_cancel_route_closes_a_waiting_flow_so_it_never_adds_a_connection_later(home, fresh_keyring):
+    transport = FakeAiTransport([key_reply()])
+    factory = ListenerFactory()
+    client = Client(home, transport, factory, Clock(1_700_000_000))
+    status, raw = client.call("POST", "/api/v1/ai/signin/openrouter", {"model": "openrouter/auto"})
+    started = json.loads(raw)
+    flow_id = started["flow_id"]
+    listener = factory.last
+    callback = urlsplit(parse_qs(urlsplit(started["authorize_url"]).query)["callback_url"][0]).path
+
+    status, _raw = client.call("DELETE", f"/api/v1/ai/signin/{flow_id}", csrf=False)
+    assert status == 403
+    assert not listener.closed
+    status, raw = client.call("DELETE", "/api/v1/ai/signin/" + "0" * 32)
+    assert status == 404 and json.loads(raw)["code"] == "ai_signin_not_found"
+
+    status, raw = client.call("DELETE", f"/api/v1/ai/signin/{flow_id}")
+    assert status == 200, raw
+    body = json.loads(raw)
+    assert (body["cancelled"], body["state"], body["code"]) == (True, "failed", "ai_signin_cancelled")
+    assert body["effect"] == "changed"
+    assert listener.closed
+
+    # A callback that still reaches the flow (say, from a backlog) does nothing.
+    late = listener.dispatch("GET", f"{callback}?code={CODE}", f"127.0.0.1:{listener.port}")
+    assert late.status == 404 and late.after is None
+    assert transport.calls == 0
+    assert fresh_keyring._store == {}
+    assert _store(home).list() == []
+    status, raw = client.call("GET", f"/api/v1/ai/signin/{flow_id}")
+    assert (json.loads(raw)["state"], json.loads(raw)["code"]) == ("failed", "ai_signin_cancelled")
+
+    # Cancelling again changes nothing.
+    status, raw = client.call("DELETE", f"/api/v1/ai/signin/{flow_id}")
+    body = json.loads(raw)
+    assert (status, body["cancelled"], body["effect"], body["state"]) == (200, False, "unchanged", "failed")
+
+
+def test_cancel_route_leaves_an_exchanging_or_connected_flow_alone(home, fresh_keyring):
+    factory = ListenerFactory()
+    client = Client(home, FakeAiTransport([key_reply()]), factory, Clock(1_700_000_000))
+    status, raw = client.call("POST", "/api/v1/ai/signin/openrouter", {"model": "openrouter/auto"})
+    started = json.loads(raw)
+    flow_id = started["flow_id"]
+    listener = factory.last
+    callback = urlsplit(parse_qs(urlsplit(started["authorize_url"]).query)["callback_url"][0]).path
+
+    # The callback arrived and the exchange has not finished yet.
+    reply = listener.dispatch("GET", f"{callback}?code={CODE}", f"127.0.0.1:{listener.port}")
+    assert reply.status == 200 and reply.after is not None
+    status, raw = client.call("DELETE", f"/api/v1/ai/signin/{flow_id}")
+    body = json.loads(raw)
+    assert (status, body["cancelled"], body["effect"], body["state"]) == (200, False, "unchanged", "waiting")
+
+    reply.after()
+    status, raw = client.call("DELETE", f"/api/v1/ai/signin/{flow_id}")
+    body = json.loads(raw)
+    assert (body["cancelled"], body["state"]) == (False, "connected")
+    assert [c.id for c in _store(home).list()] == [body["connection_id"]]
+    assert KEY.encode() not in raw
+
+
+def test_signin_start_is_local_only_and_refused_for_a_tailnet_session(tmp_path, home, fresh_keyring):
+    from krellbot.api.tailnet import write_remote_scope
+    from tests.test_tailnet_session_read_only_scope import _serve, _tailnet_session
+
+    # Even with full remote scope: OpenRouter would redirect to the remote device's own 127.0.0.1.
+    write_remote_scope(home, "full")
+    with _serve(tmp_path, home, tailnet=True) as server:
+        session = _tailnet_session(server)
+        status, _headers, body = session.send("POST", "/api/v1/ai/signin/openrouter", {"model": "openrouter/auto"})
+    assert status == 403, body
+    refusal = json.loads(body)
+    assert refusal["code"] == "ai_signin_local_only"
+    assert refusal["effect"] == "refused"
+    assert "this computer" in refusal["detail"]
