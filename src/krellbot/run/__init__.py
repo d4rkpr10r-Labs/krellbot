@@ -23,6 +23,11 @@
     7. Journal one tick record per pack per bar, including refusals.
     8. If entries are blocked by the license gate, print the lapsed message.
 
+`close_position` runs the tick's exit on request (``positions.close``, the
+pair typed back): under the same lock and without waiting for a bar, it
+cancels the arm's stop, sells exactly the strategy-owned quantity, journals
+what executed and holds new entries with ``closed_by_operator_at``.
+
 `arm_pack` records a pack into config. It refuses a second pack on the same
 venue+pair, refuses if the cap cannot meet the pair's costmin (paper), and
 for live mode requires ``skip_confirm=True`` (web ``live.arm`` after an
@@ -79,6 +84,8 @@ from .lock import TickLock
 OWNERSHIP_AMBIGUOUS = "ownership_ambiguous"
 # Journal ``reason`` for a record that accounts a reconciled intent's outcome.
 RECONCILED_REASON = "reconciled"
+# Journal ``reason`` for the record an operator close writes (``close_position``).
+CLOSE_REASON = "close"
 # Obligation kind of an exit hold: a sell on an arm's pair whose order the venue
 # could not establish (``Fill.order_unknown``), so it may be that arm's stop.
 # It holds the arm's exits and stop repair. No venue order carries its coid, so
@@ -885,7 +892,10 @@ def tick(
             entry_qty = Decimal(0)
             entry_coid_for_signal = ""
             kill_engaged = live_gate.kill_state(home).engaged
-            entries_suppressed = armed.entries_paused or kill_engaged
+            # An operator close (``close_position``) holds entries with its own
+            # marker, never with ``entries_paused``: on live that flag is the
+            # restore fence's mark, which would halt the whole venue's tick.
+            entries_suppressed = armed.entries_paused or kill_engaged or armed.closed_by_operator_at is not None
             # The daily-loss gate holds new entries only: it is checked last,
             # below, and the exit and stop paths never read it.
             loss_refusal = _daily_loss_refusal(
@@ -1475,6 +1485,421 @@ def _settle_by_operator(
         evidence=evidence,
         attributed=attributed,
     )
+
+
+# ---- operator close ---------------------------------------------------------
+
+_CLOSE_MESSAGES = {
+    "position_closed": (
+        "Position closed: only this strategy's quantity was sold, after its stop was cancelled. "
+        "New buys stay paused until you resume them, or stop the run and arm it again."
+    ),
+    "close_pending": (
+        "Close sent for only this strategy's quantity, after its stop was cancelled. What executed is settled "
+        "from the exchange's own record on the next tick. New buys stay off until the run is disarmed and armed again."
+    ),
+    "venue_rejected": (
+        "The exchange refused the close, so nothing was sold. The stop was cancelled first: the next tick "
+        "re-places it. New buys stay off."
+    ),
+    "outcome_unknown": (
+        "The close's outcome is not known yet. It is never sent again: the next tick settles it from the "
+        "exchange's own record. New buys stay off."
+    ),
+    "bad_input": "The close request is not well formed.",
+    "confirmation_required": "Type the pair to confirm the close.",
+    "confirmation_mismatch": "The typed pair does not match this run's pair.",
+    "not_armed": "No strategy is armed on this venue and pair.",
+    "restore_fence": (
+        "This home was restored, and live runs on this venue send nothing until the kill switch is released. "
+        "Nothing was sent."
+    ),
+    "tick_running": "A tick for this venue is running. Try again in a moment.",
+    "obligations_unavailable": "Unresolved orders cannot be read right now. Nothing was sent.",
+    "obligation_open": (
+        "An order on this venue is not settled yet: the next tick settles it from the exchange's record, or "
+        "resolve it in Operations. Nothing was sent."
+    ),
+    "ownership_ambiguous": "The journal cannot show exactly what this strategy owns. Nothing was sent.",
+    "nothing_to_close": "This strategy owns nothing on this pair. Nothing was sent.",
+    "venue_unavailable": "The venue could not be reached. Nothing was sent.",
+    "candles_unavailable": "No closed candle could be read for this pair. Nothing was sent.",
+    "stop_cancel_failed": "The resting stop could not be cancelled, so nothing was sold. Check the stop at the venue.",
+    "config_busy": "Another command is updating this run's settings. Try again in a moment. Nothing was sent.",
+}
+
+
+@dataclass(frozen=True)
+class ClosePositionResult:
+    """What one operator close did. ``code`` is stable; see ``_CLOSE_MESSAGES``.
+
+    ``ok`` is true for ``position_closed`` and ``close_pending``. ``effect`` is
+    ``changed`` once the stop was cancelled and entries held, ``refused``
+    otherwise (a refusal writes nothing). ``sold_qty`` is the quantity
+    journaled as executed (paper); a live close journals 0 and is settled
+    later. ``gate_message`` carries the live gate's own words for its codes.
+    """
+
+    code: str
+    ok: bool = False
+    effect: str = "refused"
+    mode: str | None = None
+    client_order_id: str | None = None
+    requested_qty: Decimal | None = None
+    sold_qty: Decimal | None = None
+    gate_message: str | None = None
+
+    @property
+    def message(self) -> str:
+        return _CLOSE_MESSAGES.get(self.code) or self.gate_message or self.code
+
+
+def close_position(
+    *,
+    venue: object,
+    pair: object,
+    confirmation: object,
+    open_venue: Callable[[list[kb_config.ArmedPack]], Any] | None = None,
+    home: Path | None = None,
+    clock: Callable[[], float] | None = None,
+) -> ClosePositionResult:
+    """Sell exactly the strategy-owned quantity of the arm on ``venue`` ``pair`` now.
+
+    The operator types ``pair`` back as ``confirmation``. This is the tick's
+    exit, run on request under the venue's ``TickLock`` without waiting for a
+    bar: it cancels the arm's stop, sells what the strategy owns (computed as
+    the tick computes it, in Decimal, never external units), journals what
+    executed and holds new entries with ``closed_by_operator_at``.
+
+    Refusals write nothing (no config, journal or ledger change). The order
+    of checks: well-formed input, the typed pair, the arm, the live gate (on
+    live the restore fence refuses; the kill switch alone does not), the tick
+    lock, unreadable or open obligations on the venue and mode, ambiguous
+    ownership. Only then is ``open_venue(armed_for_venue)`` called (default:
+    ``cli.venue_for_tick``), which returns ``(venue_obj, reader)`` or a
+    refusal string; a candle must be readable and the snapshot must show
+    nothing unrecorded (an unlinked sell is ambiguous ownership) and an owned
+    quantity above zero.
+
+    Then, under the config lock: the marker is saved, ``cancel_stops`` runs
+    and a fresh snapshot must show no stop resting on the pair, else the
+    marker is reverted and the close refused (``stop_cancel_failed``). What is
+    sold never exceeds the owned quantity less any base the venue lost while
+    the stop was cancelled. The exit is an Outbox intent of kind ``exit``
+    under a fresh coid, committed before the send and never resent, with the
+    latest closed bar as its owner bar (the journal record's ``bar_ts``).
+    Paper journals what its venue executed. Live marks the intent before the
+    send and journals ``exit_qty`` 0; ``_resolve_obligations`` settles it once
+    by ``resolved_coid`` (M28.27), and the open obligation refuses a repeat. A
+    documented venue refusal is journaled and resolves the intent as not
+    executed (M28.28).
+
+    The marker is not ``entries_paused``, so the restore fence never reads it
+    and a live close under the kill switch leaves the venue's next tick, its
+    exits, stops and reconcile running. Entries come back when the arm is
+    disarmed and armed again, or, on paper, with ``paper.resume_entries``.
+    """
+    if not isinstance(venue, str) or not venue or not isinstance(pair, str) or not pair:
+        return ClosePositionResult(code="bad_input")
+    if confirmation is not None and not isinstance(confirmation, str):
+        return ClosePositionResult(code="bad_input")
+    if not confirmation:
+        return ClosePositionResult(code="confirmation_required")
+    if confirmation != pair:
+        return ClosePositionResult(code="confirmation_mismatch")
+
+    home = Path(home) if home is not None else kb_paths.home()
+    config = kb_config.load_config(home)
+    armed = kb_config.find_armed(config, venue, pair)
+    if armed is None:
+        return ClosePositionResult(code="not_armed")
+    refused = _close_gate(home, venue, armed, config)
+    if refused is not None:
+        return refused
+
+    lock = TickLock(home, venue)
+    if not lock.acquire():
+        return ClosePositionResult(code="tick_running", mode=armed.mode)
+    try:
+        now = clock() if clock is not None else _now_seconds()
+        return _close_locked(home, venue, pair, open_venue=open_venue, now=now)
+    finally:
+        lock.release()
+
+
+def _close_gate(
+    home: Path, venue: str, armed: kb_config.ArmedPack, config: kb_config.Config
+) -> ClosePositionResult | None:
+    """The live gate for a close; None when it may run (paper always may).
+
+    The restore fence of any live arm on the venue refuses, as it halts that
+    venue's whole tick. The kill switch alone does not: ``check_live_tick``
+    lets exits run under it. Any other gate refusal of the arm is returned
+    with the gate's code (``live_disabled_paper_only_release`` in this build).
+    """
+    if armed.mode != "live":
+        return None
+    for live_armed in config.armed:
+        if live_armed.venue != venue or live_armed.mode != "live":
+            continue
+        result = live_gate.check_live_tick(
+            home, venue=venue, pair=live_armed.pair, entries_paused=live_armed.entries_paused
+        )
+        if not result.ok and result.code == live_gate.CODE_KILL_SWITCH:
+            return ClosePositionResult(code="restore_fence", mode="live")
+    result = live_gate.check_live_tick(home, venue=venue, pair=armed.pair, entries_paused=armed.entries_paused)
+    if not result.ok:
+        return ClosePositionResult(code=result.code, mode="live", gate_message=result.message)
+    return None
+
+
+def _close_locked(
+    home: Path,
+    venue: str,
+    pair: str,
+    *,
+    open_venue: Callable[[list[kb_config.ArmedPack]], Any] | None,
+    now: float,
+) -> ClosePositionResult:
+    """Everything after the tick lock; see ``close_position``."""
+    config = kb_config.load_config(home)
+    armed = kb_config.find_armed(config, venue, pair)
+    if armed is None:
+        return ClosePositionResult(code="not_armed")
+    mode = armed.mode
+    identity = _ownership_identity(armed, venue)
+    view = kb_obligations.read_obligations(home)
+    if not view.available:
+        return ClosePositionResult(code="obligations_unavailable", mode=mode)
+    if view.blocks_entries(venue=venue, mode=mode):
+        return ClosePositionResult(code="obligation_open", mode=mode)
+    ownership = project_ownership(home, identity)
+    if ownership.ambiguous:
+        return ClosePositionResult(code=OWNERSHIP_AMBIGUOUS, mode=mode)
+
+    armed_for_venue = [a for a in config.armed if a.venue == venue]
+    opener = open_venue if open_venue is not None else _default_close_venue(home)
+    try:
+        opened = opener(armed_for_venue)
+    except (InstrumentMetadataError, OSError, RuntimeError, ValueError, TypeError, KeyError):
+        opened = None
+    if not isinstance(opened, tuple) or len(opened) != 2:
+        return ClosePositionResult(code="venue_unavailable", mode=mode)
+    venue_obj, reader = opened
+    try:
+        candles = list(reader(venue, pair) or [])
+    except (InstrumentMetadataError, OSError, RuntimeError, ValueError, TypeError, KeyError):
+        candles = []  # a feed failure (``cli.CandleFetchError`` is a RuntimeError): no candle read
+    if not candles:
+        return ClosePositionResult(code="candles_unavailable", mode=mode)
+    bar_ts = int(candles[-1].ts_ms)
+    try:
+        snap = venue_obj.snapshot()
+    except (InstrumentMetadataError, OSError, RuntimeError, ValueError):
+        return ClosePositionResult(code="venue_unavailable", mode=mode)
+
+    base, _quote = _base_quote(pair)
+    fills = list(snap.recent_fills or [])
+    _ids, stop_fill_qty = _stop_fills_for(home, identity, fills)
+    journal_qty = max(ownership.attributable_qty - stop_fill_qty, Decimal(0))
+    if journal_qty > 0 and _unrecorded_unlinked_sell(home, identity, fills):
+        # A sell the venue cannot link may be this arm's stop: the tick would
+        # hold it for an operator resolve, so what is owned is not known.
+        return ClosePositionResult(code=OWNERSHIP_AMBIGUOUS, mode=mode)
+    venue_base = _snapshot_balances(snap).get(base, Decimal(0))
+    recognized = _recognized_open_qty(armed, venue, candles, _snapshot_orders(snap))
+    owned = min(venue_base, max(journal_qty, recognized))
+    if owned <= 0:
+        return ClosePositionResult(code="nothing_to_close", mode=mode)
+    external = venue_base - owned
+
+    with kb_config._paper_command_transaction(home) as acquired:
+        if not acquired:
+            return ClosePositionResult(code="config_busy", mode=mode)
+        if not _set_closed_marker(home, armed, int(now)):
+            return ClosePositionResult(code="config_busy", mode=mode)
+        cancelled = _cancel_stops_for_close(venue_obj, pair, base=base, owned=owned, external=external)
+        if isinstance(cancelled, str):
+            _clear_closed_marker(home, armed, int(now))  # a refusal writes nothing
+            return ClosePositionResult(code=cancelled, mode=mode)
+    owned, after = cancelled
+
+    stop_fill_ids, stop_fill_qty = _stop_fills_for(home, identity, list(after.recent_fills or []))
+    coid = coid_for(
+        pack_id=armed.pack_id,
+        pack_version=armed.pack_version,
+        venue=venue,
+        pair=pair,
+        bar_ts=int(now * 1000),
+        intent="close",
+    )
+    body = json.dumps({"kind": "exit", "qty": str(owned), "pair": pair}, separators=(",", ":"), sort_keys=True)
+    # A live acknowledgement is not an executed quantity (M28.27): the intent
+    # is an obligation from before the send, settled by order_outcome.
+    tracked = mode != "paper"
+    venue_refusals: list[tuple[str, str]] = []
+    intent_refused: str | None = None
+    sold = Decimal(0)
+    try:
+        state, ref = _dispatch_place(
+            home=home,
+            mode=mode,
+            venue=venue,
+            identity=_intent_identity(armed, bar_ts),
+            coid=coid,
+            body=body,
+            venue_obj=venue_obj,
+            track=tracked,
+        )
+    except StoreError as exc:
+        # The commit, the mark or the sent flag failed: what was sent is not
+        # known. A committed intent stays an obligation; nothing is resent.
+        code, intent_refused = "outcome_unknown", exc.code
+        print(f"intent refused: {exc.code}", flush=True)
+    except VenueRejectedError as exc:
+        code, intent_refused = "venue_rejected", _venue_refused(exc, coid, venue_refusals)
+    except (InstrumentMetadataError, OSError, RuntimeError, ValueError, AttributeError):
+        code = "outcome_unknown"  # committed before the send, so it stays an obligation
+    else:
+        if state != "sent":
+            code = "outcome_unknown"  # a coid already committed is never sent again
+        elif tracked:
+            code = "close_pending"
+        else:
+            executed = _executed_exit_qty(mode, ref, requested=owned)
+            if executed is None:
+                audit_needs_reconcile(OperationalStore(home / "ops.sqlite"), coid=coid)
+                code = "outcome_unknown"
+            else:
+                code, sold = "position_closed", executed
+    _record_tick(
+        kb_journal.append,
+        now=int(now),
+        venue=venue,
+        pack=armed.pack_id,
+        bar_ts=bar_ts,
+        detail={
+            "pair": pair,
+            "mode": mode,
+            "reason": CLOSE_REASON,
+            "close_coid": coid,
+            "entry_qty": "0",
+            "exit_qty": str(sold),
+            "stop_qty": str(stop_fill_qty),
+            **({"stop_fill_ids": stop_fill_ids} if stop_fill_ids else {}),
+            "owned_qty_after": str(owned - sold),
+            "entries_paused": True,
+            "kill_switch": live_gate.kill_state(home).engaged,
+            "intent_refused": intent_refused,
+        },
+    )
+    # Journal first, then retire the refused intent, as the tick does.
+    for refused_coid, refused_code in venue_refusals:
+        try:
+            kb_obligations.record_rejection(OperationalStore(home / "ops.sqlite"), coid=refused_coid, code=refused_code)
+        except StoreError as exc:
+            print(f"intent refused: {exc.code}", flush=True)  # it stays unresolved and keeps holding entries
+    return ClosePositionResult(
+        code=code,
+        ok=code in ("position_closed", "close_pending"),
+        effect="changed",
+        mode=mode,
+        client_order_id=coid,
+        requested_qty=owned,
+        sold_qty=sold if code == "position_closed" else None,
+    )
+
+
+def _default_close_venue(home: Path) -> Callable[[list[kb_config.ArmedPack]], Any]:
+    """The scheduler's own venue setup (``cli.venue_for_tick``) with its default fetch and transport."""
+
+    def open_venue(armed_list: list[kb_config.ArmedPack]) -> Any:
+        from krellbot import cli as kb_cli
+
+        return kb_cli.venue_for_tick(
+            home, armed_list, transport=kb_cli._default_transport(), fetch=kb_cli._default_fetch
+        )
+
+    return open_venue
+
+
+def _cancel_stops_for_close(
+    venue_obj: Any, pair: str, *, base: str, owned: Decimal, external: Decimal
+) -> tuple[Decimal, Any] | str:
+    """Cancel the pair's stops; return what may still be sold and the snapshot after, or a refusal code.
+
+    ``stop_cancel_failed`` when ``cancel_stops`` raises or a fresh snapshot
+    still shows a stop resting on the pair: selling under a resting stop could
+    sell the same units twice, and external ones after. Base the venue lost
+    meanwhile may be that stop filling, so it comes off what is sold
+    (``external`` is the base that was not the strategy's before the cancel);
+    ``nothing_to_close`` when nothing is left.
+    """
+    try:
+        venue_obj.cancel_stops(pair)
+        after = venue_obj.snapshot()
+    except (InstrumentMetadataError, OSError, RuntimeError, ValueError):
+        return "stop_cancel_failed"
+    if any(
+        getattr(o, "pair", None) == pair and getattr(o, "stop_price", None) is not None for o in _snapshot_orders(after)
+    ):
+        return "stop_cancel_failed"
+    sellable = min(owned, max(_snapshot_balances(after).get(base, Decimal(0)) - external, Decimal(0)))
+    if sellable <= 0:
+        return "nothing_to_close"
+    return sellable, after
+
+
+def _set_closed_marker(home: Path, armed: kb_config.ArmedPack, at: int) -> bool:
+    """Save ``closed_by_operator_at`` on the arm; False when the arm changed or config cannot be written.
+
+    The caller holds the config lock and the venue's tick lock.
+    """
+    config = kb_config.load_config(home)
+    target = kb_config.find_armed(config, armed.venue, armed.pair)
+    if target is None or (target.pack_id, target.mode) != (armed.pack_id, armed.mode):
+        return False
+    target.closed_by_operator_at = at
+    try:
+        kb_config.save_config(home, config)
+    except OSError:
+        return False
+    return True
+
+
+def _clear_closed_marker(home: Path, armed: kb_config.ArmedPack, at: int) -> None:
+    """Put the marker back as it was before a refused close set it (still under both locks)."""
+    config = kb_config.load_config(home)
+    target = kb_config.find_armed(config, armed.venue, armed.pair)
+    if target is None or target.closed_by_operator_at != at:
+        return
+    target.closed_by_operator_at = armed.closed_by_operator_at
+    try:
+        kb_config.save_config(home, config)
+    except OSError:
+        print("close refused: entries stay held, the config could not be restored", flush=True)
+
+
+def _unrecorded_unlinked_sell(home: Path, identity: OwnershipIdentity, fills: list) -> bool:
+    """True when a sell on the pair that the venue could not link has no exit hold yet.
+
+    The tick would commit a hold for it (``_hold_unlinked_sells``); a close
+    only reads, so it refuses instead. A committed hold is an obligation and
+    refuses the close earlier while it is unresolved.
+    """
+    unknown = [
+        f
+        for f in fills
+        if getattr(f, "order_unknown", False)
+        and getattr(f, "side", "") == "sell"
+        and getattr(f, "pair", None) == identity.pair
+        and getattr(f, "id", "")
+    ]
+    if not unknown:
+        return False
+    _order_coids, accounted = stop_fill_history(home, identity)
+    held = _committed_coids(home)
+    return any(f.id not in accounted and _unlinked_sell_coid(identity, f.id) not in held for f in unknown)
 
 
 def _resolve_obligations(home: Path, *, venue: str, venue_obj: Any, snap: Any, journal, now: float) -> None:
@@ -2197,7 +2622,9 @@ def _already_journaled(home: Path, pack_id: str, bar_ts: int, *, venue: str, pai
             if rec.get("kind") == "tick" and rec.get("pack") == pack_id and int(rec.get("bar_ts", 0)) == int(bar_ts):
                 recorded_venue = rec.get("venue")
                 detail = rec.get("detail")
-                if isinstance(detail, dict) and detail.get("reason") == RECONCILED_REASON:
+                # Neither a reconciled outcome nor an operator close is the
+                # tick's own evaluation of the bar, so the bar still runs.
+                if isinstance(detail, dict) and detail.get("reason") in (RECONCILED_REASON, CLOSE_REASON):
                     continue
                 recorded_pair = detail.get("pair") if isinstance(detail, dict) else None
                 # Ambiguous legacy dimensions remain conservative wildcards.

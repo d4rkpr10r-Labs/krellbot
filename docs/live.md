@@ -119,6 +119,36 @@ does.
 This release is paper-only, so every live tick is refused with
 `live_disabled_paper_only_release` before the kill switch is read.
 
+## Close position
+
+`positions.close` (`POST /api/v1/commands`, the pair typed back as
+`confirmation`) sells a live arm's position now, without waiting for a bar.
+It runs the tick's exit under the venue's tick lock:
+
+* It cancels the stops resting on the pair and reads the account again. If a
+  stop still rests, it refuses with `stop_cancel_failed` and sells nothing.
+* It sells exactly the strategy-owned quantity, computed as the tick
+  computes it. Base the account lost while the stop was cancelled comes off
+  that quantity, so external units are never sold.
+* The exit is an Outbox intent of kind `exit` under a fresh coid. It is
+  marked for reconcile before the send and is never resent. The close
+  journals `exit_qty` 0 (reason `close`). The next tick's reconcile journals
+  what `order_outcome` says executed, once, by `resolved_coid`. A residual
+  stays the strategy's and is re-protected. A documented venue refusal is
+  journaled and resolves the exit as not executed.
+* It holds new entries with the arm's `closed_by_operator_at`, not with
+  `entries_paused`. The restore fence reads only `entries_paused`, so a
+  close under the kill switch leaves the venue's next tick, its exits, stops
+  and reconcile running. A live arm's entries come back only when it is
+  disarmed and armed again: the workstation's resume is paper-only.
+
+It runs under the kill switch. It is refused, writing nothing, with
+`restore_fence` behind the restore fence, with the live gate's code
+otherwise refused (`live_disabled_paper_only_release` in this release),
+and with `tick_running`, `obligations_unavailable`, `obligation_open` (a
+repeat close before its outcome is settled included), `ownership_ambiguous`
+or `nothing_to_close`.
+
 ## Live-only invariants
 
 * The engine never sells more base than this pack's journal says it

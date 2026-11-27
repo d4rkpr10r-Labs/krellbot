@@ -18,7 +18,11 @@ import { TradingViewAlertPreview } from "./TradingViewAlertPreview";
 import { PaperHealthDetails, usePaperHealth } from "./paperHealth";
 import type { RehearsalClient } from "./rehearsalClient";
 import { summarizePaperCommandRefusal } from "./paperCommandRefusalSummary";
-import { PAUSE_NEW_BUYS_DISCLOSURE, STOP_RUN_DISCLOSURE } from "./stopRunDisclosure";
+import {
+  CLOSE_POSITION_DISCLOSURE,
+  PAUSE_NEW_BUYS_DISCLOSURE,
+  STOP_RUN_DISCLOSURE,
+} from "./stopRunDisclosure";
 import "./StatusPanel.position.css";
 import "./StatusPanel.signal.css";
 
@@ -57,7 +61,7 @@ export type StatusPanelProps = {
 
 type EntriesSentence = "Entries active" | "Entries paused";
 
-type CommandName = "pause" | "resume" | "disarm" | "raise_stop";
+type CommandName = "pause" | "resume" | "disarm" | "raise_stop" | "close";
 
 /** Arm venues offered by the paper surface (paper mode only). */
 const ARM_VENUES: readonly string[] = ["kraken", "coinbase", "binance", "gate", "pionex", "okx", "bybit", "kucoin", "ourbit", "toobit", "xt", "mexc", "deepcoin", "lbank", "bitget", "htx", "btcc", "cryptocom"];
@@ -135,6 +139,8 @@ type PanelState = {
   unknownOutcome: string | null;
   /** Backend-confirmed raise-stop echo, mirrored verbatim from `message`. */
   raiseStopEcho: string | null;
+  /** Backend-confirmed close echo, mirrored verbatim from `message`. */
+  closeEcho: string | null;
   /** Owned position read from `GET /api/v1/paper/position`; null = none read. */
   position: PaperPosition | null;
   /** Honest failure surface for a position read that did not decode. */
@@ -151,6 +157,7 @@ const INITIAL_STATE: PanelState = {
   pending: null,
   unknownOutcome: null,
   raiseStopEcho: null,
+  closeEcho: null,
   position: null,
   positionError: null,
   restingStop: null,
@@ -170,6 +177,7 @@ type PanelAction =
       status: PaperStatus | null;
       sentence?: EntriesSentence;
       raiseStopEcho?: string | null;
+      closeEcho?: string | null;
     };
 
 function sentenceFor(entries_paused: boolean | undefined): EntriesSentence {
@@ -216,6 +224,7 @@ function commandLabel(command: CommandName | "arm"): string {
   if (command === "resume") return "Resume";
   if (command === "arm") return "Start paper run";
   if (command === "raise_stop") return "Raise stop";
+  if (command === "close") return "Close position";
   return "Stop paper run";
 }
 
@@ -383,6 +392,37 @@ async function postRaiseStop(
   });
   if (!response.ok) {
     throw new Error(`paper.raise_stop failed: ${response.status}`);
+  }
+  return (await response.json()) as PaperCommandResult;
+}
+
+/**
+ * POST ``positions.close`` with the pair the operator typed back, the same
+ * way as ``postRaiseStop`` (not a PaperClient method). The backend checks
+ * the typed pair itself and refuses with HTTP 200 ``ok: false`` bodies; a
+ * non-2xx response is a transport failure and maps to the unknown-outcome
+ * path. Never retried: a close is never sent twice.
+ */
+async function postClosePosition(
+  venue: string,
+  pair: string,
+  confirmation: string,
+): Promise<PaperCommandResult> {
+  const response = await fetch("/api/v1/commands", {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Krellbot-CSRF": getCsrf(),
+    },
+    body: JSON.stringify({
+      schema_version: "1",
+      command: "positions.close",
+      payload: { venue, pair, confirmation },
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`positions.close failed: ${response.status}`);
   }
   return (await response.json()) as PaperCommandResult;
 }
@@ -702,6 +742,7 @@ function reducer(state: PanelState, action: PanelAction): PanelState {
         errorMessage: null,
         unknownOutcome: null,
         raiseStopEcho: null,
+        closeEcho: null,
       };
     }
     case "command-refused": {
@@ -751,6 +792,7 @@ function reducer(state: PanelState, action: PanelAction): PanelState {
         status: nextStatus,
         sentence: action.sentence ?? state.sentence,
         raiseStopEcho: action.raiseStopEcho ?? state.raiseStopEcho,
+        closeEcho: action.closeEcho ?? state.closeEcho,
         position: keepPosition ? state.position : null,
         positionError: keepError ? state.positionError : null,
         restingStop: keptRestingStop(nextStatus, state.restingStop),
@@ -1453,6 +1495,19 @@ export function StatusPanel({
           type: "command-refused",
           message: refusalMessage(command, result),
         });
+        if (command === "close" && result?.effect === "changed") {
+          // The stop was cancelled and new buys held even though nothing
+          // sold (or the outcome is not known yet): read the server state
+          // once so the panel does not keep showing the stop and position.
+          try {
+            const next = await client.getStatus(statusSelect);
+            if (epoch === epochRef.current) {
+              dispatch({ type: "status", status: next });
+            }
+          } catch {
+            // The refusal message stays; the panel remains refreshable.
+          }
+        }
         return;
       }
       const applied = onConfirmed();
@@ -1466,6 +1521,10 @@ export function StatusPanel({
               (typeof result.message === "string" && result.message.length > 0
                 ? result.message
                 : null))
+            : undefined,
+        closeEcho:
+          command === "close" && typeof result.message === "string" && result.message.length > 0
+            ? result.message
             : undefined,
       });
       onStatusMutated?.();
@@ -1545,6 +1604,30 @@ export function StatusPanel({
       // stays as-is; the visible truth is the backend echo plus the
       // follow-up reconciliation read inside runCommand.
       () => ({ status: current }),
+    );
+  };
+
+  // Close position: the operator types the pair back before the control
+  // enables; the backend checks it again and refuses a mismatch.
+  const [closeConfirmValue, setCloseConfirmValue] = useState("");
+  const closeConfirmId = useId();
+  const closeDisclosureId = useId();
+  const closeConfirmed =
+    typeof state.status?.pair === "string" &&
+    state.status.pair !== "" &&
+    closeConfirmValue === state.status.pair;
+
+  const handleClose = (): Promise<void> => {
+    const current = state.status;
+    const confirmation = closeConfirmValue;
+    return runCommand(
+      "close",
+      () => postClosePosition(current?.venue ?? "", current?.pair ?? "", confirmation),
+      () => {
+        setCloseConfirmValue("");
+        // A close holds new buys; the follow-up status read reconciles it.
+        return { status: current, sentence: "Entries paused" as EntriesSentence };
+      },
     );
   };
 
@@ -1805,6 +1888,57 @@ export function StatusPanel({
               venue={state.status?.venue ?? ""}
               pair={state.status?.pair ?? ""}
             />
+            {/* Close position: sells only this strategy's own quantity after
+                the operator types the pair back. The input is never
+                prefilled; the backend's own check is the validator. */}
+            <div
+              className="kbot-paper-status__close"
+              data-testid="paper-close-position"
+            >
+              <label
+                className="kbot-paper-status__field"
+                htmlFor={closeConfirmId}
+              >
+                Type {state.status?.pair} to close the position
+                <input
+                  id={closeConfirmId}
+                  className="kbot-paper-status__input"
+                  data-testid="paper-close-position-confirm"
+                  type="text"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={closeConfirmValue}
+                  onChange={(event) => {
+                    setCloseConfirmValue(event.target.value);
+                  }}
+                  disabled={busy}
+                />
+              </label>
+              <button
+                type="button"
+                className="kbot-paper-status__action kbot-paper-status__action--caution"
+                data-testid="paper-close-position-apply"
+                aria-describedby={closeDisclosureId}
+                disabled={busy || !closeConfirmed}
+                onClick={() => {
+                  void handleClose();
+                }}
+              >
+                {state.pending === "close" ? "Closing…" : "Close position"}
+              </button>
+              <p
+                className="kbot-paper-status__empty"
+                id={closeDisclosureId}
+                data-testid="paper-close-position-disclosure"
+              >
+                {CLOSE_POSITION_DISCLOSURE}
+              </p>
+            </div>
+            {state.closeEcho !== null ? (
+              <p role="status" data-testid="paper-close-position-ok">
+                {state.closeEcho}
+              </p>
+            ) : null}
             {unknownAlert}
             {state.errorMessage !== null ? (
               <div>
