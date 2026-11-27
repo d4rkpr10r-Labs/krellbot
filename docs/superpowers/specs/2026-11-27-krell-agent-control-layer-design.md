@@ -439,11 +439,12 @@ agent tasks:
 | M34.11 [owner] scopes for non-browser clients | still open; nothing here needs it, because the MCP server works in-process and creates no jobs over the loopback API |
 | M34.12 [owner] gate | trimmed to the research-contract checks |
 
-Two pieces are absorbed from later milestones because this milestone
-needs them first:
+Two pieces from later milestones come first because this milestone needs
+them:
 
 - **M29.1 run record** (run id and receipt digest), which M34.7's MCP run
-  identity depends on. It moves to the new milestone; M29 keeps a pointer.
+  identity depends on. It stays as M29.1 (already the next agent task) and
+  lands before the new milestone's tasks.
 - **M31.5's policy editor** (the first web editor for `user-policy.json`).
   The editor moves here as the Agents & limits screen; M31.5 keeps only
   its `excluded_assets` field and enforcement, written to edit that screen.
@@ -455,7 +456,7 @@ match, so it needs the owner's review and is not auto-merged (`AGENTS.md`).
 
 ### 9.2 Delivery order
 
-0. Absorbed prerequisites: M29.1 run record; agent origin on drafts.
+0. Prerequisites: M29.1 run record; agent origin on drafts.
 1. Agent tool core: registry, actors, cost/effect classes, policy v2, audit.
 2. MCP server over stdio, Krell prompts, setup snippets, Agents & limits
    settings.
