@@ -36,7 +36,8 @@ import {
 } from "./client";
 
 export type KrellItem =
-  | { key: string; kind: "user"; text: string }
+  /** `sending`: shown at once, not yet answered by the engine. */
+  | { key: string; kind: "user"; text: string; sending?: boolean }
   | { key: string; kind: "krell"; text: string; question?: string; streaming: boolean }
   | { key: string; kind: "notice"; text: string }
   | { key: string; kind: "error"; code: string; text: string }
@@ -54,6 +55,9 @@ export type KrellContextValue = {
   connection: KrellConnection | null;
   status: KrellStatus;
   loadError: string | null;
+  /** The composer's text, shared by the tab and the panel. */
+  draft: string;
+  setDraft(text: string): void;
   send(text: string): void;
   confirm(callId: string, decision: KrellDecision): void;
   setMode(mode: KrellMode): void;
@@ -182,7 +186,22 @@ function settle(items: KrellItem[], finalText?: string): KrellItem[] {
   return items;
 }
 
+type UserItem = Extract<KrellItem, { kind: "user" }>;
+
+function isSending(item: KrellItem | undefined): item is UserItem {
+  return item?.kind === "user" && item.sending === true;
+}
+
 function applyEvent(items: KrellItem[], event: KrellEvent, key: string): KrellItem[] {
+  const last = items[items.length - 1];
+  if (isSending(last) && event.type !== "error") {
+    // Any answer but an error means the engine took the message. It shows a
+    // new disclosure before storing the message, so keep that order.
+    if (event.type === "notice" && event.kind === "disclosure") {
+      return [...items.slice(0, -1), { key, kind: "notice", text: str(event.text) }, last];
+    }
+    items = [...items.slice(0, -1), { ...last, sending: false }];
+  }
   switch (event.type) {
     case "notice":
       if (event.kind === "disclosure") return [...items, { key, kind: "notice", text: str(event.text) }];
@@ -244,6 +263,7 @@ type State = {
   connection: KrellConnection | null;
   messages: KrellItem[];
   pending: boolean;
+  draft: string;
 };
 
 type Action =
@@ -253,14 +273,28 @@ type Action =
   | { type: "pending"; value: boolean }
   | { type: "add"; item: KrellItem }
   | { type: "event"; event: KrellEvent; key: string }
-  | { type: "cleared" };
+  | { type: "cleared" }
+  | { type: "draft"; value: string; ifEmpty?: boolean }
+  /** The stored thread, read again after a turn whose first answer was an error. */
+  | { type: "resync"; messages: KrellItem[]; connection: KrellConnection | null }
+  /** Drop the unanswered message (the thread could not be read to check it). */
+  | { type: "unsend" };
 
-const INITIAL: State = { status: "idle", loadError: null, connection: null, messages: [], pending: false };
+const INITIAL: State = {
+  status: "idle",
+  loadError: null,
+  connection: null,
+  messages: [],
+  pending: false,
+  draft: "",
+};
 
 function reduce(state: State, action: Action): State {
   switch (action.type) {
     case "loading":
-      return { ...state, status: "loading", loadError: null };
+      // A re-read keeps what is shown (say the connect form and its check
+      // result) until the new read lands.
+      return state.status === "ready" ? state : { ...state, status: "loading", loadError: null };
     case "loaded":
       return { ...state, status: "ready", messages: action.messages, connection: usable(action.connection) };
     case "load_failed":
@@ -276,6 +310,12 @@ function reduce(state: State, action: Action): State {
     }
     case "cleared":
       return { ...state, messages: [] };
+    case "draft":
+      return { ...state, draft: action.ifEmpty && state.draft ? state.draft : action.value };
+    case "resync":
+      return { ...state, messages: action.messages, connection: usable(action.connection) };
+    case "unsend":
+      return { ...state, messages: state.messages.filter((item) => !isSending(item)) };
   }
 }
 
@@ -297,7 +337,9 @@ export function KrellConversationProvider({
   const [state, dispatch] = useReducer(reduce, INITIAL);
   const tickets = useRef(new Map<string, string>());
   const busy = useRef(false);
+  const loading = useRef(false);
   const requested = useRef(false);
+  const shown = useRef(false);
   const keys = useRef(0);
   const nextKey = useCallback((): string => {
     keys.current += 1;
@@ -335,37 +377,108 @@ export function KrellConversationProvider({
     [nextKey, onEvent],
   );
 
+  /** One read at a time; a second request while one runs is the same read. */
   const load = useCallback(async (): Promise<void> => {
-    dispatch({ type: "loading" });
-    const result = await api.conversation();
-    if (!result.ok) {
-      dispatch({ type: "load_failed", message: `${result.message} (${result.code})` });
-      return;
+    if (loading.current) return;
+    loading.current = true;
+    try {
+      dispatch({ type: "loading" });
+      const result = await api.conversation();
+      if (!result.ok) {
+        dispatch({ type: "load_failed", message: `${result.message} (${result.code})` });
+        return;
+      }
+      tickets.current = ticketsFromHistory(result.messages);
+      dispatch({ type: "loaded", messages: itemsFromHistory(result.messages), connection: result.connection });
+      const conn = usable(result.connection);
+      if (conn && needsStart(result.messages, conn.id)) await run((h) => api.start(h));
+    } finally {
+      loading.current = false;
     }
-    tickets.current = ticketsFromHistory(result.messages);
-    dispatch({ type: "loaded", messages: itemsFromHistory(result.messages), connection: result.connection });
-    const conn = usable(result.connection);
-    if (conn && needsStart(result.messages, conn.id)) await run((h) => api.start(h));
   }, [api, run]);
 
+  // The first time the tab or panel is shown, read the thread. Each later
+  // time, read it again when no usable model was found or the read failed:
+  // a model may have been connected meanwhile, e.g. in Settings.
   useEffect(() => {
-    if (active && !requested.current) {
+    const appeared = active && !shown.current;
+    shown.current = active;
+    if (!appeared) return;
+    const stale = (state.status === "ready" && state.connection === null) || state.status === "failed";
+    if (!requested.current || (stale && !busy.current)) {
       requested.current = true;
       void load();
     }
-  }, [active, load]);
+  }, [active, load, state.status, state.connection]);
+
+  /**
+   * After a turn whose first answer was an error. The engine may have refused
+   * before storing the message (busy, invalid, no model, a session refusal)
+   * or stored it and then failed (a provider error), so show the stored
+   * thread as it is. The typed text goes back in the composer when the
+   * message was not stored.
+   */
+  const afterFirstError = useCallback(
+    async (text: string, error: { code: string; message: string }, restoreDraft: boolean): Promise<void> => {
+      const result = await api.conversation();
+      let stored = false;
+      if (result.ok) {
+        tickets.current = ticketsFromHistory(result.messages);
+        const history = result.messages;
+        const last = history[history.length - 1];
+        const errorStored =
+          last?.role === "notice" && last.payload.kind === "error" && last.payload.code === error.code;
+        const lastUser = [...history].reverse().find((m) => m.role === "user");
+        stored = lastUser !== undefined && str(lastUser.payload.text) === text;
+        const items = itemsFromHistory(history);
+        dispatch({
+          type: "resync",
+          messages: errorStored
+            ? items
+            : [...items, { key: nextKey(), kind: "error", code: error.code, text: error.message }],
+          connection: result.connection,
+        });
+      } else {
+        dispatch({ type: "unsend" });
+      }
+      if (!stored && restoreDraft) dispatch({ type: "draft", value: text, ifEmpty: true });
+    },
+    [api, nextKey],
+  );
+
+  /** A turn that starts with the person's own message, shown at once as sending. */
+  const userTurn = useCallback(
+    (text: string, open: (handler: KrellEventHandler) => Promise<void>, fromComposer: boolean): void => {
+      void run(
+        async (handler) => {
+          const seen: { first: KrellEvent | null } = { first: null };
+          await open((event) => {
+            seen.first ??= event;
+            handler(event);
+          });
+          const first = seen.first;
+          if (first?.type === "error") await afterFirstError(text, first, fromComposer);
+        },
+        () => {
+          dispatch({ type: "add", item: { key: nextKey(), kind: "user", text, sending: true } });
+          if (fromComposer) dispatch({ type: "draft", value: "" });
+        },
+      );
+    },
+    [afterFirstError, nextKey, run],
+  );
 
   const send = useCallback(
     (text: string): void => {
       const trimmed = text.trim();
-      if (!trimmed) return;
-      void run(
-        (h) => api.send(trimmed, h),
-        () => dispatch({ type: "add", item: { key: nextKey(), kind: "user", text: trimmed } }),
-      );
+      if (trimmed) userTurn(trimmed, (h) => api.send(trimmed, h), true);
     },
-    [api, nextKey, run],
+    [api, userTurn],
   );
+
+  const setDraft = useCallback((text: string): void => {
+    dispatch({ type: "draft", value: text });
+  }, []);
 
   const confirm = useCallback(
     (callId: string, decision: KrellDecision): void => {
@@ -384,12 +497,9 @@ export function KrellConversationProvider({
 
   const setMode = useCallback(
     (mode: KrellMode): void => {
-      void run(
-        (h) => api.setMode(mode, h),
-        () => dispatch({ type: "add", item: { key: nextKey(), kind: "user", text: MODE_REPLIES[mode] } }),
-      );
+      userTurn(MODE_REPLIES[mode], (h) => api.setMode(mode, h), false);
     },
-    [api, nextKey, run],
+    [api, userTurn],
   );
 
   const clear = useCallback((): void => {
@@ -422,13 +532,15 @@ export function KrellConversationProvider({
       connection: state.connection,
       status: state.status,
       loadError: state.loadError,
+      draft: state.draft,
+      setDraft,
       send,
       confirm,
       setMode,
       clear,
       reload,
     }),
-    [state, send, confirm, setMode, clear, reload],
+    [state, setDraft, send, confirm, setMode, clear, reload],
   );
 
   return <KrellContext.Provider value={value}>{children}</KrellContext.Provider>;

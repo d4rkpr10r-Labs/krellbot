@@ -10,7 +10,6 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { useEffect } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KrellConversationProvider, useKrell } from "./KrellConversationProvider";
 import { KrellView } from "./KrellView";
@@ -224,7 +223,9 @@ describe("Krell conversation", () => {
 
   it("renders tool and confirm events as neutral lines and never shows the confirm ticket", async () => {
     const TICKET = "tkt-NEVER-SHOWN-0123456789";
-    const log = vi.spyOn(console, "log");
+    const consoleSpies = (["log", "error", "warn", "info", "debug"] as const).map((method) =>
+      vi.spyOn(console, method),
+    );
     const calls = installFetch((call) => {
       if (call.path === "/api/v1/krell/confirm") {
         return sseResponse([
@@ -283,9 +284,128 @@ describe("Krell conversation", () => {
     expect(posted?.body).toEqual({ ticket_id: TICKET, decision: "decline" });
     expect(screen.getByTestId("krell-item-decision").textContent).toContain("Not now");
     expect(document.body.innerHTML).not.toContain(TICKET);
-    for (const args of log.mock.calls) {
-      expect(JSON.stringify(args)).not.toContain(TICKET);
+    for (const spy of consoleSpies) {
+      for (const args of spy.mock.calls) {
+        expect(JSON.stringify(args)).not.toContain(TICKET);
+      }
     }
+  });
+
+  it("puts a refused message back in the composer and keeps the thread as stored", async () => {
+    const calls = installFetch((call) => {
+      if (call.path === "/api/v1/krell/messages") {
+        return jsonResponse(
+          {
+            ok: false,
+            effect: "refused",
+            code: "krell_busy",
+            detail: "Krell is already answering. Wait for that answer to finish.",
+          },
+          409,
+        );
+      }
+      return jsonResponse(conversation(greeted()));
+    });
+    renderTab();
+    const input = await screen.findByTestId("krell-input");
+    fireEvent.change(input, { target: { value: "Hello Krell" } });
+    fireEvent.click(screen.getByTestId("krell-send"));
+
+    await screen.findByText("Krell is already answering. Wait for that answer to finish.");
+    await waitFor(() => expect(screen.getByTestId("krell-input")).toHaveProperty("value", "Hello Krell"));
+    expect(screen.queryByTestId("krell-message-user")).toBeNull();
+    // The thread was read again to see what the engine kept.
+    expect(calls.filter((c) => c.path === "/api/v1/krell/conversation")).toHaveLength(2);
+    expect(screen.getByTestId("krell-send")).toHaveProperty("disabled", false);
+  });
+
+  it("keeps a message the engine stored before a provider error", async () => {
+    let sent = false;
+    installFetch((call) => {
+      if (call.path === "/api/v1/krell/messages") {
+        sent = true;
+        return sseResponse([
+          { type: "error", code: "provider_unavailable", message: "The provider could not be reached." },
+          { type: "done" },
+        ]);
+      }
+      const history = sent
+        ? [
+            ...greeted(),
+            stored("user", { text: "Hello Krell" }),
+            stored("notice", {
+              kind: "error",
+              code: "provider_unavailable",
+              message: "The provider could not be reached.",
+            }),
+          ]
+        : greeted();
+      return jsonResponse(conversation(history));
+    });
+    renderTab();
+    const input = await screen.findByTestId("krell-input");
+    fireEvent.change(input, { target: { value: "Hello Krell" } });
+    fireEvent.click(screen.getByTestId("krell-send"));
+
+    await waitFor(() => expect(screen.queryByText("Krell is answering…")).toBeNull());
+    expect(screen.getAllByTestId("krell-item-error")).toHaveLength(1);
+    expect(screen.getByTestId("krell-message-user").textContent).toContain("Hello Krell");
+    expect(screen.getByTestId("krell-message-user").getAttribute("aria-busy")).toBeNull();
+    expect(screen.getByTestId("krell-input")).toHaveProperty("value", "");
+  });
+
+  it("shows a new disclosure before the first message, as a reload does", async () => {
+    installFetch((call) => {
+      if (call.path === "/api/v1/krell/messages") {
+        return sseResponse([
+          { type: "notice", kind: "disclosure", text: "Now sent to OpenAI.", connection: CONNECTION },
+          { type: "message_done", text: "Hi again." },
+          { type: "done" },
+        ]);
+      }
+      return jsonResponse(conversation(greeted()));
+    });
+    renderTab();
+    fireEvent.change(await screen.findByTestId("krell-input"), { target: { value: "Hello Krell" } });
+    fireEvent.click(screen.getByTestId("krell-send"));
+    await screen.findByText("Hi again.");
+
+    const order = Array.from(document.querySelectorAll<HTMLElement>("[data-testid^='krell-']"))
+      .map((el) => el.dataset.testid)
+      .filter((id) => id === "krell-item-notice" || id === "krell-message-user" || id === "krell-message-krell");
+    expect(order.slice(-3)).toEqual(["krell-item-notice", "krell-message-user", "krell-message-krell"]);
+    const notices = screen.getAllByTestId("krell-item-notice");
+    expect(notices[notices.length - 1].textContent).toBe("Now sent to OpenAI.");
+  });
+
+  it("asks before clearing the conversation", async () => {
+    const calls = installFetch((call) => {
+      if (call.path === "/api/v1/krell/conversation" && call.method === "DELETE") {
+        return jsonResponse({ ok: true, effect: "changed" });
+      }
+      if (call.path === "/api/v1/krell/start") {
+        return sseResponse([
+          { type: "opening", text: "Hi, I'm Krell.", question: "Standard or advanced?", quick_replies: [] },
+          { type: "done" },
+        ]);
+      }
+      return jsonResponse(conversation([...greeted(), stored("user", { text: "Old question" })]));
+    });
+    renderTab();
+    await screen.findByText("Old question");
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear conversation" }));
+    expect(screen.getByText("Clear the conversation and any open cards?")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(calls.some((c) => c.method === "DELETE")).toBe(false);
+    expect(screen.getByText("Old question")).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear conversation" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, clear" }));
+    await waitFor(() => expect(screen.queryByText("Old question")).toBeNull());
+    await screen.findByText("Hi, I'm Krell.");
+    expect(calls.filter((c) => c.method === "DELETE")).toHaveLength(1);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Clear conversation" })).toHaveProperty("disabled", false));
   });
 });
 
@@ -349,5 +469,82 @@ describe("Krell tab", () => {
     await screen.findByText("Hi, I'm Krell.");
     expect(screen.getByText(DISCLOSURE)).toBeDefined();
     expect(calls.filter((c) => c.path === "/api/v1/krell/start")).toHaveLength(1);
+  });
+
+  it("reads the conversation again when the tab is shown after a model was connected elsewhere", async () => {
+    let connected = false;
+    const calls = installFetch((call) => {
+      if (call.path === "/api/v1/krell/conversation") {
+        return jsonResponse(conversation(connected ? greeted() : [], connected ? CONNECTION : null));
+      }
+      if (call.path === "/api/v1/ai/providers") {
+        return jsonResponse({ ok: true, providers: [{ id: "openai", label: "OpenAI", credential: "required" }] });
+      }
+      return jsonResponse({ ok: false, code: "unexpected", detail: call.path }, 404);
+    });
+    const { rerender } = renderTab();
+    await screen.findByTestId("ai-connect-form");
+    expect(screen.queryByTestId("krell-input")).toBeNull();
+
+    // The person leaves the tab and activates a model in Settings.
+    rerender(<KrellConversationProvider active={false}>{null}</KrellConversationProvider>);
+    connected = true;
+    rerender(
+      <KrellConversationProvider active>
+        <KrellView />
+      </KrellConversationProvider>,
+    );
+
+    await screen.findByTestId("krell-input");
+    expect(screen.getByText("Hi, I'm Krell.")).toBeDefined();
+    expect(calls.filter((c) => c.path === "/api/v1/krell/conversation")).toHaveLength(2);
+    expect(calls.some((c) => c.method === "POST")).toBe(false);
+  });
+
+  it("opens the conversation after an add on the connect form when another model is already active", async () => {
+    let added = false;
+    const calls = installFetch((call) => {
+      if (call.path === "/api/v1/krell/conversation") {
+        return jsonResponse(conversation(added ? greeted() : [], added ? CONNECTION : null));
+      }
+      if (call.path === "/api/v1/ai/providers") {
+        return jsonResponse({
+          ok: true,
+          providers: [
+            {
+              id: "anthropic",
+              label: "Anthropic",
+              format: "anthropic_messages",
+              base_url: "https://api.anthropic.com",
+              custom: false,
+              credential: "required",
+            },
+          ],
+        });
+      }
+      if (call.path === "/api/v1/ai/connections" && call.method === "POST") {
+        added = true;
+        return jsonResponse({
+          ok: true,
+          connection: { ...CONNECTION, id: "c_bbbbbbbbbbbb", preset: "anthropic", active: false },
+          probe: { capability: "tools", message: "" },
+        });
+      }
+      if (call.path === "/api/v1/ai/connections") {
+        // Another connection, activated in Settings, stays active: onConnected never fires.
+        return jsonResponse({ ok: true, connections: [], active: CONNECTION.id });
+      }
+      return jsonResponse({ ok: false, code: "unexpected", detail: call.path }, 404);
+    });
+    renderTab();
+    await screen.findByTestId("ai-connect-form");
+    fireEvent.change(screen.getByLabelText(/api key/i), { target: { value: "sk-test-key" } });
+    fireEvent.change(screen.getByLabelText(/^model$/i), { target: { value: "claude-test" } });
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+    await screen.findByTestId("krell-input");
+    expect(screen.queryByTestId("ai-connect-form")).toBeNull();
+    expect(calls.some((c) => c.path.endsWith("/activate"))).toBe(false);
+    expect(calls.filter((c) => c.path === "/api/v1/krell/conversation")).toHaveLength(2);
   });
 });

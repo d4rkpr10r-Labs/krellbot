@@ -85,6 +85,13 @@
   border-color: var(--seafoam);
 }
 
+.kbot-krell__confirm {
+  display: flex;
+  align-items: center;
+  gap: var(--space-tight);
+  flex-wrap: wrap;
+}
+
 .kbot-krell__connect {
   display: grid;
   gap: var(--space-stack);
@@ -172,6 +179,11 @@
   background: color-mix(in srgb, var(--seafoam) 12%, var(--surface));
 }
 
+/* Sent, not yet answered by the engine. */
+.kbot-krell__msg--sending {
+  opacity: 0.7;
+}
+
 .kbot-krell__line {
   margin: 0;
   color: var(--muted);
@@ -249,6 +261,11 @@
     order: 2;
     min-height: 44px;
     padding: 6px 8px;
+  }
+
+  /* >=44px targets on phones (Close is the only way off the sheet). */
+  .kbot-krell .kbot-krell__btn {
+    min-height: 44px;
   }
 
   /* Her name alone keeps the brand row on one line; "Ask" stays for screen readers. */

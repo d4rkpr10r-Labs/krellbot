@@ -144,9 +144,49 @@ describe("Krell side panel", () => {
     expect(screen.queryByTestId("krell-panel")).toBeNull();
     expect(within(view).getByTestId("krell-message-user").textContent).toContain("What is paper?");
     expect(within(view).getByText("Paper runs use simulated funds.")).toBeDefined();
-    await waitFor(() => expect(within(view).getByTestId("krell-send")).toHaveProperty("disabled", true));
+    // The tab's composer drives the same, idle conversation: it can send at once.
+    fireEvent.change(within(view).getByTestId("krell-input"), { target: { value: "Thanks" } });
+    await waitFor(() => expect(within(view).getByTestId("krell-send")).toHaveProperty("disabled", false));
     // One shared state: the tab did not load the conversation again.
     expect(paths.filter((p) => p === "GET /api/v1/krell/conversation")).toHaveLength(1);
+  });
+
+  it("closes on Escape from inside the panel", async () => {
+    installFetch();
+    const onClose = vi.fn();
+    render(
+      <KrellConversationProvider active>
+        <KrellSidePanel onClose={onClose} onOpenTab={() => {}} />
+      </KrellConversationProvider>,
+    );
+    const panel = screen.getByTestId("krell-panel");
+    expect(document.activeElement).toBe(panel);
+    const input = await within(panel).findByTestId("krell-input");
+    fireEvent.keyDown(input, { key: "Escape", shiftKey: true });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("is a modal dialog only as a full-screen sheet", async () => {
+    installFetch();
+    const { rerender } = render(
+      <KrellConversationProvider active>
+        <KrellSidePanel onClose={() => {}} onOpenTab={() => {}} />
+      </KrellConversationProvider>,
+    );
+    const panel = screen.getByTestId("krell-panel");
+    await within(panel).findByTestId("krell-input");
+    expect(panel.getAttribute("role")).toBeNull();
+    expect(panel.getAttribute("aria-modal")).toBeNull();
+    rerender(
+      <KrellConversationProvider active>
+        <KrellSidePanel modal onClose={() => {}} onOpenTab={() => {}} />
+      </KrellConversationProvider>,
+    );
+    expect(screen.getByRole("dialog", { name: "Krell" })).toBe(panel);
+    expect(panel.getAttribute("aria-modal")).toBe("true");
   });
 
   it("panel becomes a full-screen sheet at phone width", async () => {

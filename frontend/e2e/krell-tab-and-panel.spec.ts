@@ -202,8 +202,48 @@ test("tab and panel share one conversation", async ({ journey }) => {
   await expect(view.getByTestId("krell-message-user")).toHaveText(/What is a paper run\?/);
   await expect(view.getByText("Paper runs trade simulated funds only.")).toBeVisible();
   await expect(view.getByTestId("krell-avatar")).toHaveCount(2);
+  // Moving to the tab carries focus to its composer.
+  await expect(view.getByTestId("krell-input")).toBeFocused();
   expect(mock.conversationReads).toBe(1);
   await expectTextOnly(page);
+  journey.assertGuards();
+});
+
+test("Escape and Close return focus to Ask Krell, which focuses the composer on the Krell tab", async ({ journey }) => {
+  const { page } = journey;
+  const mock: Mock = { connected: true, conversationReads: 0, sent: [] };
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await mockKrell(page, mock);
+  await page.goto(journey.workstation.baseURL);
+  await journey.waitForSessionReady(page);
+
+  const ask = page.getByTestId("ask-krell");
+  await ask.click();
+  const panel = page.getByTestId("krell-panel");
+  await expect(panel.getByTestId("krell-input")).toBeVisible();
+  // Docked on desktop: not modal, and the workstation stays usable.
+  await expect(panel).not.toHaveAttribute("role", "dialog");
+  await expect(page.locator("main.kbot-shell__main")).not.toHaveAttribute("inert");
+  await panel.getByTestId("krell-input").focus();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("krell-panel")).toHaveCount(0);
+  await expect(ask).toBeFocused();
+  await expect(ask).toHaveAttribute("aria-expanded", "false");
+
+  await ask.click();
+  await page.getByTestId("krell-panel").getByRole("button", { name: "Close" }).click();
+  await expect(page.getByTestId("krell-panel")).toHaveCount(0);
+  await expect(ask).toBeFocused();
+
+  // On the Krell tab the button focuses the tab's composer; no second conversation opens.
+  await clickNav(page, "Krell");
+  const view = page.getByTestId("krell-view");
+  await expect(view.getByTestId("krell-input")).toBeVisible();
+  await ask.click();
+  await expect(page.getByTestId("krell-panel")).toHaveCount(0);
+  await expect(page.getByTestId("krell-input")).toHaveCount(1);
+  await expect(view.getByTestId("krell-input")).toBeFocused();
+  await expect(ask).toHaveAttribute("aria-expanded", "false");
   journey.assertGuards();
 });
 
@@ -233,8 +273,30 @@ test("panel becomes a full-screen sheet at phone width", async ({ journey }) => 
   );
   expect(overflowX).toBeLessThanOrEqual(1);
 
+  // The sheet is modal: the workstation behind it is out of the tab order and the tree.
+  await expect(panel).toHaveAttribute("role", "dialog");
+  await expect(panel).toHaveAttribute("aria-modal", "true");
+  await expect(page.locator("header.kbot-shell__header")).toHaveAttribute("inert", "");
+  await expect(page.locator("main.kbot-shell__main")).toHaveAttribute("inert", "");
+  for (let step = 0; step < 8; step += 1) {
+    await page.keyboard.press("Tab");
+    const inside = await page.evaluate(
+      () =>
+        document.activeElement === document.body ||
+        document.activeElement?.closest('[data-testid="krell-panel"]') !== null,
+    );
+    expect(inside).toBe(true);
+  }
+
+  // >=44px targets, and Close (the way off the sheet) returns focus to Ask Krell.
+  for (const name of ["Open in Krell tab", "Close"]) {
+    const box = await panel.getByRole("button", { name }).boundingBox();
+    expect(box!.height).toBeGreaterThanOrEqual(44);
+  }
   await panel.getByRole("button", { name: "Close" }).click();
   await expect(page.getByTestId("krell-panel")).toHaveCount(0);
+  await expect(page.locator("main.kbot-shell__main")).not.toHaveAttribute("inert");
   await expect(ask).toHaveAttribute("aria-expanded", "false");
+  await expect(ask).toBeFocused();
   journey.assertGuards();
 });

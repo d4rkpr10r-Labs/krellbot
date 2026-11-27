@@ -7,7 +7,7 @@
  * person's message or an engine line (disclosure, error, decision) ends
  * it. All model text renders as plain text.
  */
-import { useEffect, useId, useRef, useState, type FormEvent, type JSX } from "react";
+import { useEffect, useId, useRef, type FormEvent, type JSX } from "react";
 import krellAvatar from "../../assets/character/krell-pfp-160.webp";
 import { useKrell, type KrellItem } from "./KrellConversationProvider";
 import "./krell.css";
@@ -71,7 +71,11 @@ function KrellRow({ item, avatar }: Row): JSX.Element {
   switch (item.kind) {
     case "user":
       return (
-        <li className="kbot-krell__msg kbot-krell__msg--user" data-testid="krell-message-user">
+        <li
+          className={"kbot-krell__msg kbot-krell__msg--user" + (item.sending ? " kbot-krell__msg--sending" : "")}
+          data-testid="krell-message-user"
+          aria-busy={item.sending || undefined}
+        >
           <span className="kbot-krell__sr">You: </span>
           <p className="kbot-krell__bubble">{item.text}</p>
         </li>
@@ -118,7 +122,6 @@ function KrellRow({ item, avatar }: Row): JSX.Element {
 export function KrellConversation(): JSX.Element {
   const krell = useKrell();
   const inputId = useId();
-  const [draft, setDraft] = useState("");
   const logRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -146,12 +149,10 @@ export function KrellConversation(): JSX.Element {
     );
   }
 
-  const canSend = !krell.pending && draft.trim() !== "";
+  const canSend = !krell.pending && krell.draft.trim() !== "";
   const submit = (event?: FormEvent): void => {
     event?.preventDefault();
-    if (!canSend) return;
-    krell.send(draft);
-    setDraft("");
+    if (canSend) krell.send(krell.draft);
   };
 
   return (
@@ -176,11 +177,12 @@ export function KrellConversation(): JSX.Element {
           id={inputId}
           className="kbot-krell__input"
           data-testid="krell-input"
+          data-krell-composer=""
           rows={2}
           maxLength={MAX_MESSAGE_CHARS}
           placeholder="Ask Krell about Krellbot"
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
+          value={krell.draft}
+          onChange={(event) => krell.setDraft(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
               event.preventDefault();
