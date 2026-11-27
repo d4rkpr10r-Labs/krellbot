@@ -437,59 +437,90 @@ def test_urllib_transport_streams_lines_and_maps_http_errors(monkeypatch):
     assert err.value.status == 401 and "denied" in err.value.body
 
 
-def test_redirect_is_never_followed_and_credential_never_reaches_a_second_request():
-    import threading
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+def test_no_redirect_handler_refuses_to_build_a_redirected_request():
+    import urllib.request
 
-    hits: dict[str, list[dict]] = {"first": [], "second": []}
+    from krellbot.ai.http import _NoRedirect
 
-    class Second(BaseHTTPRequestHandler):
-        def do_POST(self):
-            hits["second"].append(dict(self.headers))
-            self.send_response(200)
-            self.end_headers()
+    req = urllib.request.Request("https://a.example/x", headers={"authorization": "Bearer z"})
+    assert _NoRedirect().redirect_request(req, None, 302, "Found", {}, "https://evil.example/y") is None
 
-        do_GET = do_POST
 
-        def log_message(self, *a):
-            pass
+def test_redirect_is_never_followed_and_credential_never_reaches_the_location_host(monkeypatch):
+    import email.message
+    import io
+    import urllib.request
+    import urllib.response
 
-    second = HTTPServer(("127.0.0.1", 0), Second)
-    target = f"http://127.0.0.1:{second.server_port}/stolen"
+    import krellbot.ai.http as http_mod
 
-    class First(BaseHTTPRequestHandler):
-        def do_POST(self):
-            hits["first"].append(dict(self.headers))
-            self.send_response(302)
-            self.send_header("Location", target)
-            self.end_headers()
+    for var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    seen: list[tuple[str, dict[str, str]]] = []
 
-        do_GET = do_POST
+    class Redirecting(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            seen.append((req.full_url, {k.lower(): v for k, v in req.header_items()}))
+            headers = email.message.Message()
+            headers["Location"] = "https://evil.example/stolen"
+            resp = urllib.response.addinfourl(io.BytesIO(b""), headers, req.full_url, 302)
+            resp.msg = "Found"
+            return resp
 
-        def log_message(self, *a):
-            pass
+    monkeypatch.setattr(http_mod, "_TEST_HANDLERS", (Redirecting(),))
+    base = "https://api.example"
+    auth = {"authorization": f"Bearer {SECRET}"}
 
-    first = HTTPServer(("127.0.0.1", 0), First)
-    threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (first, second)]
-    for t in threads:
-        t.start()
-    try:
-        base = f"http://127.0.0.1:{first.server_port}"
-        for make in (
-            lambda tr: OpenAICompatAdapter(base, SECRET, tr),
-            lambda tr: AnthropicMessagesAdapter(base, SECRET, tr),
-        ):
-            out = run(make(UrllibTransport()))
-            assert len(out) == 1 and isinstance(out[0], ProviderError)
-            assert out[0].code == "provider_bad_response"
-        with pytest.raises(TransportError) as err:
-            UrllibTransport().get_json(base + "/models", {"authorization": f"Bearer {SECRET}"}, 5.0)
-        assert err.value.status == 302
-    finally:
-        first.shutdown()
-        second.shutdown()
-    assert len(hits["first"]) == 3
-    assert hits["second"] == []
+    seen.clear()
+    with pytest.raises(TransportError) as err:
+        list(UrllibTransport().post_stream(base + "/chat", {}, auth, 5.0))
+    assert err.value.status == 302
+    assert [url for url, _ in seen] == [base + "/chat"]
+
+    seen.clear()
+    with pytest.raises(TransportError) as err:
+        UrllibTransport().get_json(base + "/models", auth, 5.0)
+    assert err.value.status == 302
+    assert [url for url, _ in seen] == [base + "/models"]
+
+    for make in (
+        lambda tr: OpenAICompatAdapter(base, SECRET, tr),
+        lambda tr: AnthropicMessagesAdapter(base, SECRET, tr),
+    ):
+        seen.clear()
+        out = run(make(UrllibTransport()))
+        assert len(out) == 1 and isinstance(out[0], ProviderError)
+        assert out[0].code == "provider_bad_response"
+        assert len(seen) == 1
+        assert all("evil.example" not in url for url, _ in seen)
+
+
+def test_usage_already_seen_is_emitted_before_a_provider_error_and_no_done():
+    events = [
+        oa_chunk({"content": "a"}, usage={"prompt_tokens": 3, "completion_tokens": 2}),
+        {"error": {"type": "server_error", "message": "boom"}},
+    ]
+    out = run(openai(FakeAiTransport(responses=[sse(*events)])))
+    assert out[0] == TextDelta("a")
+    assert out[1] == Usage(3, 2)
+    assert isinstance(out[2], ProviderError) and len(out) == 3
+    assert not any(isinstance(e, Done) for e in out)
+
+    # A transport drop after usage behaves the same.
+    lines = sse(oa_chunk({"content": "a"}, usage={"prompt_tokens": 3, "completion_tokens": 2}))
+    out = run(openai(FakeAiTransport(responses=[lines + [TransportError(None, "reset")]])))
+    assert [type(e) for e in out] == [TextDelta, Usage, ProviderError]
+
+    ev = [
+        {"type": "message_start", "message": {"id": "m", "usage": {"input_tokens": 11, "output_tokens": 1}}},
+        {"type": "error", "error": {"type": "overloaded_error", "message": "x"}},
+    ]
+    out = run(anthropic(FakeAiTransport(responses=[sse(*ev, named=True)])))
+    assert out[0] == Usage(11, 1)
+    assert isinstance(out[1], ProviderError) and out[1].code == "provider_unavailable" and len(out) == 2
+
+    out = run(anthropic(FakeAiTransport(responses=[sse(*ev[:1], named=True)])))
+    assert [type(e) for e in out] == [Usage, ProviderError]
 
 
 def test_incomplete_read_mid_stream_is_unavailable(monkeypatch):

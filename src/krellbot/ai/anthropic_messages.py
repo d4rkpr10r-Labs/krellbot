@@ -8,6 +8,7 @@ from typing import Any
 from krellbot.ai.http import (
     BadStream,
     HttpTransport,
+    StreamFailure,
     error_from_exception,
     iter_sse_data,
     parse_json_object,
@@ -78,9 +79,13 @@ class AnthropicMessagesAdapter:
         tools: Sequence[ToolDef],
         max_tokens: int,
     ) -> Iterator[StreamEvent]:
+        usage_box: list[Usage | None] = [None]
         try:
-            yield from self._stream(model, system, messages, tools, max_tokens)
+            yield from self._stream(model, system, messages, tools, max_tokens, usage_box)
         except Exception as exc:  # noqa: BLE001 — adapters never raise; coerced to ProviderError
+            # Tokens already spent still count toward budgets: Usage precedes the error.
+            if usage_box[0] is not None:
+                yield usage_box[0]
             yield error_from_exception(exc)
 
     def _stream(
@@ -90,6 +95,7 @@ class AnthropicMessagesAdapter:
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolDef],
         max_tokens: int,
+        usage_box: list[Usage | None],
     ) -> Iterator[StreamEvent]:
         body: dict[str, Any] = {
             "model": model,
@@ -120,13 +126,16 @@ class AnthropicMessagesAdapter:
             if kind == "error":
                 err = event.get("error")
                 etype = err.get("type") if isinstance(err, dict) else None
-                yield ProviderError(_ERROR_CODES.get(etype, "provider_bad_response"), "The provider reported an error.")  # type: ignore[arg-type]
-                return
+                raise StreamFailure(
+                    ProviderError(_ERROR_CODES.get(etype, "provider_bad_response"), "The provider reported an error.")  # type: ignore[arg-type]
+                )
             if kind == "message_start":
                 usage = (event.get("message") or {}).get("usage") or {}
                 saw_usage = saw_usage or bool(usage)
                 input_tokens = _count(usage.get("input_tokens"))
                 output_tokens = _count(usage.get("output_tokens"))
+                if saw_usage:
+                    usage_box[0] = Usage(input_tokens, output_tokens)
             elif kind == "content_block_start":
                 block = event.get("content_block")
                 if not isinstance(block, dict) or not isinstance(event.get("index"), int):
@@ -173,6 +182,7 @@ class AnthropicMessagesAdapter:
                 if isinstance(usage, dict) and "output_tokens" in usage:
                     output_tokens = _count(usage.get("output_tokens"))
                     saw_usage = True
+                    usage_box[0] = Usage(input_tokens, output_tokens)
             elif kind == "message_stop":
                 finished = True
                 break
@@ -185,8 +195,8 @@ class AnthropicMessagesAdapter:
         # Tool calls are released only once the whole message is known to be well formed.
         for call in completed:
             yield ToolCallDone(call)
-        if saw_usage:
-            yield Usage(input_tokens, output_tokens)
+        if usage_box[0] is not None:
+            yield usage_box[0]
         yield Done(stop_reason or "end_turn")
 
 

@@ -9,6 +9,7 @@ from typing import Any, Literal
 from krellbot.ai.http import (
     BadStream,
     HttpTransport,
+    StreamFailure,
     error_from_exception,
     iter_sse_data,
     parse_json_object,
@@ -98,9 +99,13 @@ class OpenAICompatAdapter:
         tools: Sequence[ToolDef],
         max_tokens: int,
     ) -> Iterator[StreamEvent]:
+        usage_box: list[Usage | None] = [None]
         try:
-            yield from self._stream(model, system, messages, tools, max_tokens)
+            yield from self._stream(model, system, messages, tools, max_tokens, usage_box)
         except Exception as exc:  # noqa: BLE001 — adapters never raise; coerced to ProviderError
+            # Tokens already spent still count toward budgets: Usage precedes the error.
+            if usage_box[0] is not None:
+                yield usage_box[0]
             yield error_from_exception(exc)
 
     def _stream(
@@ -110,6 +115,7 @@ class OpenAICompatAdapter:
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolDef],
         max_tokens: int,
+        usage_box: list[Usage | None],
     ) -> Iterator[StreamEvent]:
         body: dict[str, Any] = {
             "model": model,
@@ -131,7 +137,6 @@ class OpenAICompatAdapter:
             headers["authorization"] = f"Bearer {self._credential}"
 
         pending: dict[int, dict[str, Any]] = {}
-        last_usage: Usage | None = None
         finish: str | None = None
         saw_done = False
         for payload in iter_sse_data(self._transport.post_stream(self._url, body, headers, _TIMEOUT)):
@@ -140,11 +145,12 @@ class OpenAICompatAdapter:
                 break
             chunk = parse_json_object(payload, "stream chunk")
             if chunk.get("error") is not None:
-                yield ProviderError(_error_code_from_body(chunk["error"]), "The provider reported an error.")  # type: ignore[arg-type]
-                return
+                raise StreamFailure(
+                    ProviderError(_error_code_from_body(chunk["error"]), "The provider reported an error.")  # type: ignore[arg-type]
+                )
             usage = chunk.get("usage")
             if isinstance(usage, dict):
-                last_usage = Usage(_count(usage.get("prompt_tokens")), _count(usage.get("completion_tokens")))
+                usage_box[0] = Usage(_count(usage.get("prompt_tokens")), _count(usage.get("completion_tokens")))
             choices = chunk.get("choices") or []
             if not isinstance(choices, list):
                 raise BadStream("choices is not a list")
@@ -174,8 +180,8 @@ class OpenAICompatAdapter:
             raise BadStream(
                 "stream ended without a finish reason" if not saw_done else "no finish reason before [DONE]"
             )
-        if last_usage is not None:
-            yield last_usage
+        if usage_box[0] is not None:
+            yield usage_box[0]
         yield Done(finish)
 
 

@@ -62,8 +62,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# Tests inject fake handlers here (placed first) to prove behaviour without sockets.
+_TEST_HANDLERS: tuple = ()
+
+
 def _open(req: urllib.request.Request, timeout: float):
-    opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=ssl_context()))
+    opener = urllib.request.build_opener(
+        *_TEST_HANDLERS, _NoRedirect, urllib.request.HTTPSHandler(context=ssl_context())
+    )
     return opener.open(req, timeout=timeout)
 
 
@@ -107,6 +113,14 @@ class BadStream(Exception):
     """The provider sent something that is not the stream shape we expect."""
 
 
+class StreamFailure(Exception):
+    """The provider reported an error inside the stream; carries the mapped ProviderError."""
+
+    def __init__(self, error: ProviderError) -> None:
+        super().__init__(error.code)
+        self.error = error
+
+
 def iter_sse_data(lines: Iterator[bytes]) -> Iterator[str]:
     """Yield the payload of each SSE ``data:`` line. Raises BadStream on anything else."""
     for raw in lines:
@@ -138,6 +152,8 @@ def parse_tool_arguments(text: str) -> dict:
 
 
 def error_from_exception(exc: Exception) -> ProviderError:
+    if isinstance(exc, StreamFailure):
+        return exc.error
     if isinstance(exc, TransportError):
         return error_from_transport(exc)
     if isinstance(exc, BadStream):
