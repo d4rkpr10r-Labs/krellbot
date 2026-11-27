@@ -17,11 +17,18 @@ two agent arms that both passed an earlier count cannot both be kept.
 
 A registry file that exists but cannot be read raises
 :class:`AgentArmRegistryUnreadable`, so the limit fails closed.
+
+Agent arms arm a pack snapshot, never the agent-supplied file:
+:func:`snapshot_pack` writes the exact bytes the agent limits were checked
+against to ``<home>/agent-packs/<sha256>.json`` (directory 0700, file 0600,
+atomic, content-addressed). A file swapped after the check cannot change
+what is armed, and the snapshot path identifies the arm's record afterwards.
 """
 
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import time
@@ -36,6 +43,34 @@ from krellbot.paths import atomic_write
 REGISTRY_FILENAME = "agent-arms.json"
 LOCK_FILENAME = ".agent-arms.lock"
 REGISTRY_SCHEMA_VERSION = "1"
+SNAPSHOT_DIRNAME = "agent-packs"
+
+
+def snapshot_dir(home: Path) -> Path:
+    """Return the directory of agent pack snapshots."""
+    return Path(home) / SNAPSHOT_DIRNAME
+
+
+def snapshot_pack(home: Path, raw: bytes) -> Path:
+    """Store ``raw`` as ``<home>/agent-packs/<sha256 of raw>.json`` and return its path.
+
+    The directory is 0700 and the file 0600, written atomically. A snapshot
+    that already holds exactly these bytes is never rewritten; one whose
+    bytes no longer match its name is replaced.
+    """
+    digest = hashlib.sha256(raw).hexdigest()
+    directory = snapshot_dir(home)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(directory, 0o700)
+    path = directory / f"{digest}.json"
+    try:
+        if hashlib.sha256(path.read_bytes()).hexdigest() == digest:
+            return path
+    except FileNotFoundError:
+        pass
+    atomic_write(path, raw, mode=0o600)
+    return path
 
 
 class AgentArmRegistryUnreadable(ValueError):
@@ -252,6 +287,7 @@ __all__ = [
     "LOCK_FILENAME",
     "REGISTRY_FILENAME",
     "REGISTRY_SCHEMA_VERSION",
+    "SNAPSHOT_DIRNAME",
     "AgentArmRegistryBusy",
     "AgentArmRegistryUnreadable",
     "claim_agent_arm",
@@ -259,4 +295,6 @@ __all__ = [
     "registry_lock",
     "registry_path",
     "running_agent_arms",
+    "snapshot_dir",
+    "snapshot_pack",
 ]

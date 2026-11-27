@@ -12,6 +12,7 @@ disarms the arm, or says plainly that it may still be running.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -25,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from krellbot import config as kb_config
+from krellbot import run as kb_run
 from krellbot.agent import arm_registry
 from krellbot.agent.actors import KRELL, Actor
 from krellbot.agent.core import AgentToolCore, ToolSpec
@@ -32,6 +34,7 @@ from krellbot.api.app import CSRF_HEADER, SESSION_COOKIE
 from krellbot.application import paper as paper_app
 from krellbot.application import user_policy
 from krellbot.application.paper import PaperService
+from krellbot.application.strategy import StrategyDraftService
 from krellbot.journal import read_records_lenient
 from krellbot.mcp import McpTools
 from krellbot.mcp.errors import (
@@ -598,9 +601,9 @@ def test_rollback_of_a_failed_agent_arm_keeps_a_concurrent_human_arm(home: Path,
 
 
 def test_the_stored_arm_is_checked_against_the_limits_after_the_arm(home: Path, monkeypatch: pytest.MonkeyPatch):
-    # The pre-check reads a 1% cap, but the pack that is armed carries 25%
-    # (as if the pack file changed between the check and the arm).
-    monkeypatch.setattr("krellbot.agent.core.arm_terms", lambda _path, _venue: ("SUIUSD", Decimal(1)))
+    # The pre-check's parse reports a 1% cap, but the armed bytes carry 25%:
+    # the stored record is checked again and wins.
+    monkeypatch.setattr("krellbot.agent.core.arm_terms", lambda _raw, _venue: ("SUIUSD", Decimal(1)))
     result = _agent_arm(home, _pack(home, cap=25))
     _assert_limit_refusal(result, CODE_AGENT_LIMIT_RISK_CAP)
     assert "was disarmed" in result["message"]
@@ -617,11 +620,13 @@ def test_an_arm_whose_new_record_cannot_be_found_is_never_counted_or_disarmed(
     before = kb_config.config_path(home).read_bytes()
 
     # The arm reports success but wrote nothing; the record on the agent's
-    # pair is the human's, from before the arm, so it is left alone.
+    # pair is the human's, from before the arm, so it is left alone and the
+    # agent is told plainly that its arm could not be identified.
     monkeypatch.setattr("krellbot.run.arm_pack", lambda *_args, **_kwargs: 0)
     result = _agent_arm(home, _pack(home), loss=None)
-    _assert_limit_refusal(result, CODE_AGENT_ARM_UNVERIFIED)
-    assert "nothing was disarmed" in result["message"]
+    _assert_limit_refusal(result, CODE_AGENT_ARM_CLEANUP_FAILED)
+    assert "could not be identified" in result["message"]
+    assert "may still be running" in result["message"]
     assert kb_config.config_path(home).read_bytes() == before
     assert arm_registry.running_agent_arms(home) == []
 
@@ -630,11 +635,12 @@ def test_failure_after_an_agent_arm_disarms_it_or_says_it_may_still_run(home: Pa
     def registry_write_fails(*_args, **_kwargs):
         raise OSError("read-only home")
 
-    monkeypatch.setattr(arm_registry, "atomic_write", registry_write_fails)
+    monkeypatch.setattr(arm_registry, "claim_agent_arm", registry_write_fails)
     result = _agent_arm(home, _pack(home))
     _assert_limit_refusal(result, CODE_AGENT_ARM_UNVERIFIED)
     assert "was disarmed" in result["message"]
     assert _armed(home) == []
+    assert arm_registry.running_agent_arms(home) == []
 
     # The disarm raises: the arm may still be running, and the refusal says
     # so, names it, and never claims it was disarmed.
@@ -671,6 +677,10 @@ def test_failure_after_an_agent_arm_disarms_it_or_says_it_may_still_run(home: Pa
         CODE_AGENT_ARM_CLEANUP_FAILED,
         CODE_AGENT_ARM_CLEANUP_FAILED,
     ]
+    # Arms that may still be running are counted, so later agent arms see them.
+    assert sorted(r["pair"] for r in arm_registry.running_agent_arms(home)) == ["BTCUSD", "ETHUSD"]
+    _write_policy(home, _v2(max_agent_arms=2))
+    _assert_limit_refusal(_agent_arm(home, _pack(home, pair="SOLUSD")), CODE_AGENT_LIMIT_MAX_ARMS)
 
 
 def test_two_agent_arms_that_both_passed_the_count_cannot_exceed_the_limit(home: Path, monkeypatch: pytest.MonkeyPatch):
@@ -728,6 +738,150 @@ def test_concurrent_agent_arm_records_are_not_lost(home: Path, monkeypatch: pyte
         writer.join()
     assert errors == []
     assert sorted(r["pair"] for r in arm_registry.running_agent_arms(home)) == ["BTCUSD", "SUIUSD"]
+
+
+# ---- the pack that was checked is the pack that is armed -----------------
+
+
+def _sha256(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def test_a_pack_swapped_after_the_check_is_not_what_gets_armed(home: Path, monkeypatch: pytest.MonkeyPatch):
+    pack = _pack(home)  # kraken SUIUSD, 2% cap
+    checked = pack.read_bytes()
+    real_arm = PaperService.arm
+
+    def swap_then_arm(self, *args, **kwargs):
+        # An agent with file access swaps the file after the check.
+        _pack(home, pair="BTCUSD", cap=25, pack_id="agent-suiusd")
+        return real_arm(self, *args, **kwargs)
+
+    monkeypatch.setattr(PaperService, "arm", swap_then_arm)
+    result = _agent_arm(home, pack)
+    assert result["ok"] is True, result
+    assert json.loads(pack.read_bytes())["markets"][0]["pair"] == "BTCUSD"
+    [armed] = _armed(home)
+    assert (armed.pair, armed.cap) == ("SUIUSD", Decimal(2))
+    snapshot = arm_registry.snapshot_dir(home) / f"{_sha256(checked)}.json"
+    assert armed.pack_path == str(snapshot)
+    assert [r["pair"] for r in arm_registry.running_agent_arms(home)] == ["SUIUSD"]
+
+
+def test_an_arm_the_engine_put_on_another_pack_is_reported_and_left_alone(home: Path, monkeypatch: pytest.MonkeyPatch):
+    # Simulates the engine arming a different pack (another pair) than the
+    # snapshot it was given.
+    other = _pack(home, pair="BTCUSD", cap=25, pack_id="other-btcusd")
+    real_arm_pack = kb_run.arm_pack
+
+    def arm_another_pack(_pack_path, **kwargs):
+        return real_arm_pack(other, **kwargs)
+
+    monkeypatch.setattr(kb_run, "arm_pack", arm_another_pack)
+    result = _agent_arm(home, _pack(home))
+    _assert_limit_refusal(result, CODE_AGENT_ARM_CLEANUP_FAILED)
+    assert "may still be running" in result["message"]
+    # A record whose pack_path is not this arm's snapshot is never touched.
+    [armed] = _armed(home)
+    assert (armed.pair, armed.pack_path) == ("BTCUSD", str(other))
+    assert arm_registry.running_agent_arms(home) == []
+    assert [r["code"] for r in _refused_rows(home)] == [CODE_AGENT_ARM_CLEANUP_FAILED]
+
+
+def test_undoing_an_agent_arm_never_touches_a_human_arm_made_meanwhile(home: Path, monkeypatch: pytest.MonkeyPatch):
+    real_arm = PaperService.arm
+
+    def arm_then_a_human_arms(self, *args, **kwargs):
+        result = real_arm(self, *args, **kwargs)
+        human = _pack(home, pair="SOLUSD", cap=25, pack_id="human-solusd")
+        assert real_arm(PaperService(home), human, venue="kraken", mode="paper", paper_balance=Decimal(1000)).ok
+        return result
+
+    def registry_write_fails(*_args, **_kwargs):
+        raise OSError("read-only home")
+
+    monkeypatch.setattr(PaperService, "arm", arm_then_a_human_arms)
+    monkeypatch.setattr(arm_registry, "claim_agent_arm", registry_write_fails)
+    result = _agent_arm(home, _pack(home))
+    _assert_limit_refusal(result, CODE_AGENT_ARM_UNVERIFIED)
+    assert "kraken SUIUSD was disarmed" in result["message"]
+    assert [a.pair for a in _armed(home)] == ["SOLUSD"]
+
+
+def test_agent_arms_arm_a_private_content_addressed_snapshot(home: Path):
+    pack = _pack(home)
+    raw = pack.read_bytes()
+    assert _agent_arm(home, pack)["ok"] is True
+    snapshot = arm_registry.snapshot_dir(home) / f"{_sha256(raw)}.json"
+    assert _armed(home)[0].pack_path == str(snapshot)
+    assert snapshot.read_bytes() == raw
+    if os.name != "nt":
+        assert stat.S_IMODE(snapshot.stat().st_mode) == 0o600
+        assert stat.S_IMODE(snapshot.parent.stat().st_mode) == 0o700
+
+    # The same bytes reuse the same snapshot; it is never rewritten.
+    first = snapshot.stat()
+    assert PaperService(home).disarm(venue="kraken", pair="SUIUSD").ok is True
+    assert _agent_arm(home, pack)["ok"] is True
+    again = snapshot.stat()
+    assert (again.st_ino, again.st_mtime_ns) == (first.st_ino, first.st_mtime_ns)
+    assert [p.name for p in snapshot.parent.iterdir()] == [snapshot.name]
+
+    # A snapshot whose bytes no longer match its name is replaced before use.
+    assert PaperService(home).disarm(venue="kraken", pair="SUIUSD").ok is True
+    snapshot.write_bytes(b"{}")
+    assert _agent_arm(home, pack)["ok"] is True
+    assert snapshot.read_bytes() == raw
+
+
+def test_an_agent_arm_of_a_catalog_pack_still_requires_a_license(home: Path):
+    catalog = home / "packs" / "catalog"
+    catalog.mkdir(parents=True)
+    paid = catalog / "agent-suiusd.json"
+    paid.write_bytes(_pack(home).read_bytes())
+    assert _agent_arm(home, paid)["ok"] is True
+    [armed] = _armed(home)
+    assert armed.pack_path.startswith(str(arm_registry.snapshot_dir(home)))
+    assert armed.requires_license is True
+
+
+def test_a_failure_inside_the_arm_after_the_write_is_undone(home: Path, monkeypatch: pytest.MonkeyPatch):
+    real_apply = paper_app._apply_loss_limit_to_new_arm
+    real_drop = paper_app._drop_new_arm
+
+    def rollback_save_fails(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    # The limit cannot be set and the rollback's save raises: PaperService.arm
+    # raises with the record written.
+    monkeypatch.setattr(paper_app, "_apply_loss_limit_to_new_arm", lambda *_a, **_k: False)
+    monkeypatch.setattr(paper_app, "_drop_new_arm", rollback_save_fails)
+    result = _agent_arm(home, _pack(home))
+    _assert_limit_refusal(result, CODE_AGENT_ARM_UNVERIFIED)
+    assert "kraken SUIUSD was disarmed" in result["message"]
+    assert _armed(home) == []
+    assert arm_registry.running_agent_arms(home) == []
+
+    # Marking the draft deployed raises after a revision arm: undone the same way.
+    monkeypatch.setattr(paper_app, "_apply_loss_limit_to_new_arm", real_apply)
+    monkeypatch.setattr(paper_app, "_drop_new_arm", real_drop)
+    core = AgentToolCore(home)
+    draft = core.call(KRELL, "draft", {"pack": json.loads(_pack(home, pair="BTCUSD").read_text(encoding="utf-8"))})
+    revision_id = draft["result"]["revision_id"]
+    assert core.call(KRELL, "validate", {"revision_id": revision_id})["ok"] is True
+
+    def mark_fails(_self, _revision_id):
+        raise OSError("drafts are read-only")
+
+    monkeypatch.setattr(StrategyDraftService, "mark_deployed", mark_fails)
+    result = core.call(
+        KRELL,
+        "paper_arm",
+        {"revision_id": revision_id, "venue": "kraken", "paper_balance": "1000", "daily_loss_limit_pct": "5"},
+    )
+    assert result["ok"] is False
+    assert result["code"] == CODE_AGENT_ARM_UNVERIFIED
+    assert _armed(home) == []
 
 
 # ---- change tools (M38.6 registers them) ---------------------------------

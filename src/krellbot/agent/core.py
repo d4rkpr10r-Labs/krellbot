@@ -17,10 +17,13 @@ result, and every call is audited:
 4. Operator policy and agent limits: :meth:`AgentToolCore._policy_step`
    checks ``paper_arm`` and the paper change tools against the operator's
    agent limits (:mod:`krellbot.agent.limits`, typed ``agent_limit_*`` and
-   ``agent_change_not_allowed`` refusals, journaled). After a successful
-   agent arm, the stored record is checked again and the arm is counted in
-   ``agent-arms.json`` under a lock (:mod:`krellbot.agent.arm_registry`);
-   any failure there disarms it (``agent_arm_*`` codes).
+   ``agent_change_not_allowed`` refusals, journaled). ``paper_arm`` reads
+   the pack's bytes once, checks them and arms an immutable snapshot of
+   them (``<home>/agent-packs/<sha256>.json``). After the arm, the record is
+   found by identity (venue, a new key, the snapshot path), checked again as
+   stored and counted in ``agent-arms.json`` under a lock
+   (:mod:`krellbot.agent.arm_registry`); anything wrong undoes it, or says
+   it may still be running (``agent_arm_*`` codes).
 5. Confirm tickets: :meth:`AgentToolCore._confirm_step` (M38.7 plugs in here).
 6. The tool's handler.
 7. One ``kind=agent_action`` journal record (:mod:`krellbot.agent.audit`).
@@ -44,13 +47,13 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal
 
 from krellbot import sanitize
-from krellbot.agent import limits
+from krellbot.agent import arm_registry, limits
 from krellbot.agent.actors import ACTOR_KINDS, Actor
 from krellbot.agent.audit import append_agent_record, is_secret_param_name
 from krellbot.agent.limits import (
@@ -66,7 +69,15 @@ from krellbot.agent.limits import (
 )
 from krellbot.application import packs as packs_app
 from krellbot.application import user_policy
-from krellbot.application.paper import CODE_NOT_ARMED, PaperService, arm_terms, parse_daily_loss_limit_pct
+from krellbot.application.paper import (
+    CODE_LOSS_LIMIT_ROLLBACK_FAILED,
+    CODE_NOT_ARMED,
+    PaperService,
+    arm_keys,
+    arm_terms,
+    new_arms_of,
+    parse_daily_loss_limit_pct,
+)
 from krellbot.application.research import ResearchRequest, ResearchService
 from krellbot.application.strategy import (
     DraftNotRunnable,
@@ -75,7 +86,7 @@ from krellbot.application.strategy import (
     StrategyIdMismatch,
 )
 from krellbot.application.user_policy import PolicyDecision
-from krellbot.config import find_armed, load_config
+from krellbot.config import ArmedPack, load_config
 
 # ---- refusal vocabulary -------------------------------------------------
 #
@@ -233,12 +244,18 @@ COSTS: tuple[str, ...] = ("light", "heavy")
 
 @dataclass(frozen=True)
 class ToolContext:
-    """What a handler may use: the home, the caller, the clock and the fetcher."""
+    """What a handler may use: the home, the caller, the clock and the fetcher.
+
+    ``call_state`` is scratch for one call only, shared by its policy step,
+    confirm step and handler (``paper_arm`` hands the pack it checked to the
+    handler this way, so the handler arms exactly that).
+    """
 
     home: Path
     actor: Actor
     clock: Callable[[], float]
     fetch: Callable[..., Any] | None
+    call_state: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -448,15 +465,24 @@ class AgentToolCore:
         """Step 4: operator policy and agent limits (:mod:`krellbot.agent.limits`).
 
         Return a refusal result to stop the call, or ``None`` to continue.
-        ``paper_arm`` is checked against the agent limits with the values
-        ``PaperService.arm`` will use; the change tools against the per-actor
-        allow flags. The existing paper-arm policy check stays inside the
-        ``paper_arm`` handler (``user_policy.ensure_allowed``): when it would
-        refuse, this step steps aside so that refusal and its single journal
-        row are exactly as before.
+
+        ``paper_arm`` (:func:`_prepare_paper_arm`): this step itself refuses a
+        live mode, an operator policy that denies paper-arm or is malformed
+        (``user_policy.ensure_allowed``, which journals the one refuse row),
+        bad input, and anything over the agent limits. It reads the pack's
+        bytes once, checks those bytes, writes them to an immutable snapshot
+        and leaves the prepared arm in ``ctx.call_state``; the handler arms
+        exactly that snapshot, so the pack that was checked is the pack that
+        is armed.
+
+        The change tools are checked against the per-actor allow flags.
         """
         if spec.name == limits.TOOL_PAPER_ARM:
-            return _paper_arm_limits(ctx, params)
+            prepared = _prepare_paper_arm(ctx, params)
+            if isinstance(prepared, dict):
+                return prepared
+            ctx.call_state[_PREPARED_ARM] = prepared
+            return None
         if spec.name in limits.CHANGE_TOOLS:
             decision = limits.check_agent_call(ctx.home, ctx.actor, spec.name, params, resolved={}, clock=ctx.clock)
             return None if decision is None else limit_refused(spec.name, decision)
@@ -643,23 +669,34 @@ def _backtest(ctx: ToolContext, params: dict) -> dict:
 
 @dataclass(frozen=True)
 class _ArmRequest:
-    """A ``paper_arm`` call resolved to what ``PaperService.arm`` will use."""
+    """A ``paper_arm`` call resolved from one read of its pack's bytes.
+
+    ``source_path`` is where the bytes were read (the agent's ``pack_path``
+    or the draft revision file); ``snapshot`` is the immutable copy that is
+    armed, set once the bytes passed the agent limits.
+    """
 
     venue: str
-    pack_path: Path
+    source_path: Path
+    pack_bytes: bytes
     revision_id: str | None
     balance: Decimal | None
     daily_loss_limit_pct: Decimal | None
+    snapshot: Path | None = None
 
+
+# ``ctx.call_state`` key: the prepared arm the policy step hands the handler.
+_PREPARED_ARM = "paper_arm.prepared"
 
 MESSAGE_BAD_LOSS_LIMIT = "daily_loss_limit_pct must be a plain percent above 0 and at most 100, e.g. 5 or 2.5"
+MESSAGE_PACK_UNREADABLE = "the pack file cannot be read"
 
 
 def _arm_request(ctx: ToolContext, params: dict) -> _ArmRequest | dict:
     """Resolve a ``paper_arm`` call, or return its ``mcp_invalid_request`` refusal.
 
-    Shared by the policy step and the handler, so both see the same pack,
-    balance and daily loss limit and refuse bad input identically.
+    The pack's bytes are read exactly once here; every check and the armed
+    snapshot use those bytes.
     """
     venue = params.get("venue")
     if not venue:
@@ -682,6 +719,10 @@ def _arm_request(ctx: ToolContext, params: dict) -> _ArmRequest | dict:
             "paper_arm",
             "paper_arm requires pack_path or revision_id",
         ).to_dict()
+    try:
+        pack_bytes = resolved_path.read_bytes()
+    except OSError:
+        return invalid_request("paper_arm", MESSAGE_PACK_UNREADABLE).to_dict()
 
     paper_balance = params.get("paper_balance")
     balance: Decimal | None
@@ -703,7 +744,8 @@ def _arm_request(ctx: ToolContext, params: dict) -> _ArmRequest | dict:
 
     return _ArmRequest(
         venue=str(venue),
-        pack_path=resolved_path,
+        source_path=resolved_path,
+        pack_bytes=pack_bytes,
         revision_id=str(revision_id) if revision_id else None,
         balance=balance,
         daily_loss_limit_pct=loss_limit,
@@ -717,17 +759,16 @@ def _paper_arm_policy_denied(decision: PolicyDecision) -> dict:
     return body
 
 
-def _paper_arm_limits(ctx: ToolContext, params: dict) -> dict | None:
-    """Policy step for ``paper_arm``: a refusal, or ``None`` once every limit passed.
+def _prepare_paper_arm(ctx: ToolContext, params: dict) -> _ArmRequest | dict:
+    """Check a ``paper_arm`` call and snapshot its pack; a refusal, or the prepared arm.
 
-    This step refuses everything itself, in the handler's historic order and
-    with its historic bodies: a live mode (``mcp_live_arm_refused``), an
-    operator policy that denies paper-arm or is malformed
-    (``user_policy.ensure_allowed``, which journals the one refuse row), bad
-    input (``mcp_invalid_request``), then the agent limits. The handler is
-    never reached without the limits having been checked, even if the policy
-    file changes between reads. Values are read from the pack the arm will use
-    (``arm_terms``); one that cannot be read is refused, never guessed.
+    Refuses, in the historic order and with the historic bodies: a live mode
+    (``mcp_live_arm_refused``), an operator policy that denies paper-arm or is
+    malformed (``user_policy.ensure_allowed``, which journals the one refuse
+    row), bad input (``mcp_invalid_request``), then the agent limits. The
+    limits read the pack bytes ``_arm_request`` read once (``arm_terms``); a
+    value that cannot be read is refused, never guessed. Bytes that pass are
+    written to ``<home>/agent-packs/<sha256>.json``, which is what is armed.
     """
     if str(params.get("mode", "paper")) != "paper":
         return live_arm_refused("paper_arm").to_dict()
@@ -737,7 +778,7 @@ def _paper_arm_limits(ctx: ToolContext, params: dict) -> dict | None:
     request = _arm_request(ctx, params)
     if isinstance(request, dict):
         return request
-    pair, risk_cap = arm_terms(request.pack_path, request.venue)
+    pair, risk_cap = arm_terms(request.pack_bytes, request.venue)
     resolved = {
         "venue": request.venue,
         "pair": pair or None,
@@ -748,18 +789,33 @@ def _paper_arm_limits(ctx: ToolContext, params: dict) -> dict | None:
     decision = limits.check_agent_call(
         ctx.home, ctx.actor, limits.TOOL_PAPER_ARM, params, resolved=resolved, clock=ctx.clock
     )
-    return None if decision is None else limit_refused(limits.TOOL_PAPER_ARM, decision)
+    if decision is not None:
+        return limit_refused(limits.TOOL_PAPER_ARM, decision)
+    return replace(request, snapshot=arm_registry.snapshot_pack(ctx.home, request.pack_bytes))
 
 
-MESSAGE_ARM_NOT_FOUND = (
-    "the new arm could not be found in the stored config to check it against the agent limits; "
-    "nothing was disarmed and nothing was counted"
-)
 MESSAGE_ARM_NOT_SETTLED = "the agent arm could not be checked, counted or completed"
+MESSAGE_ARM_FAILED_AFTER_WRITE = "the agent arm failed after its record was written"
 
 
-def _arm_keys(home: Path) -> set[tuple[str, str, int]]:
-    return {(a.venue, a.pair, a.armed_at_ts) for a in load_config(home).armed}
+def _shown(venue: str, pair: str | None = None) -> str:
+    shown = sanitize.text(venue, max_len=32)
+    return f"{shown} {sanitize.text(pair, max_len=32)}" if pair else shown
+
+
+def _count_anyway(ctx: ToolContext, armed: ArmedPack, request: _ArmRequest) -> None:
+    """Best effort: count an agent arm that may still be running, so later pre-checks see it."""
+    try:
+        arm_registry.record_agent_arm(
+            ctx.home,
+            venue=armed.venue,
+            pair=armed.pair,
+            actor=ctx.actor,
+            armed_at_ts=armed.armed_at_ts,
+            revision_id=request.revision_id,
+        )
+    except Exception:  # noqa: BLE001 — best effort; the refusal already says it may be running.
+        return
 
 
 def _journal_refusal(ctx: ToolContext, code: str, message: str) -> dict:
@@ -771,22 +827,25 @@ def _journal_refusal(ctx: ToolContext, code: str, message: str) -> dict:
     return limit_refused(limits.TOOL_PAPER_ARM, decision)
 
 
-def _undo_agent_arm(ctx: ToolContext, paper: PaperService, venue: str, pair: str, refusal: limits.Refusal) -> dict:
-    """Disarm an agent arm that must not stand, and refuse with ``refusal``.
+def _undo_agent_arm(
+    ctx: ToolContext, paper: PaperService, armed: ArmedPack, request: _ArmRequest, refusal: limits.Refusal
+) -> dict:
+    """Disarm this call's agent arm, which must not stand, and refuse with ``refusal``.
 
-    If the disarm fails, the refusal becomes ``agent_arm_cleanup_failed`` and
-    says the arm may still be running; it never claims a disarm that did not
-    happen.
+    If the disarm fails, the arm is counted anyway (best effort) and the
+    refusal becomes ``agent_arm_cleanup_failed``, which says the arm may
+    still be running; it never claims a disarm that did not happen.
     """
     code, message = refusal
     try:
-        undone = paper.disarm(venue=venue, pair=pair, correlation_id="")
+        undone = paper.disarm(venue=armed.venue, pair=armed.pair, correlation_id="")
         disarmed = undone.ok or undone.code == CODE_NOT_ARMED
     except Exception:  # noqa: BLE001 — a failed cleanup is reported, never raised.
         disarmed = False
-    shown = f"{sanitize.text(venue, max_len=32)} {sanitize.text(pair, max_len=32)}"
+    shown = _shown(armed.venue, armed.pair)
     if disarmed:
         return _journal_refusal(ctx, code, f"{message}; the arm on {shown} was disarmed")
+    _count_anyway(ctx, armed, request)
     return _journal_refusal(
         ctx,
         CODE_AGENT_ARM_CLEANUP_FAILED,
@@ -799,24 +858,51 @@ def _settle_agent_arm(
     request: _ArmRequest,
     paper: PaperService,
     *,
-    pair: str,
     before: set[tuple[str, str, int]],
-) -> dict | None:
-    """After a successful agent arm: check the stored record, count it, or undo it.
+    result: Any,
+    failure: Exception | None,
+) -> dict:
+    """Settle an agent arm attempt and return the tool result.
 
-    The stored ``ArmedPack`` is the authority (:func:`limits.settle_agent_arm`).
-    Only the record this arm created is ever touched: the one on the resolved
-    venue and pair that was not in the config before the arm. Any failure
-    after the arm disarms it and returns a typed refusal. Returns ``None``
-    when the arm stands.
+    This call's record is identified by identity only: on ``request.venue``,
+    a key not armed ``before`` the call, and ``pack_path`` equal to the
+    snapshot. A record with any other ``pack_path`` is never touched.
+
+    - No record, and the arm was refused or failed before writing: the
+      refusal stands (a failure is re-raised as ``agent_tool_error``).
+    - The arm succeeded (or its rollback failed) but no record, or more than
+      one, matches: ``agent_arm_cleanup_failed`` (may still be running); any
+      matched records are counted.
+    - One record, and the arm failed or was refused after writing it: undone.
+    - One record and the arm succeeded: the stored record is checked and the
+      arm counted (:func:`limits.settle_agent_arm`); anything wrong undoes it.
     """
+    ok = result is not None and result.ok
+    rollback_failed = result is not None and result.code == CODE_LOSS_LIMIT_ROLLBACK_FAILED
     try:
-        armed = find_armed(load_config(ctx.home), request.venue, pair) if pair else None
-    except Exception:  # noqa: BLE001 — handled below as a record that cannot be found.
-        armed = None
-    if armed is None or (armed.venue, armed.pair, armed.armed_at_ts) in before:
-        # Not ours to disarm: it may be a human's arm.
-        return _journal_refusal(ctx, CODE_AGENT_ARM_UNVERIFIED, MESSAGE_ARM_NOT_FOUND)
+        mine = new_arms_of(load_config(ctx.home), venue=request.venue, pack_path=request.snapshot, before=before)
+    except Exception:  # noqa: BLE001 — an unreadable config is reported below.
+        mine = None
+    if mine is None or len(mine) > 1 or (not mine and (ok or rollback_failed)):
+        for armed in mine or []:
+            _count_anyway(ctx, armed, request)
+        return _journal_refusal(
+            ctx,
+            CODE_AGENT_ARM_CLEANUP_FAILED,
+            (
+                f"the agent arm on {_shown(request.venue)} could not be identified in the stored config, "
+                "so it was not checked or disarmed and may still be running; check the armed list"
+            ),
+        )
+    if not mine:
+        if failure is not None:
+            raise failure
+        out = result.to_dict()
+        out["tool"] = "paper_arm"
+        return out
+    armed = mine[0]
+    if not ok:
+        return _undo_agent_arm(ctx, paper, armed, request, (CODE_AGENT_ARM_UNVERIFIED, MESSAGE_ARM_FAILED_AFTER_WRITE))
     try:
         refusal = limits.settle_agent_arm(ctx.home, ctx.actor, armed, revision_id=request.revision_id)
         if refusal is None and request.revision_id:
@@ -826,47 +912,45 @@ def _settle_agent_arm(
                 pass
     except Exception:  # noqa: BLE001 — any failure after the arm undoes it.
         refusal = (CODE_AGENT_ARM_UNVERIFIED, MESSAGE_ARM_NOT_SETTLED)
-    if refusal is None:
-        return None
-    return _undo_agent_arm(ctx, paper, armed.venue, armed.pair, refusal)
-
-
-def _paper_arm(ctx: ToolContext, params: dict) -> dict:
-    mode = params.get("mode", "paper")
-    correlation_id = params.get("correlation_id", "") or ""
-
-    # Hard boundary: refuse before any paper/live service call. The policy
-    # step already refused these; the handler keeps its own checks.
-    if str(mode) != "paper":
-        return live_arm_refused("paper_arm").to_dict()
-
-    decision = user_policy.ensure_allowed(ctx.home, user_policy.ACTION_PAPER_ARM)
-    if not decision.ok:
-        return _paper_arm_policy_denied(decision)
-
-    request = _arm_request(ctx, params)
-    if isinstance(request, dict):
-        return request
-
-    pair, _cap = arm_terms(request.pack_path, request.venue)
-    before = _arm_keys(ctx.home)
-    paper = PaperService(home=ctx.home, clock=ctx.clock)
-    result = paper.arm(
-        request.pack_path,
-        venue=request.venue,
-        mode="paper",
-        paper_balance=request.balance,
-        correlation_id=correlation_id,
-        daily_loss_limit_pct=request.daily_loss_limit_pct,
-    )
-    if result.ok:
-        # Every core caller is an agent: check the stored arm and count it.
-        refused = _settle_agent_arm(ctx, request, paper, pair=pair, before=before)
-        if refused is not None:
-            return refused
+    if refusal is not None:
+        return _undo_agent_arm(ctx, paper, armed, request, refusal)
     out = result.to_dict()
     out["tool"] = "paper_arm"
     return out
+
+
+def _paper_arm(ctx: ToolContext, params: dict) -> dict:
+    prepared = ctx.call_state.pop(_PREPARED_ARM, None)
+    if isinstance(prepared, _ArmRequest):
+        # A deny since the policy step still wins.
+        decision = user_policy.ensure_allowed(ctx.home, user_policy.ACTION_PAPER_ARM)
+        if not decision.ok:
+            return _paper_arm_policy_denied(decision)
+    else:
+        # Called without the policy step: run every check here, on one read.
+        prepared = _prepare_paper_arm(ctx, params)
+        if isinstance(prepared, dict):
+            return prepared
+    correlation_id = params.get("correlation_id", "") or ""
+
+    paper = PaperService(home=ctx.home, clock=ctx.clock)
+    before = arm_keys(load_config(ctx.home))
+    result = None
+    failure: Exception | None = None
+    try:
+        result = paper.arm(
+            prepared.snapshot,
+            venue=prepared.venue,
+            mode="paper",
+            paper_balance=prepared.balance,
+            correlation_id=correlation_id,
+            daily_loss_limit_pct=prepared.daily_loss_limit_pct,
+            source_path=prepared.source_path,
+        )
+    except Exception as exc:  # noqa: BLE001 — settled below by identity, never left running unreported.
+        failure = exc
+    # Every core caller is an agent: settle the arm by identity.
+    return _settle_agent_arm(ctx, prepared, paper, before=before, result=result, failure=failure)
 
 
 def _builtin_specs() -> tuple[ToolSpec, ...]:
