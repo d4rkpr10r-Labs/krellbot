@@ -18,6 +18,13 @@ result, and every call is audited:
 6. The tool's handler.
 7. One ``kind=agent_action`` journal record (:mod:`krellbot.agent.audit`).
 
+Steps 4-6 run under one guard: an exception there becomes ``agent_tool_error``
+(effect ``error``), and the audit step swallows its own failures, so ``call``
+never raises.
+
+The secret-name check matches substrings of top-level param names; confirm
+tokens travel as the ``confirm_token`` keyword of ``call``, never inside params.
+
 Handlers bind only to ``krellbot.application`` facades. This module does not
 import ``run``, ``venues``, ``execution``, ``keys``, ``secrets.get``,
 ``live_gate`` or ``live_preflight``. The refusal codes below keep their
@@ -333,17 +340,23 @@ class AgentToolCore:
             return secret_param_refused(spec.name).to_dict(), None, False
 
         ctx = ToolContext(home=self._home, actor=actor, clock=self._clock, fetch=self._fetch)
-        # 4. Operator policy and agent limits.
-        refusal = self._policy_step(ctx, spec, params)
-        if refusal is not None:
-            return refusal, None, False
-        # 5. Confirm tickets.
-        stop, ticket = self._confirm_step(ctx, spec, params, confirm_token)
-        if stop is not None:
-            return stop, ticket, False
-        # 6. Handler.
-        result, failed = self._run_handler(ctx, spec, params)
-        return result, ticket, failed
+        ticket: str | None = None
+        # Steps 4-6 share one guard: an exception in a seam or a handler, or a
+        # non-dict result from any of them, becomes ``agent_tool_error``.
+        try:
+            # 4. Operator policy and agent limits.
+            result = self._policy_step(ctx, spec, params)
+            # 5. Confirm tickets.
+            if result is None:
+                result, ticket = self._confirm_step(ctx, spec, params, confirm_token)
+            # 6. Handler, on a copy so it cannot change what the audit records.
+            if result is None:
+                result = spec.handler(ctx, dict(params))
+        except Exception as exc:  # noqa: BLE001 — call() never raises; only the class name is kept.
+            return _tool_error(spec.name, type(exc).__name__), ticket, True
+        if not isinstance(result, dict):
+            return _tool_error(spec.name, "malformed result"), ticket, True
+        return result, ticket, False
 
     def _policy_step(self, ctx: ToolContext, spec: ToolSpec, params: dict) -> dict | None:
         """Step 4: operator policy and agent limits.
@@ -370,16 +383,6 @@ class AgentToolCore:
         """
         return None, None
 
-    @staticmethod
-    def _run_handler(ctx: ToolContext, spec: ToolSpec, params: dict) -> tuple[dict, bool]:
-        try:
-            result = spec.handler(ctx, dict(params))
-        except Exception as exc:  # noqa: BLE001 — call() never raises; only the class name is kept.
-            return _tool_error(spec.name, type(exc).__name__), True
-        if not isinstance(result, dict):
-            return _tool_error(spec.name, "malformed result"), True
-        return result, False
-
     def _audit(
         self,
         actor: Actor,
@@ -390,7 +393,12 @@ class AgentToolCore:
         failed: bool,
         confirm_ticket: str | None,
     ) -> None:
-        """Step 7: append the ``agent_action`` record (``ts`` in whole seconds)."""
+        """Step 7: append the ``agent_action`` record (``ts`` in whole seconds).
+
+        Never raises: a failing clock falls back to wall time so the record is
+        still written, and any other audit failure is dropped, as a read-only
+        journal is for the user-policy receipts.
+        """
         if failed:
             outcome = "error"
         elif result.get("effect") == "needs_confirm":
@@ -399,25 +407,33 @@ class AgentToolCore:
             outcome = "ok"
         else:
             outcome = "refused"
-        safe_params = params if isinstance(params, dict) else {}
-        append_agent_record(
-            self._home,
-            ts=int(self._clock()),
-            actor=actor,
-            tool=sanitize.text(tool, max_len=len(tool)),
-            params=safe_params,
-            outcome=outcome,
-            code=str(result.get("code") or outcome),
-            venue=_venue_of(safe_params),
-            confirm_ticket=confirm_ticket,
-        )
+        try:
+            ts = int(self._clock())
+        except Exception:  # noqa: BLE001 — an injected clock must not cost the audit record.
+            ts = int(time.time())
+        try:
+            safe_params = params if isinstance(params, dict) else {}
+            append_agent_record(
+                self._home,
+                ts=ts,
+                actor=actor,
+                tool=sanitize.text(tool, max_len=len(tool)),
+                params=safe_params,
+                outcome=outcome,
+                code=str(result.get("code") or outcome),
+                venue=_venue_of(safe_params),
+                confirm_ticket=confirm_ticket,
+            )
+        except Exception:  # noqa: BLE001 — call() never raises; the tool result stands without its record.
+            return
 
 
 def _venue_of(params: dict) -> str:
     venue = params.get("venue")
     if not isinstance(venue, str):
         return "-"
-    return sanitize.text(venue.strip(), max_len=64) or "-"
+    # Redact the whole value before the cut, so a secret cannot straddle it.
+    return sanitize.text(sanitize.redact(venue.strip()), max_len=64) or "-"
 
 
 # ---- built-in verbs (moved from McpTools) -------------------------------

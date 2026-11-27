@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from krellbot import sanitize
 from krellbot.agent.actors import KRELL, Actor
 from krellbot.agent.audit import is_secret_param_name, read_agent_activity
 from krellbot.agent.core import LABEL_NOT_ADVICE, LABEL_PAPER, LABEL_SIMULATED, AgentToolCore, ToolSpec
@@ -179,6 +180,75 @@ def test_long_param_values_are_truncated_in_the_audit_record(home: Path):
     stored_pack = rows[1]["detail"]["params"]["pack"]
     assert len(json.dumps(stored_pack, ensure_ascii=False)) <= 240
     assert "L" * 1000 not in _journal_text(home)
+
+
+def test_registered_secrets_straddling_the_cut_are_redacted_before_truncation(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(sanitize, "_REGISTERED", set())
+    secret = "QZSECRETVALUE0123456789"
+    sanitize.register_secret(secret)
+    mcp = McpTools(home)
+
+    # Each value crosses the 200-character cut in the middle of the secret.
+    mcp.call("read", note="x" * 190 + secret)
+    mcp.call("read", context={"note": "y" * 180 + secret})
+
+    journal_text = _journal_text(home)
+    assert secret not in journal_text
+    assert secret[:8] not in journal_text
+    rows = _agent_rows(home)
+    assert rows[0]["detail"]["params"]["note"] == "x" * 190 + "***"
+    assert "***" in rows[1]["detail"]["params"]["context"]
+
+
+def test_nested_secret_shaped_names_never_reach_the_journal(home: Path):
+    value = "nested-fake-credential-9876"
+    pack = _valid_pack_dict()
+    pack["auth"] = {"api_key": value}
+
+    McpTools(home).call("draft", pack=pack)
+
+    assert len(_agent_rows(home)) == 1
+    assert value not in _journal_text(home)
+
+
+class _RaisingPolicyCore(AgentToolCore):
+    def _policy_step(self, ctx, spec, params):
+        raise RuntimeError("policy seam failed")
+
+
+class _RaisingConfirmCore(AgentToolCore):
+    def _confirm_step(self, ctx, spec, params, confirm_token):
+        raise RuntimeError("confirm seam failed")
+
+
+def test_failures_in_seams_clock_or_audit_never_escape_call(home: Path, monkeypatch: pytest.MonkeyPatch):
+    for core_cls in (_RaisingPolicyCore, _RaisingConfirmCore):
+        result = core_cls(home, clock=lambda: 1_700_000_400).call(KRELL, "read", {})
+        assert (result["ok"], result["effect"], result["code"]) == (False, "error", "agent_tool_error")
+        assert "seam failed" not in result["message"]
+        assert result["actor"] == "krell"
+    assert [(r["detail"]["outcome"], r["detail"]["code"]) for r in _agent_rows(home)] == [
+        ("error", "agent_tool_error"),
+        ("error", "agent_tool_error"),
+    ]
+
+    def broken_clock() -> float:
+        raise RuntimeError("clock failed")
+
+    refused = AgentToolCore(home, clock=broken_clock).call(KRELL, "arm_live", {})
+    assert refused["code"] == CODE_LIVE_ARM_REFUSED
+    # Still audited, at wall-clock time.
+    assert len(_agent_rows(home)) == 3
+
+    def broken_append(*_args, **_kwargs) -> None:
+        raise RuntimeError("audit write failed")
+
+    monkeypatch.setattr("krellbot.agent.core.append_agent_record", broken_append)
+    snapshot = AgentToolCore(home).call(KRELL, "read", {})
+    assert snapshot["ok"] is True
+    assert len(_agent_rows(home)) == 3
 
 
 def test_results_carry_actor_and_labels(home: Path):

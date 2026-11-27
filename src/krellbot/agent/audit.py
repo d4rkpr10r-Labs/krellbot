@@ -7,10 +7,12 @@ file 0o600, one fsynced line per record, integer-second ``ts``, and a failed
 write never blocks or flips the tool call it records.
 
 Params are copied for the record, never stored raw: values of secret-shaped
-names are replaced with ``***`` at any depth, strings longer than 200
-characters are truncated with a ``…(+N)`` suffix, and nested objects are
-stored as one truncated compact-JSON string. The whole record then goes
-through :func:`krellbot.sanitize.redact`.
+names are replaced with ``***`` at any depth, registered secrets are redacted
+from each *whole* value, and only then are strings longer than 200 characters
+truncated with a ``…(+N)`` suffix (redacting after the cut would miss a
+secret that straddles it). Nested objects are stored as one truncated
+compact-JSON string. The whole record then goes through
+:func:`krellbot.sanitize.redact` once more.
 """
 
 from __future__ import annotations
@@ -68,6 +70,11 @@ def _omit_secret_values(value: Any) -> Any:
     return value
 
 
+def _redacted(text: str) -> str:
+    """Replace registered secrets in the whole string (call before any cut)."""
+    return sanitize.redact(text)
+
+
 def _audit_value(value: Any) -> Any:
     if value is None or isinstance(value, bool):
         return value
@@ -76,32 +83,34 @@ def _audit_value(value: Any) -> Any:
     if isinstance(value, float):
         return value if math.isfinite(value) else str(value)
     if isinstance(value, str):
-        return truncate_text(value)
+        return truncate_text(_redacted(value))
     if isinstance(value, dict | list | tuple):
         try:
-            rendered = json.dumps(
-                _omit_secret_values(value),
-                separators=(",", ":"),
-                ensure_ascii=False,
-                default=str,
-            )
+            # Redact the structure before rendering (JSON escaping could hide a
+            # secret), then the rendered text (nested objects go through str()),
+            # and only then truncate.
+            safe = sanitize.redact(_omit_secret_values(value))
+            rendered = _redacted(json.dumps(safe, separators=(",", ":"), ensure_ascii=False, default=str))
         except Exception:  # noqa: BLE001 — deep nesting or a failing nested __str__ must not break the audit.
             rendered = f"<{type(value).__name__}>"
         return truncate_text(rendered)
-    # Decimal, Path, huge ints and anything else: the text form, truncated.
+    # Decimal, Path, huge ints and anything else: the redacted text form, truncated.
     try:
-        return truncate_text(str(value))
+        return truncate_text(_redacted(str(value)))
     except Exception:  # noqa: BLE001 — a failing __str__ (or int digit limit) must not break the audit.
         return f"<{type(value).__name__}>"
 
 
 def audit_params(params: object) -> dict[str, Any]:
-    """Return the record-safe copy of a tool call's params."""
+    """Return the record-safe copy of a tool call's params.
+
+    Redaction always sees the full value; truncation happens last.
+    """
     if not isinstance(params, dict):
         return {}
     out: dict[str, Any] = {}
     for key, value in params.items():
-        name = truncate_text(str(key))
+        name = truncate_text(_redacted(str(key)))
         out[name] = OMITTED_VALUE if is_secret_param_name(key) else _audit_value(value)
     return out
 
@@ -135,7 +144,7 @@ def append_agent_record(
         "bar_ts": 0,
         "detail": {
             "actor": actor.label,
-            "tool": truncate_text(str(tool)),
+            "tool": truncate_text(_redacted(str(tool))),
             "params": audit_params(params),
             "outcome": outcome,
             "code": str(code),
