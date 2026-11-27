@@ -87,7 +87,8 @@ export function KrellSidePanel({ modal = false, onClose, onOpenTab }: KrellSideP
     panelRef.current?.focus();
   }, []);
 
-  // A plain Escape inside the panel closes it, as the Jobs drawer does.
+  // A plain Escape inside the panel closes it, as the Jobs drawer does, and
+  // goes no further: window-level Escape handlers (the setup tour) keep theirs.
   const onKeyDown = (event: KeyboardEvent<HTMLElement>): void => {
     const native = event.nativeEvent;
     if (
@@ -102,6 +103,7 @@ export function KrellSidePanel({ modal = false, onClose, onOpenTab }: KrellSideP
       return;
     }
     event.preventDefault();
+    event.stopPropagation();
     onClose();
   };
 

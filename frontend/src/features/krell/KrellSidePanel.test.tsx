@@ -121,7 +121,7 @@ describe("Krell side panel", () => {
     const paths = installFetch();
     const onOpenTab = vi.fn();
     const { rerender } = render(
-      <KrellConversationProvider active>
+      <KrellConversationProvider surface="panel">
         <KrellSidePanel onClose={() => {}} onOpenTab={onOpenTab} />
       </KrellConversationProvider>,
     );
@@ -136,7 +136,7 @@ describe("Krell side panel", () => {
     expect(onOpenTab).toHaveBeenCalledTimes(1);
 
     rerender(
-      <KrellConversationProvider active>
+      <KrellConversationProvider surface="tab">
         <KrellView />
       </KrellConversationProvider>,
     );
@@ -155,24 +155,35 @@ describe("Krell side panel", () => {
     installFetch();
     const onClose = vi.fn();
     render(
-      <KrellConversationProvider active>
+      <KrellConversationProvider surface="panel">
         <KrellSidePanel onClose={onClose} onOpenTab={() => {}} />
       </KrellConversationProvider>,
     );
     const panel = screen.getByTestId("krell-panel");
     expect(document.activeElement).toBe(panel);
     const input = await within(panel).findByTestId("krell-input");
-    fireEvent.keyDown(input, { key: "Escape", shiftKey: true });
-    fireEvent.keyDown(input, { key: "Enter" });
-    expect(onClose).not.toHaveBeenCalled();
-    fireEvent.keyDown(input, { key: "Escape" });
-    expect(onClose).toHaveBeenCalledTimes(1);
+    const windowKeys: string[] = [];
+    const onWindowKey = (event: KeyboardEvent): void => {
+      windowKeys.push(`${event.shiftKey ? "Shift+" : ""}${event.key}`);
+    };
+    window.addEventListener("keydown", onWindowKey);
+    try {
+      fireEvent.keyDown(input, { key: "Escape", shiftKey: true });
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(onClose).not.toHaveBeenCalled();
+      fireEvent.keyDown(input, { key: "Escape" });
+      expect(onClose).toHaveBeenCalledTimes(1);
+      // The Escape the panel claimed goes no further (the setup tour listens on window).
+      expect(windowKeys).toEqual(["Shift+Escape", "Enter"]);
+    } finally {
+      window.removeEventListener("keydown", onWindowKey);
+    }
   });
 
   it("is a modal dialog only as a full-screen sheet", async () => {
     installFetch();
     const { rerender } = render(
-      <KrellConversationProvider active>
+      <KrellConversationProvider surface="panel">
         <KrellSidePanel onClose={() => {}} onOpenTab={() => {}} />
       </KrellConversationProvider>,
     );
@@ -181,7 +192,7 @@ describe("Krell side panel", () => {
     expect(panel.getAttribute("role")).toBeNull();
     expect(panel.getAttribute("aria-modal")).toBeNull();
     rerender(
-      <KrellConversationProvider active>
+      <KrellConversationProvider surface="panel">
         <KrellSidePanel modal onClose={() => {}} onOpenTab={() => {}} />
       </KrellConversationProvider>,
     );
@@ -192,7 +203,7 @@ describe("Krell side panel", () => {
   it("panel becomes a full-screen sheet at phone width", async () => {
     installFetch();
     render(
-      <KrellConversationProvider active>
+      <KrellConversationProvider surface="panel">
         <KrellSidePanel onClose={() => {}} onOpenTab={() => {}} />
       </KrellConversationProvider>,
     );

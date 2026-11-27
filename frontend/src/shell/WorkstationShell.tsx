@@ -1880,7 +1880,9 @@ export function WorkstationShell({
             researchDetachedRef.current,
           )
         : null}
-      {setupTour.status === "active" && typeof document !== "undefined"
+      {/* The tour (portaled outside the inert header and main) waits while the
+          Krell sheet is modal, and comes back when it closes. */}
+      {setupTour.status === "active" && !krellModal && typeof document !== "undefined"
         ? createPortal(
             <WorkspaceSetupTour
               stepId={setupTour.stepId}
@@ -1925,7 +1927,7 @@ export function WorkstationShell({
   // One Krell conversation for the tab and the panel; nothing is read
   // until one of them is first shown.
   return (
-    <KrellConversationProvider active={active === "krell" || krellPanelOpen}>
+    <KrellConversationProvider surface={active === "krell" ? "tab" : krellPanelOpen ? "panel" : null}>
       {shell}
     </KrellConversationProvider>
   );

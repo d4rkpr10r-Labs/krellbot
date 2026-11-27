@@ -4,7 +4,7 @@
  * Settings and the tab shown again), it shows the shared conversation.
  * Contract: KRELL-SIGNAL-20261010.
  */
-import { useId, useState, type JSX } from "react";
+import { useEffect, useId, useRef, useState, type JSX } from "react";
 import { AiConnectForm } from "../settings/AiConnectForm";
 import { KrellConversation } from "./KrellConversation";
 import { useKrell } from "./KrellConversationProvider";
@@ -21,7 +21,23 @@ export function KrellView(): JSX.Element {
   const krell = useKrell();
   const headingId = useId();
   const [confirmingClear, setConfirmingClear] = useState(false);
+  const clearRef = useRef<HTMLButtonElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  /** Where focus goes when the clear question closes. */
+  const afterConfirm = useRef<"clear" | "composer" | null>(null);
   const noModel = krell.status === "ready" && krell.connection === null;
+
+  useEffect(() => {
+    // Opening the question focuses Cancel, the safe choice. Closing it puts
+    // focus back on "Clear conversation", or on the composer after a clear.
+    if (confirmingClear) {
+      cancelRef.current?.focus();
+      return;
+    }
+    if (afterConfirm.current === "clear") clearRef.current?.focus();
+    if (afterConfirm.current === "composer") focusKrellComposer();
+    afterConfirm.current = null;
+  }, [confirmingClear]);
 
   return (
     <section
@@ -50,19 +66,29 @@ export function KrellView(): JSX.Element {
                 className="kbot-krell__btn"
                 disabled={krell.pending}
                 onClick={() => {
+                  afterConfirm.current = "composer";
                   setConfirmingClear(false);
                   krell.clear();
                 }}
               >
                 Yes, clear
               </button>
-              <button type="button" className="kbot-krell__btn" onClick={() => setConfirmingClear(false)}>
+              <button
+                type="button"
+                ref={cancelRef}
+                className="kbot-krell__btn"
+                onClick={() => {
+                  afterConfirm.current = "clear";
+                  setConfirmingClear(false);
+                }}
+              >
                 Cancel
               </button>
             </div>
           ) : (
             <button
               type="button"
+              ref={clearRef}
               className="kbot-krell__btn"
               onClick={() => setConfirmingClear(true)}
               disabled={krell.pending}

@@ -2,9 +2,9 @@
  * One shared Krell conversation for the Krell tab and the side panel
  * (M38.16).
  *
- * The provider sits at the shell root and reads nothing until `active`
- * first turns true (the tab or the panel is shown), so the rest of
- * Krellbot makes no Krell requests. It loads the stored thread once, asks
+ * The provider sits at the shell root and reads nothing until a Krell
+ * `surface` (the tab or the panel) is first shown, so the rest of
+ * Krellbot makes no Krell requests. It loads the stored thread, asks
  * the engine for the disclosure and opening when they are missing, and
  * turns streamed events into display items.
  *
@@ -195,12 +195,14 @@ function isSending(item: KrellItem | undefined): item is UserItem {
 function applyEvent(items: KrellItem[], event: KrellEvent, key: string): KrellItem[] {
   const last = items[items.length - 1];
   if (isSending(last) && event.type !== "error") {
-    // Any answer but an error means the engine took the message. It shows a
-    // new disclosure before storing the message, so keep that order.
+    // Any answer but an error means the engine took the message. A new
+    // disclosure comes just before the engine stores it, so show the
+    // disclosure first, as a reload does.
+    const taken: KrellItem = { ...last, sending: false };
     if (event.type === "notice" && event.kind === "disclosure") {
-      return [...items.slice(0, -1), { key, kind: "notice", text: str(event.text) }, last];
+      return [...items.slice(0, -1), { key, kind: "notice", text: str(event.text) }, taken];
     }
-    items = [...items.slice(0, -1), { ...last, sending: false }];
+    items = [...items.slice(0, -1), taken];
   }
   switch (event.type) {
     case "notice":
@@ -321,15 +323,18 @@ function reduce(state: State, action: Action): State {
 
 const KrellContext = createContext<KrellContextValue | null>(null);
 
+/** Where the conversation is shown right now, if anywhere. */
+export type KrellSurface = "tab" | "panel" | null;
+
 export type KrellConversationProviderProps = {
-  /** True while the Krell tab or the side panel is shown; the first true loads. */
-  active: boolean;
+  /** The first surface shown loads the thread; each newly shown surface may re-read it. */
+  surface: KrellSurface;
   children: ReactNode;
   client?: KrellClient;
 };
 
 export function KrellConversationProvider({
-  active,
+  surface,
   children,
   client,
 }: KrellConversationProviderProps): JSX.Element {
@@ -339,7 +344,11 @@ export function KrellConversationProvider({
   const busy = useRef(false);
   const loading = useRef(false);
   const requested = useRef(false);
-  const shown = useRef(false);
+  const shown = useRef<KrellSurface>(null);
+  const messagesRef = useRef<KrellItem[]>(state.messages);
+  useEffect(() => {
+    messagesRef.current = state.messages;
+  }, [state.messages]);
   const keys = useRef(0);
   const nextKey = useCallback((): string => {
     keys.current += 1;
@@ -397,29 +406,36 @@ export function KrellConversationProvider({
     }
   }, [api, run]);
 
-  // The first time the tab or panel is shown, read the thread. Each later
-  // time, read it again when no usable model was found or the read failed:
-  // a model may have been connected meanwhile, e.g. in Settings.
+  // The first surface shown reads the thread. Each newly shown surface (the
+  // panel, then the tab; or either one again) reads it again when no usable
+  // model was found or the read failed: a model may have been connected
+  // meanwhile, e.g. in Settings.
   useEffect(() => {
-    const appeared = active && !shown.current;
-    shown.current = active;
+    const appeared = surface !== null && surface !== shown.current;
+    shown.current = surface;
     if (!appeared) return;
     const stale = (state.status === "ready" && state.connection === null) || state.status === "failed";
     if (!requested.current || (stale && !busy.current)) {
       requested.current = true;
       void load();
     }
-  }, [active, load, state.status, state.connection]);
+  }, [surface, load, state.status, state.connection]);
 
   /**
    * After a turn whose first answer was an error. The engine may have refused
    * before storing the message (busy, invalid, no model, a session refusal)
    * or stored it and then failed (a provider error), so show the stored
-   * thread as it is. The typed text goes back in the composer when the
-   * message was not stored.
+   * thread as it is. The message was stored when the thread now holds more
+   * of the person's messages than were shown before the send
+   * (`sentBefore`); otherwise its text goes back in the composer.
    */
   const afterFirstError = useCallback(
-    async (text: string, error: { code: string; message: string }, restoreDraft: boolean): Promise<void> => {
+    async (
+      text: string,
+      error: { code: string; message: string },
+      sentBefore: number,
+      restoreDraft: boolean,
+    ): Promise<void> => {
       const result = await api.conversation();
       let stored = false;
       if (result.ok) {
@@ -428,8 +444,7 @@ export function KrellConversationProvider({
         const last = history[history.length - 1];
         const errorStored =
           last?.role === "notice" && last.payload.kind === "error" && last.payload.code === error.code;
-        const lastUser = [...history].reverse().find((m) => m.role === "user");
-        stored = lastUser !== undefined && str(lastUser.payload.text) === text;
+        stored = history.filter((m) => m.role === "user").length > sentBefore;
         const items = itemsFromHistory(history);
         dispatch({
           type: "resync",
@@ -449,6 +464,9 @@ export function KrellConversationProvider({
   /** A turn that starts with the person's own message, shown at once as sending. */
   const userTurn = useCallback(
     (text: string, open: (handler: KrellEventHandler) => Promise<void>, fromComposer: boolean): void => {
+      // The person's messages on screen match their stored ones (a refused
+      // message is removed again), so this counts what was stored before.
+      const sentBefore = messagesRef.current.filter((item) => item.kind === "user" && !item.sending).length;
       void run(
         async (handler) => {
           const seen: { first: KrellEvent | null } = { first: null };
@@ -457,7 +475,7 @@ export function KrellConversationProvider({
             handler(event);
           });
           const first = seen.first;
-          if (first?.type === "error") await afterFirstError(text, first, fromComposer);
+          if (first?.type === "error") await afterFirstError(text, first, sentBefore, fromComposer);
         },
         () => {
           dispatch({ type: "add", item: { key: nextKey(), kind: "user", text, sending: true } });

@@ -247,6 +247,48 @@ test("Escape and Close return focus to Ask Krell, which focuses the composer on 
   journey.assertGuards();
 });
 
+test("the setup tour waits behind the Krell sheet and keeps its own Escape", async ({ journey }) => {
+  const { page } = journey;
+  const mock: Mock = { connected: true, conversationReads: 0, sent: [] };
+  await page.context().addInitScript(() => {
+    try {
+      window.localStorage.setItem("krellbot.home.setupTour", JSON.stringify({ status: "active", stepId: "workspace" }));
+    } catch {
+      // Best-effort seed only.
+    }
+  });
+  const tourState = () => page.evaluate(() => window.localStorage.getItem("krellbot.home.setupTour"));
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockKrell(page, mock);
+  await page.goto(journey.workstation.baseURL);
+  await journey.waitForSessionReady(page);
+  const tour = page.getByTestId("workspace-setup-tour");
+  await expect(tour).toHaveCount(1);
+
+  // Phone: nothing outside the modal sheet stays on top of it or reachable.
+  await page.getByTestId("ask-krell").click();
+  const panel = page.getByTestId("krell-panel");
+  await expect(panel.getByTestId("krell-input")).toBeVisible();
+  await expect(tour).toHaveCount(0);
+  await panel.getByTestId("krell-input").focus();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("krell-panel")).toHaveCount(0);
+  await expect(tour).toHaveCount(1);
+  expect(JSON.parse((await tourState()) ?? "{}").status).toBe("active");
+
+  // Desktop: the docked panel's Escape closes only the panel.
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.getByTestId("ask-krell").click();
+  await expect(page.getByTestId("krell-panel").getByTestId("krell-input")).toBeVisible();
+  await expect(tour).toHaveCount(1);
+  await page.getByTestId("krell-panel").getByTestId("krell-input").focus();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("krell-panel")).toHaveCount(0);
+  await expect(tour).toHaveCount(1);
+  expect(JSON.parse((await tourState()) ?? "{}").status).toBe("active");
+  journey.assertGuards();
+});
+
 test("panel becomes a full-screen sheet at phone width", async ({ journey }) => {
   const { page } = journey;
   const mock: Mock = { connected: true, conversationReads: 0, sent: [] };

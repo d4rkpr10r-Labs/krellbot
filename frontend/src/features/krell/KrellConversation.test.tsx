@@ -12,6 +12,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KrellConversationProvider, useKrell } from "./KrellConversationProvider";
+import { KrellSidePanel } from "./KrellSidePanel";
 import { KrellView } from "./KrellView";
 
 vi.mock("../../session", () => ({
@@ -121,7 +122,7 @@ function installFetch(handler: (call: Call) => Response | Promise<Response>): Ca
 
 function renderTab() {
   return render(
-    <KrellConversationProvider active>
+    <KrellConversationProvider surface="tab">
       <KrellView />
     </KrellConversationProvider>,
   );
@@ -267,7 +268,7 @@ describe("Krell conversation", () => {
     }
 
     render(
-      <KrellConversationProvider active>
+      <KrellConversationProvider surface="tab">
         <KrellView />
         <Decline />
       </KrellConversationProvider>,
@@ -317,6 +318,54 @@ describe("Krell conversation", () => {
     // The thread was read again to see what the engine kept.
     expect(calls.filter((c) => c.path === "/api/v1/krell/conversation")).toHaveLength(2);
     expect(screen.getByTestId("krell-send")).toHaveProperty("disabled", false);
+  });
+
+  it("puts a refused resend of the same text back in the composer", async () => {
+    const history = [
+      ...greeted(),
+      stored("user", { text: "yes" }),
+      stored("assistant", { text: "Okay.", tool_calls: [] }),
+    ];
+    installFetch((call) => {
+      if (call.path === "/api/v1/krell/messages") {
+        return jsonResponse({ ok: false, effect: "refused", code: "krell_busy", detail: "Krell is busy." }, 409);
+      }
+      return jsonResponse(conversation(history));
+    });
+    renderTab();
+    await screen.findByText("Okay.");
+    fireEvent.change(screen.getByTestId("krell-input"), { target: { value: "yes" } });
+    fireEvent.click(screen.getByTestId("krell-send"));
+
+    await screen.findByText("Krell is busy.");
+    // The earlier, stored "yes" does not count as this one.
+    await waitFor(() => expect(screen.getByTestId("krell-input")).toHaveProperty("value", "yes"));
+    expect(screen.getAllByTestId("krell-message-user")).toHaveLength(1);
+  });
+
+  it("does not leave a stored message sending after a disclosure and then an error", async () => {
+    const calls = installFetch((call) => {
+      if (call.path === "/api/v1/krell/messages") {
+        return sseResponse([
+          { type: "notice", kind: "disclosure", text: "Now sent to OpenAI.", connection: CONNECTION },
+          { type: "error", code: "provider_unavailable", message: "The provider could not be reached." },
+          { type: "done" },
+        ]);
+      }
+      return jsonResponse(conversation(greeted()));
+    });
+    renderTab();
+    fireEvent.change(await screen.findByTestId("krell-input"), { target: { value: "Hello Krell" } });
+    fireEvent.click(screen.getByTestId("krell-send"));
+
+    await screen.findByText("The provider could not be reached.");
+    await waitFor(() => expect(screen.queryByText("Krell is answering…")).toBeNull());
+    const sent = screen.getByTestId("krell-message-user");
+    expect(sent.getAttribute("aria-busy")).toBeNull();
+    expect(sent.className).not.toContain("kbot-krell__msg--sending");
+    expect(screen.getByTestId("krell-input")).toHaveProperty("value", "");
+    // The first answer was the disclosure, so the thread was not re-read.
+    expect(calls.filter((c) => c.path === "/api/v1/krell/conversation")).toHaveLength(1);
   });
 
   it("keeps a message the engine stored before a provider error", async () => {
@@ -396,12 +445,16 @@ describe("Krell conversation", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Clear conversation" }));
     expect(screen.getByText("Clear the conversation and any open cards?")).toBeDefined();
+    // Focus moves to the safe choice, and back to the button on Cancel.
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Cancel" }));
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Clear conversation" }));
     expect(calls.some((c) => c.method === "DELETE")).toBe(false);
     expect(screen.getByText("Old question")).toBeDefined();
 
     fireEvent.click(screen.getByRole("button", { name: "Clear conversation" }));
     fireEvent.click(screen.getByRole("button", { name: "Yes, clear" }));
+    expect(document.activeElement).toBe(screen.getByTestId("krell-input"));
     await waitFor(() => expect(screen.queryByText("Old question")).toBeNull());
     await screen.findByText("Hi, I'm Krell.");
     expect(calls.filter((c) => c.method === "DELETE")).toHaveLength(1);
@@ -487,15 +540,45 @@ describe("Krell tab", () => {
     expect(screen.queryByTestId("krell-input")).toBeNull();
 
     // The person leaves the tab and activates a model in Settings.
-    rerender(<KrellConversationProvider active={false}>{null}</KrellConversationProvider>);
+    rerender(<KrellConversationProvider surface={null}>{null}</KrellConversationProvider>);
     connected = true;
     rerender(
-      <KrellConversationProvider active>
+      <KrellConversationProvider surface="tab">
         <KrellView />
       </KrellConversationProvider>,
     );
 
     await screen.findByTestId("krell-input");
+    expect(screen.getByText("Hi, I'm Krell.")).toBeDefined();
+    expect(calls.filter((c) => c.path === "/api/v1/krell/conversation")).toHaveLength(2);
+    expect(calls.some((c) => c.method === "POST")).toBe(false);
+  });
+
+  it("reads the conversation again when the open panel moves to the tab after a model was connected elsewhere", async () => {
+    let connected = false;
+    const calls = installFetch((call) => {
+      if (call.path === "/api/v1/krell/conversation") {
+        return jsonResponse(conversation(connected ? greeted() : [], connected ? CONNECTION : null));
+      }
+      return jsonResponse({ ok: false, code: "unexpected", detail: call.path }, 404);
+    });
+    const { rerender } = render(
+      <KrellConversationProvider surface="panel">
+        <KrellSidePanel onClose={() => {}} onOpenTab={() => {}} />
+      </KrellConversationProvider>,
+    );
+    await screen.findByText("Connect an AI model in the Krell tab to start talking to Krell.");
+
+    // A model is activated in Settings while the panel stays open; then "Open in Krell tab".
+    connected = true;
+    rerender(
+      <KrellConversationProvider surface="tab">
+        <KrellView />
+      </KrellConversationProvider>,
+    );
+
+    await screen.findByTestId("krell-input");
+    expect(screen.queryByTestId("ai-connect-form")).toBeNull();
     expect(screen.getByText("Hi, I'm Krell.")).toBeDefined();
     expect(calls.filter((c) => c.path === "/api/v1/krell/conversation")).toHaveLength(2);
     expect(calls.some((c) => c.method === "POST")).toBe(false);
