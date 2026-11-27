@@ -207,6 +207,55 @@ describe("Krell mode quick replies", () => {
     expect(screen.queryByTestId("krell-message-user")).toBeNull();
   });
 
+  it("keeps the quick replies when the press's stream fails after a disclosure", async () => {
+    // The engine showed a new disclosure, then could not store the mode.
+    installFetch((call) => {
+      if (call.path === "/api/v1/krell/profile") {
+        return sseResponse([
+          { type: "notice", kind: "disclosure", text: "Now sent to OpenAI.", connection: CONNECTION },
+          {
+            type: "error",
+            code: "krell_store_unavailable",
+            message: "Krell's conversation store could not be read or written, so nothing changed.",
+          },
+          { type: "done" },
+        ]);
+      }
+      return jsonResponse(conversation(greeted()));
+    });
+    renderTab();
+    await screen.findByText(OPENING);
+
+    fireEvent.click(reply("Advanced"));
+
+    await screen.findByText("Krell's conversation store could not be read or written, so nothing changed.");
+    await waitFor(() => expect(reply("Advanced").disabled).toBe(false));
+    expect(reply("Standard")).toBeDefined();
+  });
+
+  it("hides the quick replies after a failed turn when the engine did store the mode", async () => {
+    // The engine stored the mode, then the provider failed: the stored conversation says so.
+    let pressed = false;
+    installFetch((call) => {
+      if (call.path === "/api/v1/krell/profile") {
+        pressed = true;
+        return sseResponse([
+          { type: "text_delta", text: "Standard it" },
+          { type: "error", code: "provider_unavailable", message: "The provider could not be reached." },
+          { type: "done" },
+        ]);
+      }
+      return jsonResponse(conversation(greeted(), pressed ? "standard" : null));
+    });
+    renderTab();
+    await screen.findByText(OPENING);
+
+    fireEvent.click(reply("Standard"));
+
+    await screen.findByText("The provider could not be reached.");
+    await waitFor(() => expect(quickReplies()).toBeNull());
+  });
+
   it("disables the quick replies while Krell answers", async () => {
     let answer: (response: Response) => void = () => {};
     installFetch((call) => {

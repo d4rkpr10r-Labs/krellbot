@@ -6,7 +6,7 @@ ledger and agent tool core. Only the model is fake: a ``FakeAiTransport``
 plays the scenario's ``script``, one scripted turn per provider call. The
 person opens Krell (``start``), presses the scenario's mode quick reply
 (``set_mode``, what ``POST /api/v1/krell/profile`` runs) and then sends the
-scenario's ``user`` message (``send``).
+scenario's ``user`` message, or each of its ``user`` messages in turn (``send``).
 
 With a scripted model, whatever the model "chooses" is true by
 construction, so these evals assert only what the loop controls: the
@@ -204,8 +204,9 @@ class Run:
         if scenario["mode"] is not None:
             # The person presses the mode quick reply: what POST /api/v1/krell/profile runs.
             self.streams.append(list(self._loop().set_mode(scenario["mode"])))
-        if scenario.get("user"):
-            self.streams.append(list(self._loop().send(scenario["user"])))
+        user = scenario.get("user") or []
+        for text in [user] if isinstance(user, str) else user:
+            self.streams.append(list(self._loop().send(text)))
         self.events = [event for stream in self.streams for event in stream]
 
     def _loop(self) -> KrellLoop:
@@ -322,6 +323,14 @@ def test_scripted_scenario_holds_the_loops_honesty_guarantees(home: Path, scenar
                 told["message"] = krell_loop.NOTE_AWAITING_HUMAN
             assert data == json.loads(json.dumps(told, default=str)), tool
 
+    # The model never sees a confirm ticket, checked on the raw requests rather than through the
+    # loop's own model_view: no ticket key and no ticket id anywhere in what was sent.
+    tickets = [event["confirm"]["ticket_id"] for event in run.of("confirm_request")]
+    for body in run.bodies:
+        sent = json.dumps(body)
+        assert "ticket_id" not in sent and "confirm_ticket" not in sent
+        assert not any(ticket in sent for ticket in tickets)
+
     # Every backtest result carries the simulated label, on the person's card and so in the model's copy.
     for event in run.of("tool_result"):
         if event["name"] == "backtest":
@@ -362,6 +371,8 @@ def test_every_scenario_has_the_documented_shape() -> None:
         assert set(scenario) <= SCENARIO_KEYS, scenario["name"]
         assert {"name", "mode", "script", "expect"} <= set(scenario), scenario["name"]
         assert scenario["mode"] in (None, *krell_loop.MODES), scenario["name"]
+        user = scenario.get("user", [])
+        assert all(isinstance(text, str) and text for text in ([user] if isinstance(user, str) else user))
         assert scenario["script"], scenario["name"]
         for turn in scenario["script"]:
             assert set(turn) <= {"text", "tool_calls"} and (turn.get("text") or turn.get("tool_calls")), turn

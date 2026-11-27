@@ -17,8 +17,9 @@
  * decided; the token budget and Krell's highlights are kept here too.
  *
  * M38.18: the stored mode is kept here as the engine reports it: from the
- * conversation read, a mode press the engine took, or a `set_profile` result
- * that ran. Krell's words alone never change it.
+ * conversation read, a mode press whose stream ended with no error (after an
+ * error, a re-read), or a `set_profile` result that ran. Krell's words alone
+ * never change it.
  */
 import {
   createContext,
@@ -319,8 +320,8 @@ type Action =
   | ({ type: "resync" } & Thread)
   /** Drop the unanswered message (the thread could not be read to check it). */
   | { type: "unsend" }
-  /** The engine took a mode press, so it stored that mode. */
-  | { type: "mode"; mode: KrellMode };
+  /** The mode the engine stored: a mode press's stream ended cleanly, or a re-read said so. */
+  | { type: "mode"; mode: KrellMode | null };
 
 const INITIAL: State = {
   status: "idle",
@@ -610,19 +611,30 @@ export function KrellConversationProvider({
     [api, nextKey, run],
   );
 
-  /** A mode quick reply: `POST /api/v1/krell/profile`, then a turn in that mode. */
+  /**
+   * A mode quick reply: `POST /api/v1/krell/profile`, then a turn in that mode.
+   * The mode is taken as stored only when the stream ends with no error. After
+   * an error, the stored conversation says whether it was: a first-answer error
+   * re-reads the whole thread (`afterFirstError`), and a later one re-reads the
+   * mode alone, so the error already shown stays on screen.
+   */
   const setMode = useCallback(
     (mode: KrellMode): void => {
       userTurn(
         MODE_REPLIES[mode],
-        (h) => {
-          let answered = false;
-          return api.setMode(mode, (event) => {
-            // As for a message: any first answer but an error means the engine took the press.
-            if (!answered && event.type !== "error") dispatch({ type: "mode", mode });
-            answered = true;
+        async (h) => {
+          const seen = { first: null as KrellEvent | null, error: false };
+          await api.setMode(mode, (event) => {
+            seen.first ??= event;
+            if (event.type === "error") seen.error = true;
             h(event);
           });
+          if (!seen.error) {
+            dispatch({ type: "mode", mode });
+          } else if (seen.first?.type !== "error") {
+            const result = await api.conversation();
+            if (result.ok) dispatch({ type: "mode", mode: result.mode });
+          }
         },
         false,
       );
