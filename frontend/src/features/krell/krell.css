@@ -220,6 +220,13 @@
   resize: vertical;
 }
 
+/* The mode quick replies (secondary buttons), above the composer until a mode is set. */
+.kbot-krell__replies {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-tight);
+}
+
 /* Secondary, so a confirm card's Confirm is the conversation's one sage primary. */
 .kbot-krell .kbot-krell__send {
   min-height: 44px;

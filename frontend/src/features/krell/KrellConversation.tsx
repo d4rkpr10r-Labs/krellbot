@@ -10,11 +10,14 @@
  * Result and confirm cards (M38.17) are drawn only from tool results and
  * confirm requests the engine sent, never from model text. A confirm ticket
  * id never reaches a display item, so nothing here can show one.
+ *
+ * The opening's Standard and Advanced quick replies (M38.18) show only while
+ * no mode is set.
  */
 import { useEffect, useId, useRef, type FormEvent, type JSX } from "react";
 import krellAvatar from "../../assets/character/krell-pfp-160.webp";
 import { BudgetMeter } from "./BudgetMeter";
-import type { KrellDecision } from "./client";
+import { MODE_REPLIES, type KrellDecision, type KrellMode } from "./client";
 import { ConfirmCard, confirmOutcomes, isPressable, type ConfirmOutcome } from "./ConfirmCard";
 import { useKrell, type KrellItem } from "./KrellConversationProvider";
 import { ToolResultCard } from "./ToolResultCard";
@@ -22,6 +25,29 @@ import "./krell.css";
 
 /** The engine's limit on one message (`MAX_MESSAGE_CHARS`). */
 const MAX_MESSAGE_CHARS = 8000;
+
+const MODES: readonly KrellMode[] = ["standard", "advanced"];
+
+/** The opening, with its mode question, is in the log. */
+function modeAsked(items: KrellItem[]): boolean {
+  return items.some((item) => item.kind === "krell" && Boolean(item.question));
+}
+
+/**
+ * Standard and Advanced, answering the mode question. Secondary buttons, so
+ * an open confirm card's Confirm stays the conversation's one sage primary.
+ */
+function ModeQuickReplies({ busy, choose }: { busy: boolean; choose(mode: KrellMode): void }): JSX.Element {
+  return (
+    <div className="kbot-krell__replies" role="group" aria-label="Choose a mode" data-testid="krell-quick-replies">
+      {MODES.map((mode) => (
+        <button key={mode} type="button" className="kbot-krell__btn" disabled={busy} onClick={() => choose(mode)}>
+          {MODE_REPLIES[mode]}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 /** What the confirm cards in the log need from the conversation. */
 type Cards = {
@@ -187,6 +213,9 @@ export function KrellConversation(): JSX.Element {
         <p className="kbot-krell__line" role="status">
           Krell is answering…
         </p>
+      ) : null}
+      {krell.mode === null && modeAsked(krell.messages) ? (
+        <ModeQuickReplies busy={krell.pending} choose={krell.setMode} />
       ) : null}
       <form className="kbot-krell__composer" onSubmit={submit}>
         <label className="kbot-krell__sr" htmlFor={inputId}>

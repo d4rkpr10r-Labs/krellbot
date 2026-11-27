@@ -15,6 +15,11 @@
  * M38.17: decisions (and an `agent_confirm_unknown` answer to a press)
  * carry their card's call id, so each confirm card can show what the engine
  * decided; the token budget and Krell's highlights are kept here too.
+ *
+ * M38.18: the stored mode is kept here as the engine reports it: from the
+ * conversation read, a mode press whose stream ended with no error (after an
+ * error, a re-read), or a `set_profile` result that ran. Krell's words alone
+ * never change it.
  */
 import {
   createContext,
@@ -28,8 +33,10 @@ import {
   type ReactNode,
 } from "react";
 import {
+  MODE_REPLIES,
   createKrellClient,
   toBudget,
+  toMode,
   type KrellBudget,
   type KrellClient,
   type KrellConnection,
@@ -65,6 +72,8 @@ export type KrellContextValue = {
   connection: KrellConnection | null;
   /** Krell's token budget, once the engine has reported it. */
   budget: KrellBudget | null;
+  /** The stored mode; null until one is chosen (the quick replies show until then). */
+  mode: KrellMode | null;
   status: KrellStatus;
   loadError: string | null;
   /** The composer's text, shared by the tab and the panel. */
@@ -83,7 +92,6 @@ const CODE_BUSY = "krell_busy";
 const CODE_CONFIRM_UNKNOWN = "agent_confirm_unknown";
 const MESSAGE_BUSY = "Krell is already answering. Wait for that answer to finish.";
 const MESSAGE_CONFIRM_UNKNOWN = "That card is no longer active, so nothing was sent.";
-const MODE_REPLIES: Record<KrellMode, string> = { standard: "Standard", advanced: "Advanced" };
 const TICKET_KEYS = new Set(["ticket_id", "confirm_ticket"]);
 
 function str(value: unknown, fallback = ""): string {
@@ -283,6 +291,7 @@ type State = {
   loadError: string | null;
   connection: KrellConnection | null;
   budget: KrellBudget | null;
+  mode: KrellMode | null;
   /** The latest highlight event; `nonce` tells a repeat of the same test id apart. */
   highlight: { testId: string; nonce: number } | null;
   messages: KrellItem[];
@@ -290,9 +299,17 @@ type State = {
   draft: string;
 };
 
+/** What a conversation read sets. */
+type Thread = {
+  messages: KrellItem[];
+  connection: KrellConnection | null;
+  budget: KrellBudget | null;
+  mode: KrellMode | null;
+};
+
 type Action =
   | { type: "loading" }
-  | { type: "loaded"; messages: KrellItem[]; connection: KrellConnection | null; budget: KrellBudget | null }
+  | ({ type: "loaded" } & Thread)
   | { type: "load_failed"; message: string }
   | { type: "pending"; value: boolean }
   | { type: "add"; item: KrellItem }
@@ -300,15 +317,18 @@ type Action =
   | { type: "cleared" }
   | { type: "draft"; value: string; ifEmpty?: boolean }
   /** The stored thread, read again after a turn whose first answer was an error. */
-  | { type: "resync"; messages: KrellItem[]; connection: KrellConnection | null; budget: KrellBudget | null }
+  | ({ type: "resync" } & Thread)
   /** Drop the unanswered message (the thread could not be read to check it). */
-  | { type: "unsend" };
+  | { type: "unsend" }
+  /** The mode the engine stored: a mode press's stream ended cleanly, or a re-read said so. */
+  | { type: "mode"; mode: KrellMode | null };
 
 const INITIAL: State = {
   status: "idle",
   loadError: null,
   connection: null,
   budget: null,
+  mode: null,
   highlight: null,
   messages: [],
   pending: false,
@@ -325,13 +345,21 @@ function endStream(items: KrellItem[]): KrellItem[] {
   return items.some(open) ? items.map((item) => (open(item) ? { ...item, ended: true } : item)) : items;
 }
 
-/** What an event changes besides the display items: the budget and the highlight. */
-function sideState(state: State, event: KrellEvent): Partial<Pick<State, "budget" | "highlight">> {
+/** The mode a `set_profile` result stored, when the call ran and names one. */
+function storedMode(event: KrellEvent): KrellMode | null {
+  if (event.type !== "tool_result" || event.name !== "set_profile" || event.result.ok !== true) return null;
+  const profile = event.result.profile;
+  return isRecord(profile) ? toMode(profile.mode) : null;
+}
+
+/** What an event changes besides the display items: the budget, the highlight and the mode. */
+function sideState(state: State, event: KrellEvent): Partial<Pick<State, "budget" | "highlight" | "mode">> {
   if (event.type === "budget") return { budget: toBudget(event) ?? state.budget };
   if (event.type === "highlight" && typeof event.test_id === "string") {
     return { highlight: { testId: event.test_id, nonce: (state.highlight?.nonce ?? 0) + 1 } };
   }
-  return {};
+  const mode = storedMode(event);
+  return mode ? { mode } : {};
 }
 
 function reduce(state: State, action: Action): State {
@@ -347,6 +375,7 @@ function reduce(state: State, action: Action): State {
         messages: action.messages,
         connection: usable(action.connection),
         budget: action.budget ?? state.budget,
+        mode: action.mode,
       };
     case "load_failed":
       return { ...state, status: "failed", loadError: action.message };
@@ -360,7 +389,8 @@ function reduce(state: State, action: Action): State {
       return { ...state, ...sideState(state, action.event), messages, connection: noModel ? null : state.connection };
     }
     case "cleared":
-      return { ...state, messages: [] };
+      // Clearing forgets the profile too, so the mode question is open again.
+      return { ...state, messages: [], mode: null };
     case "draft":
       return { ...state, draft: action.ifEmpty && state.draft ? state.draft : action.value };
     case "resync":
@@ -369,9 +399,12 @@ function reduce(state: State, action: Action): State {
         messages: action.messages,
         connection: usable(action.connection),
         budget: action.budget ?? state.budget,
+        mode: action.mode,
       };
     case "unsend":
       return { ...state, messages: state.messages.filter((item) => !isSending(item)) };
+    case "mode":
+      return { ...state, mode: action.mode };
   }
 }
 
@@ -460,6 +493,7 @@ export function KrellConversationProvider({
         messages: itemsFromHistory(result.messages),
         connection: result.connection,
         budget: result.budget,
+        mode: result.mode,
       });
       const conn = usable(result.connection);
       if (conn && needsStart(result.messages, conn.id)) await run((h) => api.start(h));
@@ -515,6 +549,7 @@ export function KrellConversationProvider({
             : [...items, { key: nextKey(), kind: "error", code: error.code, text: error.message }],
           connection: result.connection,
           budget: result.budget,
+          mode: result.mode,
         });
       } else {
         dispatch({ type: "unsend" });
@@ -576,9 +611,33 @@ export function KrellConversationProvider({
     [api, nextKey, run],
   );
 
+  /**
+   * A mode quick reply: `POST /api/v1/krell/profile`, then a turn in that mode.
+   * The mode is taken as stored only when the stream ends with no error. After
+   * an error, the stored conversation says whether it was: a first-answer error
+   * re-reads the whole thread (`afterFirstError`), and a later one re-reads the
+   * mode alone, so the error already shown stays on screen.
+   */
   const setMode = useCallback(
     (mode: KrellMode): void => {
-      userTurn(MODE_REPLIES[mode], (h) => api.setMode(mode, h), false);
+      userTurn(
+        MODE_REPLIES[mode],
+        async (h) => {
+          const seen = { first: null as KrellEvent | null, error: false };
+          await api.setMode(mode, (event) => {
+            seen.first ??= event;
+            if (event.type === "error") seen.error = true;
+            h(event);
+          });
+          if (!seen.error) {
+            dispatch({ type: "mode", mode });
+          } else if (seen.first?.type !== "error") {
+            const result = await api.conversation();
+            if (result.ok) dispatch({ type: "mode", mode: result.mode });
+          }
+        },
+        false,
+      );
     },
     [api, userTurn],
   );
@@ -612,6 +671,7 @@ export function KrellConversationProvider({
       pending: state.pending,
       connection: state.connection,
       budget: state.budget,
+      mode: state.mode,
       status: state.status,
       loadError: state.loadError,
       draft: state.draft,

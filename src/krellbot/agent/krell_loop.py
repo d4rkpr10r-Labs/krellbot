@@ -62,14 +62,12 @@ from typing import Any
 from krellbot import sanitize
 from krellbot.agent import budget as token_budget
 from krellbot.agent.actors import KRELL
+from krellbot.agent.assemble import build_agent_core
 from krellbot.agent.audit import append_agent_record
 from krellbot.agent.confirm import CODE_CONFIRM_UNKNOWN, MESSAGE_CONFIRM_UNKNOWN, ConfirmLedger
 from krellbot.agent.conversation_store import ConversationStore, Profile, StoredMessage, StoreError
 from krellbot.agent.core import SCHEMA_VERSION, AgentToolCore
 from krellbot.agent.persona import MODE_QUESTION, OPENING_LINE, system_prompt
-from krellbot.agent.tools_change import register_change_tools
-from krellbot.agent.tools_read import register_read_tools
-from krellbot.agent.tools_research import register_research_tools
 from krellbot.ai.connections import Connection, ConnectionRefused, ConnectionStore, provider_host
 from krellbot.ai.disclosure import egress_disclosure
 from krellbot.ai.http import HttpTransport
@@ -216,16 +214,14 @@ HIGHLIGHT_TOOL = ToolDef(
 def build_krell_core(home: Path, *, clock: Callable[[], float], ledger: ConfirmLedger) -> AgentToolCore:
     """Krell's agent tool core: built once per app, with the engine's confirm ledger on the same clock.
 
-    The core passes ``now=`` from ``clock`` to the ledger, so ticket expiry
-    follows this clock. Registration is idempotent (``core.has``). The change
-    tools (pause, resume, disarm) act on paper strategies only: a live target
-    is refused before the confirm step, so Krell never shows a card for it.
+    It is :func:`~krellbot.agent.assemble.build_agent_core`, the builder the
+    MCP server uses too, so both front doors offer the same tools; Krell's
+    core adds only the ledger. The core passes ``now=`` from ``clock`` to the
+    ledger, so ticket expiry follows this clock. The change tools (pause,
+    resume, disarm) act on paper strategies only: a live target is refused
+    before the confirm step, so Krell never shows a card for it.
     """
-    core = AgentToolCore(home, clock=clock, confirm=ledger)
-    register_read_tools(core)
-    register_research_tools(core)
-    register_change_tools(core)
-    return core
+    return build_agent_core(home, clock=clock, confirm=ledger)
 
 
 # ---- what the model may see ------------------------------------------------
