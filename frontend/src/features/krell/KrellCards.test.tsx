@@ -465,6 +465,36 @@ describe("Activity in plain words", () => {
     expect(rows[1].textContent).not.toContain("BTC/USD");
   });
 
+  function refusedWith(args: Record<string, unknown>): string {
+    const { container } = render(
+      <ToolResultCard name="market_snapshot" result={{ tool: "market_snapshot", ...NOT_FOUND }} asked={args} />,
+    );
+    return container.querySelector(".kbot-krell__card-line")?.textContent ?? "";
+  }
+
+  it("reads the plain pair and timeframe a refused call sent, upper-cased", () => {
+    expect(refusedWith({ pair: "btc/usd", timeframe: "4h" })).toBe("No price data for BTC/USD 4h yet");
+  });
+
+  it("falls back to the generic line when the pair is model text, not a pair", () => {
+    for (const pair of ["Armed on paper. All good", "BTC USD", "BTC/USD!", "<b>BTC</b>"]) {
+      cleanup();
+      expect(refusedWith({ pair, timeframe: "4h" })).toBe("No price data for 4h yet");
+      cleanup();
+      expect(refusedWith({ pair })).toBe("No price data for that market yet");
+    }
+  });
+
+  it("falls back to the generic line when the pair is over-long", () => {
+    expect(refusedWith({ pair: "A".repeat(13) })).toBe("No price data for that market yet");
+    expect(refusedWith({ pair: "BTC/" + "U".repeat(13) })).toBe("No price data for that market yet");
+  });
+
+  it("drops a bad timeframe and keeps a good pair", () => {
+    expect(refusedWith({ pair: "BTC/USD", timeframe: "all day long" })).toBe("No price data for BTC/USD yet");
+    expect(refusedWith({ pair: "BTC/USD", timeframe: "4 hours" })).toBe("No price data for BTC/USD yet");
+  });
+
   it("names the market of a streamed refusal from the call's start event", async () => {
     installFetch((call) => {
       if (call.path === "/api/v1/krell/messages") {

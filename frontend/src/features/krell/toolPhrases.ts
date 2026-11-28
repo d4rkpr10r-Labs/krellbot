@@ -232,12 +232,24 @@ const PHRASES = new Map<string, Phrase>([
   ],
 ]);
 
+const PAIR_SHAPE = /^[A-Za-z0-9]{2,12}([/:_-][A-Za-z0-9]{2,12})?$/;
+const TIMEFRAME_SHAPE = /^[0-9]{1,3}[smhdwM]$/;
+
+/** The pair the call sent, upper-cased, only if it has a plain pair shape; model text never passes. */
+function plainPair(pair: string | undefined): string {
+  return pair !== undefined && PAIR_SHAPE.test(pair) ? pair.toUpperCase() : "";
+}
+
+function plainTimeframe(timeframe: string | undefined): string {
+  return timeframe !== undefined && TIMEFRAME_SHAPE.test(timeframe) ? timeframe : "";
+}
+
 /** Refusal codes with a plainer headline than their tool's. */
 const REFUSAL_LINES = new Map<string, (asked?: AskedMarket) => string>([
   [
     "market_snapshot_not_found",
     (asked) => {
-      const market = [asked?.pair, asked?.timeframe].filter(Boolean).join(" ");
+      const market = [plainPair(asked?.pair), plainTimeframe(asked?.timeframe)].filter(Boolean).join(" ");
       return market ? `No price data for ${market} yet` : "No price data for that market yet";
     },
   ],
