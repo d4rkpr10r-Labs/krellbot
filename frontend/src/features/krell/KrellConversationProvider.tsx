@@ -62,7 +62,16 @@ export type KrellItem =
   /** `callId`: the confirm card whose press this error answered. `requestId`: the provider's, when kept. */
   | { key: string; kind: "error"; code: string; text: string; callId?: string; requestId?: string }
   /** `ended`: the stream that started the call has ended (with no result, it may or may not have run). */
-  | { key: string; kind: "tool"; callId: string; name: string; result: KrellToolResult | null; ended?: boolean }
+  | {
+      key: string;
+      kind: "tool";
+      callId: string;
+      name: string;
+      result: KrellToolResult | null;
+      ended?: boolean;
+      /** The market the call asked for (only its pair and timeframe), so a refusal can name it. */
+      asked?: CallMarket;
+    }
   | { key: string; kind: "confirm"; callId: string; tool: string; confirm: Record<string, unknown> }
   /** `callId`: the confirm card decided on ("" when it cannot be told). `ended`: its stream has ended. */
   | { key: string; kind: "decision"; callId: string; decision: KrellDecision; tool: string; ended?: boolean };
@@ -143,9 +152,28 @@ function confirmOf(result: unknown): Record<string, unknown> | null {
   return isRecord(result.confirm) ? result.confirm : null;
 }
 
-function toolItems(key: string, callId: string, name: string, result: unknown): KrellItem[] {
+/** The pair and timeframe a call sent, as text; nothing else of its arguments is kept. */
+export type CallMarket = { pair?: string; timeframe?: string };
+
+function askedOf(args: unknown): CallMarket | undefined {
+  if (!isRecord(args)) return undefined;
+  const asked: CallMarket = {};
+  if (typeof args.pair === "string" && args.pair) asked.pair = args.pair;
+  if (typeof args.timeframe === "string" && args.timeframe) asked.timeframe = args.timeframe;
+  return asked.pair || asked.timeframe ? asked : undefined;
+}
+
+function toolItems(key: string, callId: string, name: string, result: unknown, args?: unknown): KrellItem[] {
+  const asked = askedOf(args);
   const items: KrellItem[] = [
-    { key, kind: "tool", callId, name, result: isRecord(result) ? withoutTickets(result) : null },
+    {
+      key,
+      kind: "tool",
+      callId,
+      name,
+      result: isRecord(result) ? withoutTickets(result) : null,
+      ...(asked ? { asked } : {}),
+    },
   ];
   const confirm = confirmOf(result);
   if (confirm) {
@@ -165,6 +193,13 @@ function itemsFromHistory(messages: KrellStoredMessage[]): KrellItem[] {
   const items: KrellItem[] = [];
   // Not now is stored with its ticket but no call id: find its card by ticket here.
   const cardOf = new Map(Array.from(ticketsFromHistory(messages), ([callId, ticket]) => [ticket, callId]));
+  const argsOf = new Map<string, unknown>();
+  for (const message of messages) {
+    const calls = message.role === "assistant" ? message.payload.tool_calls : undefined;
+    for (const call of Array.isArray(calls) ? calls : []) {
+      if (isRecord(call)) argsOf.set(str(call.id), call.arguments);
+    }
+  }
   for (const message of messages) {
     const p = message.payload;
     const key = `h${message.id}`;
@@ -174,7 +209,7 @@ function itemsFromHistory(messages: KrellStoredMessage[]): KrellItem[] {
       const text = str(p.text);
       if (text) items.push({ key, kind: "krell", text, streaming: false });
     } else if (message.role === "tool") {
-      items.push(...toolItems(key, str(p.tool_call_id), str(p.name), p.result));
+      items.push(...toolItems(key, str(p.tool_call_id), str(p.name), p.result, argsOf.get(str(p.tool_call_id))));
     } else if (message.role === "notice") {
       if (p.kind === "opening") {
         items.push({ key, kind: "krell", text: str(p.text), question: str(p.question), streaming: false });
@@ -269,7 +304,7 @@ function applyEvent(items: KrellItem[], event: KrellEvent, key: string, callId?:
       return event.text ? [...items, { key, kind: "krell", text: event.text, streaming: false }] : items;
     }
     case "tool_start":
-      return [...settle(items), { key, kind: "tool", callId: event.id, name: event.name, result: null }];
+      return [...settle(items), ...toolItems(key, event.id, event.name, null, event.arguments)];
     case "tool_result": {
       let index = items.length - 1;
       while (index >= 0) {
@@ -277,7 +312,8 @@ function applyEvent(items: KrellItem[], event: KrellEvent, key: string, callId?:
         if (item.kind === "tool" && item.callId === event.id && item.result === null) break;
         index -= 1;
       }
-      const added = toolItems(key, event.id, event.name, event.result);
+      const started = index < 0 ? undefined : items[index];
+      const added = toolItems(key, event.id, event.name, event.result, started?.kind === "tool" ? started.asked : undefined);
       if (index < 0) return [...items, added[0]];
       return items.map((item, i) => (i === index ? { ...added[0], key: item.key } : item));
     }

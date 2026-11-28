@@ -182,7 +182,11 @@ describe("Krell's Keep going quick reply", () => {
 
     // The refused call over the budget shows as its card; Keep going follows the summary.
     await waitFor(() => expect(keepGoing().disabled).toBe(false));
-    expect(screen.getByText(CAP_MESSAGE, { exact: false })).toBeDefined();
+    // The ordinary step folds into "1 step" (M39.6); the refusal stays visible on its own, outside the fold.
+    const refused = screen.getByText(CAP_MESSAGE, { exact: false }).closest(".kbot-krell__card--refused");
+    expect(refused).not.toBeNull();
+    expect(refused?.closest("[hidden]")).toBeNull();
+    expect(screen.getByRole("button", { name: "1 step" }).getAttribute("aria-expanded")).toBe("false");
     // A secondary button: an open confirm card's Confirm stays the one sage primary.
     expect(keepGoing().className).toContain("kbot-krell__btn");
     expect(keepGoing().className).not.toContain("kbot-krell__go");
