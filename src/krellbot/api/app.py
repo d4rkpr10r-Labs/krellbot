@@ -5242,6 +5242,107 @@ def create_app(
             return _ai_refused(exc)
         return await _ai_probe_and_record(s, store, conn)
 
+    @app.post("/api/v1/ai/models")
+    async def ai_models(request: Request) -> Response:
+        """List the models a provider offers, for a stored connection or one being set up.
+
+        Body: ``{"connection_id"}`` (the stored key or sign-in is used), or ``{"preset",
+        "api_key"?, "base_url"?}`` for a draft. A draft key is used for this request only:
+        never stored, logged or returned. Answers ``{"models": [...], "listed": true}``, or
+        ``listed: false`` with a ``reason`` when the provider has no list or refuses it.
+        """
+
+        from krellbot.ai.connections import ConnectionRefused, ConnectionStore, is_connection_id, validate_base_url
+        from krellbot.ai.http import UrllibTransport
+        from krellbot.ai.models import list_chat_models, list_for_connection
+        from krellbot.ai.providers import PRESETS
+
+        s = _state(request.app)
+        denied = _gate_state_change(request, s)
+        if denied is not None:
+            return denied
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            return _ai_invalid_body()
+        if not isinstance(payload, dict):
+            return _ai_invalid_body()
+        transport = s.ai_transport or UrllibTransport()
+        connection_id = payload.get("connection_id")
+        try:
+            if connection_id is not None:
+                if set(payload) != {"connection_id"} or not isinstance(connection_id, str):
+                    return _ai_invalid_body()
+                if not is_connection_id(connection_id):
+                    return _ai_not_found()
+                store = _ai_store(s)
+                conn = await asyncio.to_thread(store.get, connection_id)
+                listing = await asyncio.to_thread(
+                    list_for_connection, store, conn, transport, clock=lambda: _app_now(s)
+                )
+            else:
+                preset_id = payload.get("preset")
+                base_url = payload.get("base_url")
+                api_key = payload.get("api_key")
+                if (
+                    set(payload) - {"preset", "base_url", "api_key"}
+                    or not isinstance(preset_id, str)
+                    or any(v is not None and not isinstance(v, str) for v in (base_url, api_key))
+                ):
+                    return _ai_invalid_body()
+                preset = PRESETS.get(preset_id)
+                if preset is None:
+                    raise ConnectionRefused("ai_preset_unknown")
+                if preset.custom:
+                    if base_url is None:
+                        raise ConnectionRefused("ai_endpoint_invalid")
+                    url = base_url.rstrip("/")
+                    validate_base_url(base_url)
+                    validate_base_url(url)
+                else:
+                    if base_url is not None and base_url.rstrip("/") != preset.base_url:
+                        raise ConnectionRefused("ai_endpoint_fixed")
+                    url = preset.base_url
+                key = ConnectionStore._clean_credential(api_key)
+                if key is None and not preset.custom:
+                    raise ConnectionRefused("ai_credential_required")
+                if not preset.lists_models:
+                    from krellbot.ai.models import REASON_NO_MODEL_LIST
+
+                    return _ai_json(
+                        {
+                            "ok": True,
+                            "effect": "unchanged",
+                            "models": [],
+                            "listed": False,
+                            "reason": REASON_NO_MODEL_LIST,
+                        }
+                    )
+                listing = await asyncio.to_thread(list_chat_models, preset.format, url, key, transport)
+        except ConnectionRefused as exc:
+            return _ai_refused(exc)
+        if listing.error is not None:
+            return _ai_json(
+                {
+                    "ok": False,
+                    "effect": "refused",
+                    "code": listing.error.code,
+                    "detail": listing.error.message,
+                    "models": [],
+                    "listed": False,
+                },
+                502,
+            )
+        body: dict = {
+            "ok": True,
+            "effect": "unchanged",
+            "models": [m.as_dict() for m in listing.models],
+            "listed": listing.listed,
+        }
+        if not listing.listed:
+            body["reason"] = listing.reason
+        return _ai_json(body)
+
     # ---- Sign in with OpenRouter (M38.20) ------------------------------
     #
     # OAuth PKCE through a one-shot listener on 127.0.0.1 (a separate socket,
