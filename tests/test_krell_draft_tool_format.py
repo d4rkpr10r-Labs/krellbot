@@ -16,10 +16,14 @@ import jsonschema
 import pytest
 
 from krellbot.agent.actors import KRELL, Actor
-from krellbot.agent.core import PACK_ID_PATTERN, AgentToolCore
+from krellbot.agent.core import PACK_ID_PATTERN, AgentToolCore, provider_safe_schema
 from krellbot.application.strategy import StrategyDraftService
 from krellbot.mcp import McpTools
 from krellbot.pack import lint
+
+# The draft tool's listing (name, description, input schema) goes to the
+# provider on every model request, so it has a byte budget.
+DRAFT_TOOL_BUDGET_BYTES = 6000
 
 # The keywords every provider we support accepts in a tool schema.
 PROVIDER_SAFE_KEYWORDS = frozenset(
@@ -96,6 +100,9 @@ def _off_allowlist(node: object, path: str = "pack") -> list[str]:
     if not isinstance(node, dict):
         return [f"{path}: not an object schema"]
     found = [f"{path}.{key}" for key in node if key not in PROVIDER_SAFE_KEYWORDS]
+    if "enum" in node and "type" not in node:
+        # Some providers take ``enum`` only on a typed node.
+        found.append(f"{path}.enum without a type")
     for name, sub in node.get("properties", {}).items():
         found += _off_allowlist(sub, f"{path}.properties.{name}")
     if "items" in node:
@@ -139,7 +146,51 @@ def test_draft_pack_schema_follows_the_pack_schema_file(home: Path):
     assert venues == source["$defs"]["market"]["properties"]["venue"]["enum"]
     stop = pack_schema["properties"]["risk"]["properties"]["stop"]
     assert [branch["required"] for branch in stop["anyOf"]] == [["type", "pct"], ["type", "len", "mult"]]
-    assert pack_schema["properties"]["schema_version"] == {"enum": [1]}
+    assert pack_schema["properties"]["schema_version"] == {"type": "integer", "minimum": 1, "maximum": 1}
+    assert pack_schema["properties"]["timeframe"]["type"] == "string"
+
+
+def test_draft_tool_listing_fits_its_byte_budget(home: Path):
+    spec = _draft_spec(home)
+    listing = json.dumps({"name": spec.name, "description": spec.description, "input_schema": spec.input_schema})
+
+    assert len(listing.encode("utf-8")) <= DRAFT_TOOL_BUDGET_BYTES, (
+        f"the draft tool listing is {len(listing.encode('utf-8'))} bytes, over its "
+        f"{DRAFT_TOOL_BUDGET_BYTES}-byte budget: it is sent to the provider on every model request"
+    )
+
+
+def test_closed_objects_rule_is_said_once_or_per_object(home: Path):
+    pack_schema = _pack_schema(home)
+    assert "Every object takes only the keys shown." in pack_schema["description"]
+    assert "No other keys." not in json.dumps(pack_schema)
+
+    # With one open object in the source, each closed object says it itself.
+    source = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"open": {"type": "object", "properties": {"a": {"type": "string"}}}},
+    }
+    converted = provider_safe_schema(source)
+    assert converted["description"] == "No other keys."
+    assert "description" not in converted["properties"]["open"]
+
+
+def test_tuple_without_an_order_note_fails_the_conversion():
+    source = {
+        "type": "object",
+        "properties": {"pair": {"$ref": "#/$defs/pair_tuple"}},
+        "$defs": {
+            "pair_tuple": {
+                "type": "array",
+                "prefixItems": [{"type": "string"}, {"type": "number"}],
+                "items": False,
+            }
+        },
+    }
+
+    with pytest.raises(ValueError, match="order note"):
+        provider_safe_schema(source)
 
 
 def test_draft_pack_schema_states_dropped_rules_in_descriptions(home: Path):
@@ -163,17 +214,19 @@ def test_draft_pack_schema_accepts_every_shipped_starter_pack(home: Path, pack: 
     jsonschema.Draft202012Validator(_pack_schema(home)).validate(pack)
 
 
-def test_condition_groups_are_typed_two_levels_deep_then_cut_off(home: Path):
+def test_condition_is_a_typed_comparison_or_a_permissive_group(home: Path):
     entry = _pack_schema(home)["properties"]["entry"]
 
-    first = _branch(entry, "object")
-    second = _branch(first["properties"]["all"]["items"], "object")
-    innermost = second["properties"]["any"]["items"]
-    cutoff = _branch(innermost, "object")
-    assert set(cutoff) == {"type", "description"}
-    assert _branch(innermost, "array")["minItems"] == 3
+    assert [branch["type"] for branch in entry["anyOf"]] == ["array", "object"]
+    assert "description" not in entry
+    leaf, group = entry["anyOf"]
+    assert leaf["minItems"] == leaf["maxItems"] == 3
+    assert all("anyOf" not in item for item in leaf["items"]["anyOf"])
+    assert set(group) == {"type", "description"}
+    assert '{"all": [conditions]}' in group["description"]
+    assert "at most two levels" in group["description"]
 
-    # Two group levels are the deepest the validator accepts.
+    # The group note's "at most two levels" is the deepest the validator accepts.
     leaf = ["close", ">", "sma20"]
     two_levels = _pack(entry={"all": [{"any": [leaf, leaf]}, leaf]})
     three_levels = _pack(entry={"all": [{"any": [{"all": [leaf]}]}]})
@@ -190,6 +243,7 @@ def test_draft_description_says_it_validates_and_never_trades(home: Path):
 
     assert "validate" in description
     assert "never trades" in description
+    assert "id: your own short slug, or leave it out and one is made from the label" in description
 
 
 def test_draft_description_example_is_a_runnable_pack(home: Path):
@@ -232,6 +286,46 @@ def test_generated_id_takes_the_next_free_suffix(home: Path):
     ]
 
 
+def test_redrafting_the_same_idless_pack_finds_its_revision(home: Path):
+    pack = _pack(id=None, label="Trend rider")
+
+    first = AgentToolCore(home).call(KRELL, "draft", {"pack": pack})
+    again = AgentToolCore(home).call(KRELL, "draft", {"pack": pack})
+
+    assert again["result"]["strategy_id"] == first["result"]["strategy_id"] == "trend-rider"
+    assert again["result"]["revision_id"] == first["result"]["revision_id"]
+    assert again["result"]["outcome"] == "existing"
+    assert again["effect"] == "unchanged"
+    assert [path.name for path in (home / "drafts").iterdir()] == ["trend-rider"]
+
+
+def test_generated_id_skips_a_directory_another_writer_claimed(home: Path):
+    # Another process made the directory first but wrote no revision yet.
+    (home / "drafts" / "trend-rider").mkdir(parents=True)
+
+    result = _draft(home, _pack(id=None, label="Trend rider"))
+
+    assert result["strategy_id"] == "trend-rider-2"
+    assert list((home / "drafts" / "trend-rider").iterdir()) == []
+
+
+def test_generated_id_claim_survives_a_writer_that_wins_the_race(home: Path, monkeypatch):
+    target = home / "drafts" / "trend-rider"
+    real_mkdir = Path.mkdir
+
+    def racing_mkdir(self, *args, **kwargs):
+        if self == target and not target.exists():
+            real_mkdir(self, parents=True)  # another writer makes it first
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", racing_mkdir)
+
+    result = _draft(home, _pack(id=None, label="Trend rider"))
+
+    assert result["strategy_id"] == "trend-rider-2"
+    assert list(target.iterdir()) == []
+
+
 def test_generated_id_fits_the_pack_id_pattern(home: Path):
     label = "A very long strategy label that keeps on going well past the limit"
     first = _draft(home, _pack(id=None, label=label))
@@ -262,6 +356,19 @@ def test_edit_without_id_keeps_the_parent_strategy(home: Path):
     assert edited["pack"]["label"] == "Renamed"
 
 
+def test_edit_without_id_never_borrows_a_malformed_parent_id(home: Path):
+    # A direct service caller can store a strategy id the pack schema refuses.
+    parent = StrategyDraftService(home).create(_pack(id="Legacy_Strategy"))
+
+    result = AgentToolCore(home).call(
+        KRELL, "draft", {"pack": _pack(id=None, label="Renamed"), "parent_revision_id": parent["revision_id"]}
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "mcp_invalid_request"
+    assert result["message"] == "pack must have a non-empty id"
+
+
 def test_direct_service_callers_still_need_an_id(home: Path):
     with pytest.raises(ValueError, match="pack must have a non-empty id"):
         StrategyDraftService(home).create(_pack(id=None))
@@ -284,6 +391,21 @@ def test_malformed_pack_returns_the_validators_errors_in_one_call(home: Path):
     validated = AgentToolCore(home).call(KRELL, "validate", {"revision_id": drafted["revision_id"]})
     assert drafted["errors"] == validated["result"]["errors"]
     assert drafted["runnable"] is validated["result"]["runnable"]
+
+
+def test_draft_reports_changed_when_validation_moves_the_state(home: Path):
+    # Saved but never validated: the draft call validates it.
+    StrategyDraftService(home).create(_pack())
+    core = AgentToolCore(home)
+
+    first = core.call(KRELL, "draft", {"pack": _pack()})
+    again = core.call(KRELL, "draft", {"pack": _pack()})
+
+    assert first["result"]["outcome"] == "existing"
+    assert first["result"]["state"] == "validated"
+    assert first["effect"] == "changed"
+    assert again["result"]["outcome"] == "existing"
+    assert again["effect"] == "unchanged"
 
 
 def test_redrafting_a_deployed_revision_keeps_it_deployed(home: Path):

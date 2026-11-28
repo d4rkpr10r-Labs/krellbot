@@ -725,14 +725,23 @@ def _read(ctx: ToolContext, params: dict) -> dict:
 # ---- the draft tool's pack format ---------------------------------------
 #
 # ``draft``'s ``pack`` input is derived from ``pack/schema.json`` when this
-# module is imported, so the two cannot drift. Tool schemas reach every
-# provider, so the derived schema uses only the keywords they all accept
-# (:data:`PROVIDER_SAFE_KEYWORDS`): refs are inlined, ``oneOf`` becomes
-# ``anyOf``, ``const`` a one-value ``enum`` and a tuple (``prefixItems``) an
-# ``items`` ``anyOf``. A rule that a dropped keyword carried (a pattern, an
-# exclusive choice, no other keys, a tuple's order) is said in that node's
-# description. The validator stays the authority, and ``draft`` returns its
-# verdict in the same call.
+# module is imported (:func:`provider_safe_schema`), so the two cannot drift.
+# Tool schemas go to the provider on every model request, so the derived
+# schema is compact and uses only the keywords every provider accepts
+# (:data:`PROVIDER_SAFE_KEYWORDS`):
+#
+# - refs are inlined; a recursive def (the condition group) gets one compact,
+#   permissive form instead (:data:`_PACK_COMPACT_DEFS`);
+# - ``oneOf`` becomes ``anyOf``; every ``enum`` carries its ``type``, and a
+#   single number (``const: 1``) becomes ``minimum`` = ``maximum``;
+# - a tuple (``prefixItems``) becomes an ``items`` ``anyOf`` of its element
+#   schemas, nested ``anyOf`` flattened, and must have an order note;
+# - a rule a dropped keyword carried (a pattern, an exclusive choice, no
+#   other keys, a tuple's order) is said in that node's description; "no
+#   other keys" is said once, at the root, when every object is closed.
+#
+# The validator stays the authority, and ``draft`` returns its verdict in the
+# same call.
 
 PROVIDER_SAFE_KEYWORDS: frozenset[str] = frozenset(
     {
@@ -751,26 +760,24 @@ PROVIDER_SAFE_KEYWORDS: frozenset[str] = frozenset(
         "maxLength",
     }
 )
-_COPIED_KEYWORDS = PROVIDER_SAFE_KEYWORDS - {"properties", "items", "anyOf"}
+_COPIED_KEYWORDS = PROVIDER_SAFE_KEYWORDS - {"properties", "items", "anyOf", "enum"}
 # Dropped here; their rules become description notes (``_key_notes``).
 _KEY_RULE_KEYWORDS = frozenset({"$schema", "$id", "$defs", "additionalProperties", "minProperties", "maxProperties"})
 
-# How many times a recursive def is inlined on one path before it is cut to a
-# plain object. The pack's only recursion is a condition group (``all_any``):
-# lint allows conditions 3 deep and a comparison is depth 1, so two group
-# levels are as deep as a runnable pack goes.
-_RECURSION_DEPTH = 2
-
 # Plain-words notes for defs whose meaning the keywords alone do not carry.
+# A tuple def must have one: it is the only place its items' order is said.
 _PACK_DEF_NOTES: dict[str, str] = {
-    "leaf": "A comparison, in order [left, op, right].",
-    "operand": "A price field, a number, or the name of an indicator in indicators.",
+    "leaf": "A comparison [left, op, right]; left and right are a price field, a number or an indicator name.",
 }
-_PACK_CUTOFF_NOTES: dict[str, str] = {
-    "all_any": "Groups nest at most two levels deep, so put a comparison [left, op, right] here.",
+# Recursive defs, each given one compact, permissive form instead of being inlined.
+_PACK_COMPACT_DEFS: dict[str, str] = {
+    "all_any": (
+        'A group: {"all": [conditions]} or {"any": [conditions]}, exactly one key; groups nest at most two levels.'
+    ),
 }
-_CUTOFF_NOTE = "Nested too deep to describe here; the validator checks it."
-_PACK_NOTE = "A strategy pack, shaped like the example in the tool description."
+_PACK_NOTE = "Shaped like the example in the tool description."
+# Said once at the root when every object in the source is closed.
+_CLOSED_NOTE = "Every object takes only the keys shown."
 
 # Keywords :func:`_brief` can summarise.
 _BRIEF_KEYWORDS = frozenset(
@@ -814,17 +821,60 @@ def _brief(node: dict, defs: dict) -> str:
     return str(kind)
 
 
+def _typed_enum(values: list) -> dict:
+    """An ``enum`` with its ``type``: some providers take ``enum`` only on a typed node.
+
+    A single number is written as ``minimum`` = ``maximum``, which every
+    provider reads; ``enum`` there is for strings only on some of them.
+    """
+    if values and all(isinstance(value, str) for value in values):
+        return {"type": "string", "enum": list(values)}
+    if values and all(isinstance(value, int | float) and not isinstance(value, bool) for value in values):
+        kind = "integer" if all(isinstance(value, int) for value in values) else "number"
+        if len(values) == 1:
+            return {"type": kind, "minimum": values[0], "maximum": values[0]}
+        return {"type": kind, "enum": list(values)}
+    raise ValueError(f"pack schema enum {values!r} has no provider-safe form")
+
+
 def _count(n: int) -> str:
     return "one key" if n == 1 else f"{n} keys"
 
 
-def _key_notes(node: dict) -> list[str]:
-    """Notes for the object rules the provider-safe keywords cannot state."""
+@dataclass(frozen=True)
+class _Source:
+    """What one conversion reads: the source's ``$defs``, and whether every object in it is closed."""
+
+    defs: dict
+    closed: bool
+
+
+def _all_objects_closed(node: object) -> bool:
+    """True when every object schema in ``node`` (defs included) has ``additionalProperties: false``.
+
+    A map named like a keyword only makes this ``False``, which keeps the
+    per-object notes: it never hides a rule.
+    """
+    if isinstance(node, dict):
+        if ("properties" in node or "patternProperties" in node) and node.get("additionalProperties") is not False:
+            return False
+        return all(_all_objects_closed(value) for value in node.values())
+    if isinstance(node, list):
+        return all(_all_objects_closed(item) for item in node)
+    return True
+
+
+def _key_notes(node: dict, src: _Source) -> list[str]:
+    """Notes for the object rules the provider-safe keywords cannot state.
+
+    When every object is closed, the root says so once (:data:`_CLOSED_NOTE`)
+    instead of each object repeating it.
+    """
     notes: list[str] = []
     extra = node.get("additionalProperties")
     if extra not in (None, True, False):
         raise ValueError("pack schema additionalProperties schemas have no provider-safe form")
-    if extra is False and "patternProperties" not in node:
+    if extra is False and not src.closed and "patternProperties" not in node:
         notes.append("No other keys.")
     low, high = node.get("minProperties"), node.get("maxProperties")
     if low is not None and low == high:
@@ -837,18 +887,31 @@ def _key_notes(node: dict) -> list[str]:
     return notes
 
 
-def _unique(nodes: list[dict]) -> list[dict]:
+def _is_placeholder(node: dict) -> bool:
+    """A permissive object (no properties), listed after the typed branches."""
+    return node.get("type") == "object" and "properties" not in node
+
+
+def _types_differ(branches: list[dict]) -> bool:
+    """True when every branch has its own ``type``, so they cannot overlap."""
+    kinds = [branch.get("type") for branch in branches]
+    return None not in kinds and len(set(kinds)) == len(kinds)
+
+
+def _flat_unique(nodes: list[dict]) -> list[dict]:
+    """``nodes`` with nested ``anyOf`` wrappers spliced in and repeats dropped."""
     out: list[dict] = []
     for node in nodes:
-        if node not in out:
-            out.append(node)
+        for item in node["anyOf"] if set(node) <= {"anyOf", "description"} else [node]:
+            if item not in out:
+                out.append(item)
     return out
 
 
-def _safe_node(node: dict, defs: dict, stack: tuple[str, ...]) -> dict:
-    """``node`` in :data:`PROVIDER_SAFE_KEYWORDS` only, its refs inlined (see the section comment)."""
+def _safe_node(node: dict, src: _Source, stack: tuple[str, ...], note: str | None = None) -> dict:
+    """``node`` in :data:`PROVIDER_SAFE_KEYWORDS` only (see the section comment); ``note`` leads its description."""
     if "$ref" in node:
-        return _safe_ref(node["$ref"], defs, stack)
+        return _safe_ref(node["$ref"], src, stack)
     out: dict = {}
     notes: list[str] = []
     for key, value in node.items():
@@ -857,63 +920,74 @@ def _safe_node(node: dict, defs: dict, stack: tuple[str, ...]) -> dict:
         if key in _COPIED_KEYWORDS:
             out[key] = copy.deepcopy(value)
         elif key == "properties":
-            out[key] = {name: _safe_node(sub, defs, stack) for name, sub in value.items()}
+            out[key] = {name: _safe_node(sub, src, stack) for name, sub in value.items()}
         elif key == "items":
             # ``items: false`` closes a tuple; its ``maxItems`` already says so.
             if isinstance(value, dict):
-                out[key] = _safe_node(value, defs, stack)
+                out[key] = _safe_node(value, src, stack)
         elif key == "prefixItems":
-            out["items"] = {"anyOf": _unique([_safe_node(sub, defs, stack) for sub in value])}
+            if note is None:
+                raise ValueError("pack schema tuple has no order note; add one to _PACK_DEF_NOTES")
+            out["items"] = {"anyOf": _flat_unique([_safe_node(sub, src, stack) for sub in value])}
         elif key in ("oneOf", "anyOf"):
-            out["anyOf"] = [_safe_node(sub, defs, stack) for sub in value]
-            if key == "oneOf":
+            branches = sorted((_safe_node(sub, src, stack) for sub in value), key=_is_placeholder)
+            out["anyOf"] = branches
+            if key == "oneOf" and not _types_differ(branches):
                 notes.append("Exactly one of these.")
-        elif key == "const":
-            out["enum"] = [copy.deepcopy(value)]
+        elif key in ("const", "enum"):
+            out.update(_typed_enum([value] if key == "const" else value))
         elif key == "pattern":
             notes.append(f"Must match {value}.")
         elif key == "exclusiveMinimum":
-            notes.append(f"Must be above {value}.")
+            notes.append(f"Above {value}.")
         elif key == "not" and set(value) == {"enum"}:
-            notes.append(f"Not one of {', '.join(str(item) for item in value['enum'])}.")
+            notes.append(f"Not {'/'.join(str(item) for item in value['enum'])}.")
         elif key == "patternProperties":
             notes += [
-                f"Keys must match {pattern}; each value is {_brief(sub, defs)}." for pattern, sub in value.items()
+                f"Keys must match {pattern}; each value is {_brief(sub, src.defs)}." for pattern, sub in value.items()
             ]
         else:
             raise ValueError(f"pack schema keyword {key!r} has no provider-safe form")
-    notes += _key_notes(node)
-    if notes:
-        out["description"] = " ".join([out["description"], *notes] if "description" in out else notes)
+    notes += _key_notes(node, src)
+    parts = [part for part in (note, out.get("description")) if part] + notes
+    if parts:
+        out["description"] = " ".join(parts)
     return out
 
 
-def _safe_ref(ref: str, defs: dict, stack: tuple[str, ...]) -> dict:
-    """Inline one ref. A recursive object def is cut to a plain object after :data:`_RECURSION_DEPTH` levels."""
-    name = _def_name(ref, defs)
-    target = defs[name]
-    depth = stack.count(name)
-    if depth >= _RECURSION_DEPTH:
-        if target.get("type") == "object":
-            return {"type": "object", "description": _PACK_CUTOFF_NOTES.get(name, _CUTOFF_NOTE)}
-        if depth > _RECURSION_DEPTH:
-            raise ValueError(f"pack schema def {name!r} recurses with no object def to cut at")
-    node = _safe_node(target, defs, (*stack, name))
-    note = _PACK_DEF_NOTES.get(name)
-    if note:
-        node["description"] = f"{note} {node['description']}" if "description" in node else note
-    return node
+def _safe_ref(ref: str, src: _Source, stack: tuple[str, ...]) -> dict:
+    """Inline one ref; a def in :data:`_PACK_COMPACT_DEFS` becomes its compact form."""
+    name = _def_name(ref, src.defs)
+    if name in _PACK_COMPACT_DEFS:
+        return {"type": "object", "description": _PACK_COMPACT_DEFS[name]}
+    if name in stack:
+        raise ValueError(f"pack schema def {name!r} recurses; give it a compact form in _PACK_COMPACT_DEFS")
+    return _safe_node(src.defs[name], src, (*stack, name), note=_PACK_DEF_NOTES.get(name))
 
 
-def _pack_tool_schema() -> dict:
-    """The provider-safe ``pack`` schema, derived from ``pack/schema.json``."""
+def provider_safe_schema(source: dict) -> dict:
+    """``source``, a JSON Schema with local ``$defs``, in :data:`PROVIDER_SAFE_KEYWORDS` only.
+
+    Raises ``ValueError`` for what it cannot convert safely: a keyword with no
+    provider-safe form, a recursive def with no compact form, or a tuple with
+    no order note.
+    """
+    src = _Source(defs=source.get("$defs", {}), closed=_all_objects_closed(source))
+    schema = _safe_node(source, src, ())
+    if src.closed:
+        schema["description"] = " ".join(part for part in (schema.get("description"), _CLOSED_NOTE) if part)
+    return schema
+
+
+def _draft_pack_schema() -> dict:
+    """The ``pack`` schema of the draft tool, derived from ``pack/schema.json``."""
     source = json.loads(resources.files("krellbot.pack").joinpath("schema.json").read_text(encoding="utf-8"))
-    schema = _safe_node(source, source.get("$defs", {}), ())
+    schema = provider_safe_schema(source)
     schema["description"] = " ".join([_PACK_NOTE, schema.get("description", "")]).strip()
     return schema
 
 
-DRAFT_PACK_SCHEMA: dict = _pack_tool_schema()
+DRAFT_PACK_SCHEMA: dict = _draft_pack_schema()
 
 # One complete pack the validator passes (``tests/test_krell_draft_tool_format.py``).
 DRAFT_EXAMPLE_PACK: dict = {
@@ -937,27 +1011,34 @@ DRAFT_EXAMPLE_PACK: dict = {
 DRAFT_DESCRIPTION = (
     "Save a strategy pack as a draft revision, or edit one with parent_revision_id, and validate it in the "
     "same call: runnable and errors in the result are the validator's verdict, so you do not need a separate "
-    "validate call. A draft never trades. A pack without an id gets one made from its label. "
-    "Example pack: " + json.dumps(DRAFT_EXAMPLE_PACK)
+    "validate call. A draft never trades. id: your own short slug, or leave it out and one is made from the "
+    "label. Example pack: " + json.dumps(DRAFT_EXAMPLE_PACK)
 )
 
 
 def _draft_strategy_id(service: StrategyDraftService, pack: dict, parent_revision_id: object) -> str | None:
-    """The strategy id for a pack sent without one: the parent's when editing, else a free one from the label."""
+    """The strategy id for a pack sent without one, or ``None`` to leave it missing.
+
+    Editing: the parent's strategy id, used only when it is a valid pack id.
+    Creating: :meth:`StrategyDraftService.claim_strategy_id`, a slug of the
+    label that matches :data:`PACK_ID_PATTERN` by construction.
+    """
     if parent_revision_id:
-        return service.strategy_id_of(str(parent_revision_id))
-    return service.free_strategy_id(pack.get("label"))
+        strategy_id = service.strategy_id_of(str(parent_revision_id))
+        return strategy_id if is_pack_id(strategy_id) else None
+    return service.claim_strategy_id(pack)
 
 
 def _draft(ctx: ToolContext, params: dict) -> dict:
     """Save a draft revision and validate it in the same call.
 
     A pack with no non-empty ``id`` gets one here (the service still refuses
-    an empty id for direct callers): the parent's strategy id when editing,
-    else a free one from the label. Step 3 never saw that id, so it is made to
-    match :data:`PACK_ID_PATTERN` by construction. A revision still in the ``draft`` state
-    is validated, so ``runnable`` and ``errors`` are the validator's verdict;
-    a validated or deployed revision already carries it and keeps its state.
+    an empty id for direct callers; see :func:`_draft_strategy_id`). Step 3
+    never saw that id, so it matches :data:`PACK_ID_PATTERN` or is not used.
+    A revision still in the ``draft`` state is validated, so ``runnable`` and
+    ``errors`` are the validator's verdict; a validated or deployed revision
+    already carries it and keeps its state. ``effect`` is ``changed`` when a
+    revision was written or validation moved its state.
     """
     pack = params.get("pack")
     parent_revision_id = params.get("parent_revision_id")
@@ -968,6 +1049,7 @@ def _draft(ctx: ToolContext, params: dict) -> dict:
         strategy_id = _draft_strategy_id(service, pack, parent_revision_id)
         if strategy_id:
             pack = {**pack, "id": strategy_id}
+    moved = False
     try:
         if parent_revision_id:
             summary = service.edit(str(parent_revision_id), pack, origin=ctx.actor.label)
@@ -977,6 +1059,7 @@ def _draft(ctx: ToolContext, params: dict) -> dict:
             outcome = summary.get("outcome")
             summary = service.validate(str(summary["revision_id"]))
             summary["outcome"] = outcome
+            moved = summary.get("state") != STATE_DRAFT
     except RevisionNotFound as exc:
         return invalid_request("draft", f"revision not found: {exc}").to_dict()
     except StrategyIdMismatch as exc:
@@ -986,7 +1069,7 @@ def _draft(ctx: ToolContext, params: dict) -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
         "ok": True,
-        "effect": "changed" if summary.get("outcome") == "created" else "unchanged",
+        "effect": "changed" if summary.get("outcome") == "created" or moved else "unchanged",
         "tool": "draft",
         "result": summary,
     }
@@ -1381,10 +1464,7 @@ def _builtin_specs() -> tuple[ToolSpec, ...]:
                 "type": "object",
                 "properties": {
                     "pack": copy.deepcopy(DRAFT_PACK_SCHEMA),
-                    "parent_revision_id": {
-                        "type": "string",
-                        "description": "Revision to edit; the new revision keeps its strategy id.",
-                    },
+                    "parent_revision_id": {"type": "string", "description": "Revision to edit; keeps its strategy id."},
                 },
                 "required": ["pack"],
             },
@@ -1499,6 +1579,7 @@ __all__ = [
     "normalize_tool_name",
     "path_id_refusal",
     "policy_denied",
+    "provider_safe_schema",
     "read_regular_file_bounded",
     "secret_param_refused",
     "unknown_tool",

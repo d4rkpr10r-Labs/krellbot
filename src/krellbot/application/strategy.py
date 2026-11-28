@@ -454,32 +454,46 @@ class StrategyDraftService:
         assert strategy_id is not None
         return self._summary(strategy_id, revision_id)
 
-    def has_strategy(self, strategy_id: str) -> bool:
-        """True when the draft store already holds a strategy with this id."""
-
-        return self._strategy_dir(strategy_id).is_dir()
-
     def strategy_id_of(self, revision_id: str) -> str | None:
         """The strategy id that stores ``revision_id``, or ``None`` when it is not stored."""
 
         return self._strategy_for_revision(revision_id)
 
-    def free_strategy_id(self, label: object) -> str:
-        """A new strategy id made from ``label`` that no draft uses yet.
+    def claim_strategy_id(self, pack: dict) -> str:
+        """The strategy id for ``pack``, which has none, made from its label.
 
-        It is :func:`slug_strategy_id`; when that strategy exists, ``-2``,
-        ``-3``, ... is appended, the base trimmed so the id stays within
-        :data:`MAX_STRATEGY_ID_LEN`.
+        Candidates are :func:`slug_strategy_id` of the label, then ``-2``,
+        ``-3``, ... (the base trimmed to stay within
+        :data:`MAX_STRATEGY_ID_LEN`). The first candidate whose strategy
+        already holds this exact pack is returned, so sending the same pack
+        again finds its revision instead of a new strategy. Otherwise the
+        first candidate whose directory this call creates is claimed: the
+        directory is made with ``exist_ok=False``, so two writers never get the
+        same new id.
         """
 
-        base = slug_strategy_id(label)
-        candidate = base
-        n = 2
-        while self.has_strategy(candidate):
-            suffix = f"-{n}"
+        base = slug_strategy_id(pack.get("label"))
+        n = 1
+        while True:
+            suffix = "" if n == 1 else f"-{n}"
             candidate = base[: MAX_STRATEGY_ID_LEN - len(suffix)].rstrip("-") + suffix
             n += 1
-        return candidate
+            if self._rev_path(candidate, _revision_id({**pack, "id": candidate})).exists():
+                return candidate
+            try:
+                self._claim_strategy_dir(candidate)
+            except FileExistsError:
+                continue
+            return candidate
+
+    def _claim_strategy_dir(self, strategy_id: str) -> None:
+        """Create the strategy directory; ``FileExistsError`` when anything is already there."""
+
+        path = self._strategy_dir(strategy_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.mkdir(mode=0o700, exist_ok=False)
+        if not _IS_WINDOWS:
+            os.chmod(path, 0o700)
 
     def is_runnable(self, revision_id: str) -> bool:
         """True iff the revision can be armed."""
