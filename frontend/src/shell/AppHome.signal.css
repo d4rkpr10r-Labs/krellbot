@@ -3,28 +3,42 @@
  *
  * Single focused hero + paper starter CTA. Configuration, keys, disclosures,
  * and local computer controls live in the dedicated Settings view.
+ *
+ * Flat surfaces (docs/design-system.md, Shell composition): the home
+ * wrapper is the page, so the gradient shows around it. The hero and the
+ * starter chooser are its panels and share one surface. Inside a panel,
+ * group with spacing and hairlines, never another box.
  */
 
 .app-home {
   display: grid;
   gap: var(--space-section, 16px);
   align-content: start;
+  width: min(100%, var(--page-column-max, 1080px));
+  margin-inline: auto;
   min-width: 0;
-  --app-home-hero-inset: 14px 16px;
+  --app-home-panel-inset: clamp(18px, 2.2vw, 28px);
+}
+
+/* ---- the one home panel surface (hero and chooser alike) ---- */
+
+.app-home__hero,
+.kbot-shell .app-home .kbot-paper-starter-chooser {
+  padding: var(--app-home-panel-inset);
+  background-color: var(--panel-bg-translucent);
+  background-image: var(--panel-light, none);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--panel-shadow, none);
 }
 
 /* ---- hero composition (brand + path CTA + honesty) ---- */
 
 .app-home__hero {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: var(--space-stack, 14px);
-  flex-wrap: wrap;
-  padding: var(--app-home-hero-inset);
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-panel);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 20px 40px;
   animation: kbot-shell-home-enter var(--motion-duration-enter, 180ms)
     var(--motion-ease-standard, cubic-bezier(0.2, 0, 0, 1));
 }
@@ -43,9 +57,8 @@
 .app-home__hero-brand {
   display: flex;
   align-items: flex-start;
-  gap: 12px;
+  gap: 14px;
   min-width: 0;
-  flex: 1 1 280px;
 }
 
 .app-home__hero-brand .kbot-brandmark {
@@ -80,15 +93,12 @@
   line-height: 1.45;
 }
 
+/* A status line inside the hero, not a box: the dot carries the state. */
 .app-home__active-paper {
   display: flex;
   align-items: flex-start;
   gap: 10px;
   max-width: 56ch;
-  padding: 10px 12px;
-  border: 1px solid color-mix(in srgb, var(--seafoam) 38%, var(--line));
-  border-radius: var(--radius-control);
-  background: color-mix(in srgb, var(--panel) 48%, var(--surface));
 }
 
 .app-home__active-paper-dot {
@@ -127,12 +137,21 @@
   line-height: 1.4;
 }
 
+/* The action column: the one sage CTA, then the quiet links beneath it. */
 .app-home__cta-group {
+  display: grid;
+  justify-items: start;
+  align-content: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.app-home__cta-links {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 10px 16px;
-  align-self: flex-start;
+  gap: 0 18px;
+  max-width: 360px;
 }
 
 .app-home__cta {
@@ -207,13 +226,12 @@
   font-size: 12.5px;
 }
 
+/* A callout inside the hero: a danger rule on the left, not a nested box. */
 .app-home__session--failed {
   display: grid;
   gap: 10px;
-  padding: 12px 14px;
-  border: 1px solid color-mix(in srgb, var(--danger-border) 70%, var(--line));
-  border-radius: var(--radius-control);
-  background: color-mix(in srgb, var(--caution-bg) 35%, var(--surface));
+  padding: 2px 0 2px 12px;
+  border-left: 2px solid var(--danger-border);
 }
 
 .app-home__note-copy {
@@ -262,13 +280,61 @@
   outline-offset: 2px;
 }
 
+/* ---- starter chooser inside home: one panel, rows split by hairlines ---- */
+
+.kbot-shell .app-home .kbot-paper-starter-chooser {
+  width: 100%;
+  margin: 0;
+}
+
+.kbot-shell .app-home .kbot-paper-starter-chooser .kbot-starter-picker {
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 0;
+}
+
+.kbot-shell .app-home .kbot-starter-picker--consumer .kbot-starter-picker__list {
+  gap: 0;
+}
+
+.kbot-shell .app-home .kbot-starter-picker--consumer .kbot-starter-picker__item {
+  padding: 14px 0;
+  background: none;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+}
+
+.kbot-shell .app-home .kbot-starter-picker--consumer .kbot-starter-picker__item:last-child {
+  border-bottom: 1px solid var(--line);
+}
+
+/* "Browse packs instead" is a text link, like the hero's quiet links. */
+.kbot-shell .app-home button.kbot-paper-starter-chooser__packs {
+  min-height: 40px;
+  padding: 0 2px;
+  border: 0;
+  background: transparent;
+  color: var(--seafoam);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.kbot-shell .app-home button.kbot-paper-starter-chooser__packs:hover {
+  color: var(--text);
+}
+
 /* ---- narrow / mobile ---- */
 
-@media (max-width: 640px) {
+@media (max-width: 720px) {
   .app-home__hero {
+    grid-template-columns: minmax(0, 1fr);
     align-items: stretch;
   }
+}
 
+@media (max-width: 640px) {
   .app-home__hero-brand {
     flex-direction: column;
     gap: 10px;
@@ -280,10 +346,15 @@
 
   .app-home__cta-group {
     width: 100%;
+    justify-items: stretch;
   }
 
   .app-home__cta {
     width: 100%;
+    min-height: 44px;
+  }
+
+  .app-home button.app-home__cta-link {
     min-height: 44px;
   }
 }

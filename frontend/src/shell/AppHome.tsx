@@ -266,28 +266,16 @@ export function AppHome({
         {chooserOpen ? null : (
           <div className="app-home__cta-group">
             {hasPaperRun ? (
-              <>
-                <button
-                  type="button"
-                  className="app-home__cta"
-                  data-testid="app-home-cta-paper"
-                  onClick={() => {
-                    onNavigate("workstation");
-                  }}
-                >
-                  Open paper run
-                </button>
-                <button
-                  type="button"
-                  className="app-home__cta-link"
-                  data-testid="app-home-cta-try-another"
-                  onClick={() => {
-                    setChooserOpen(true);
-                  }}
-                >
-                  Try another strategy
-                </button>
-              </>
+              <button
+                type="button"
+                className="app-home__cta"
+                data-testid="app-home-cta-paper"
+                onClick={() => {
+                  onNavigate("workstation");
+                }}
+              >
+                Open paper run
+              </button>
             ) : (
               <button
                 type="button"
@@ -300,26 +288,40 @@ export function AppHome({
                 Start with a free paper strategy
               </button>
             )}
-            <button
-              type="button"
-              className="app-home__cta-link"
-              data-testid="app-home-cta-packs"
-              onClick={() => {
-                onNavigate("packs");
-              }}
-            >
-              I already have a pack
-            </button>
-            {onReplaySetupTour ? (
+            <div className="app-home__cta-links">
+              {hasPaperRun ? (
+                <button
+                  type="button"
+                  className="app-home__cta-link"
+                  data-testid="app-home-cta-try-another"
+                  onClick={() => {
+                    setChooserOpen(true);
+                  }}
+                >
+                  Try another strategy
+                </button>
+              ) : null}
               <button
                 type="button"
-                className="app-home__cta-link app-home__cta-tour"
-                data-testid="workspace-setup-tour-replay"
-                onClick={onReplaySetupTour}
+                className="app-home__cta-link"
+                data-testid="app-home-cta-packs"
+                onClick={() => {
+                  onNavigate("packs");
+                }}
               >
-                Take setup tour
+                I already have a pack
               </button>
-            ) : null}
+              {onReplaySetupTour ? (
+                <button
+                  type="button"
+                  className="app-home__cta-link app-home__cta-tour"
+                  data-testid="workspace-setup-tour-replay"
+                  onClick={onReplaySetupTour}
+                >
+                  Take setup tour
+                </button>
+              ) : null}
+            </div>
           </div>
         )}
       </header>

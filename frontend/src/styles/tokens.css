@@ -38,6 +38,8 @@
   /* --- semantic roles --- */
   --canvas-bg: var(--navy);
   --panel-bg: var(--surface);
+  /* Panels sit over the page gradient: translucent, never a matte slab. */
+  --panel-bg-translucent: color-mix(in srgb, var(--surface) 76%, transparent);
   --panel-raised: var(--panel);
   --panel-border: var(--line);
   --text-primary: var(--text);
@@ -66,6 +68,8 @@
   --space-stack: 12px;
   --space-tight: 8px;
   --space-page-x: 22px;
+  /* Workspace home and Settings share one centred column, edges aligned. */
+  --page-column-max: 1080px;
 
   /* --- motion (intentional shell enters; honor prefers-reduced-motion) --- */
   --motion-duration-fast: 120ms;

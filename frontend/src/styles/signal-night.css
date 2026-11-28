@@ -13,10 +13,15 @@
   --ambient-violet: #8b5cf6;
   --ambient-lilac: #c4b5fd;
   --radius-panel: 14px;
+  /* Teal from the top right, violet from the left, and a low glow along the
+     bottom so the field reaches the bottom of the viewport. */
   --ambient-field:
     radial-gradient(ellipse 56rem 34rem at 96% 0, rgb(45 212 191 / 15%), transparent 70%),
-    radial-gradient(ellipse 48rem 30rem at 0 10rem, rgb(139 92 246 / 13%), transparent 70%);
+    radial-gradient(ellipse 48rem 30rem at 0 10rem, rgb(139 92 246 / 13%), transparent 70%),
+    radial-gradient(ellipse 64rem 22rem at 30% 100%, rgb(139 92 246 / 9%), transparent 70%),
+    radial-gradient(ellipse 52rem 20rem at 85% 100%, rgb(45 212 191 / 7%), transparent 70%);
   --panel-light: linear-gradient(135deg, rgb(94 234 212 / 5%), transparent 45%, rgb(139 92 246 / 4%));
+  --panel-shadow: inset 0 1px 0 rgb(255 255 255 / 4%), 0 8px 28px rgb(0 0 0 / 16%);
 }
 
 [data-theme="signal-night"] body {
@@ -26,6 +31,11 @@
 
 [data-theme="signal-night"] :is(.kbot-shell, .kbot-first-run-wizard) {
   background: var(--ambient-field), var(--navy);
+}
+
+/* Pinned to the viewport: the field runs behind content on every view. */
+[data-theme="signal-night"] .kbot-shell {
+  background-attachment: fixed;
 }
 
 [data-theme="signal-night"] .kbot-shell__brandbar {
@@ -40,7 +50,9 @@
   box-shadow: inset 0 -2px var(--seafoam), inset 0 -14px 18px -18px var(--seafoam);
 }
 
-[data-theme="signal-night"] :is(.app-home__hero, .app-home__welcome, .kbot-shell__pagehead) {
+/* Page heads on the remaining views. Workspace home's hero is a plain panel
+   (AppHome.signal.css) and Settings' head sits on the page. */
+[data-theme="signal-night"] .kbot-shell__pagehead {
   background:
     linear-gradient(100deg, var(--surface) 15%, transparent 88%),
     repeating-linear-gradient(90deg, transparent 0 39px, rgb(94 234 212 / 5%) 39px 40px),
@@ -66,11 +78,11 @@
   }
 }
 
-[data-theme="signal-night"] .kbot-shell__main > section,
+[data-theme="signal-night"] .kbot-shell__main > section:where(:not(.app-home)),
 [data-theme="signal-night"] .kbot-shell__main > .kbot-disclosure,
 [data-theme="signal-night"] :is(.app-home__card, .kbot-palette__box, .kbot-jobs__dialog) {
   background-image: var(--panel-light);
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 4%), 0 8px 28px rgb(0 0 0 / 16%);
+  box-shadow: var(--panel-shadow);
 }
 
 [data-theme="signal-night"] .kbot-first-run-wizard__chrome {

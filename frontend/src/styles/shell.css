@@ -21,8 +21,14 @@
 
 /* ============ base ============ */
 
+/*
+ * The page gradient runs the full viewport behind every view: the root is
+ * at least one dynamic viewport tall and its gradient is pinned to the
+ * viewport, so scrolling never reveals a flat band below it.
+ */
 .kbot-shell {
   min-height: 100vh;
+  min-height: 100dvh;
   background:
     radial-gradient(
       1200px 520px at 12% -8%,
@@ -34,7 +40,13 @@
       color-mix(in srgb, var(--seafoam) 8%, transparent),
       transparent 55%
     ),
+    radial-gradient(
+      1100px 420px at 50% 110%,
+      color-mix(in srgb, var(--panel) 45%, transparent),
+      transparent 70%
+    ),
     var(--navy);
+  background-attachment: fixed;
   color: var(--text);
   display: grid;
   grid-template-rows: auto 1fr;
@@ -258,7 +270,7 @@
 
 /* Disclosure sections already carry panel chrome; avoid double frames. */
 .kbot-shell__main > .kbot-disclosure {
-  background: var(--surface);
+  background: var(--panel-bg-translucent);
   border: 1px solid var(--line);
   border-radius: var(--radius-panel);
   padding: 0;
@@ -345,12 +357,14 @@
  * feature surfaces (paper status, runs, armed records, editor,
  * research, packs, preflight…) that are mounted inside the shell
  * without editing each feature file: surface background, restrained
- * border, panel radius, and section headings.
+ * border, panel radius, and section headings. The surface is translucent
+ * so the page gradient shows through. Workspace home's own wrapper is the
+ * page, not a panel: its hero and chooser are the panels.
  */
-.kbot-shell__main > section,
+.kbot-shell__main > section:where(:not(.app-home)),
 .kbot-shell__main section[class^="kbot-"],
 .kbot-shell__main section[class*=" kbot-"] {
-  background: var(--surface);
+  background: var(--panel-bg-translucent);
   border: 1px solid var(--line);
   border-radius: var(--radius-panel);
   padding: 16px 18px;

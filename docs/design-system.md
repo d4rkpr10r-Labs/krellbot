@@ -22,8 +22,9 @@ task must name `KRELL-SIGNAL-20261010` and follow this document.
 | `--coral` | `#CC9689` | caution/attention base — never success |
 
 Semantic roles (`--accent`, `--focus-ring`, `--action-primary-bg`,
-`--caution-*`, `--danger-*`, `--font-ui`, `--font-mono`, radii) are derived
-from those nine tokens. Prefer semantic roles in component CSS.
+`--caution-*`, `--danger-*`, `--panel-bg-translucent`, `--font-ui`,
+`--font-mono`, radii) are derived from those nine tokens; the layout width
+`--page-column-max` sits beside them. Prefer semantic roles in component CSS.
 
 ### Compatibility aliases
 
@@ -85,12 +86,35 @@ The local application shell is **compact, horizontal and product-led**
 1. Sticky brand bar: the supplied outlined wordmark, inline view navigation
    (active tab underlined in seafoam), then status context (mode + truthful
    availability), Jobs, and the command palette affordance.
-2. Workspace home (`AppHome`) uses a hero + main column + aside composition
-   for orientation only — never fabricated portfolio equity or sample bots.
-3. Real content panels below: readable `--surface` panels with `--line`
-   borders and a consistent radius. Paper workstation may use a main + aside
-   split so the inspector sits as a rail, not a marketing sidebar of invented
-   health metrics.
+2. Workspace home (`AppHome`) is one hero panel, plus the starter chooser
+   when it is open, in a centred column (`--page-column-max`) that Settings
+   shares, for orientation only — never fabricated portfolio equity or
+   sample bots.
+3. Real content panels below: readable `--panel-bg-translucent` panels with
+   `--line` borders and a consistent radius. Paper workstation may use a
+   main + aside split so the inspector sits as a rail, not a marketing
+   sidebar of invented health metrics.
+
+### Surfaces
+
+A surface is an element that paints its own background, a visible border
+and a radius.
+
+- Any section has at most two surface levels: the page and one panel.
+- Inside a panel, group with spacing, headings and hairline `--line`
+  dividers, never with another bordered and backgrounded box. Callouts
+  inside a panel use a coloured rule on the left, not a box.
+- Status chips and pills are not surfaces. Controls (buttons, fields,
+  read-only code fields) keep their own chrome inside the panel.
+- The page gradient runs the full viewport behind content: the shell root
+  is at least one viewport tall and its gradient is pinned to the viewport.
+- Panels may be translucent over the gradient. They must not be opaque
+  matte slabs that cut it off. A view's own wrapper is page, not panel.
+- Sibling panels share one surface. No panel gets a background its
+  siblings lack.
+
+`frontend/e2e/flat-surfaces.spec.ts` pins this for Workspace home and every
+Settings section at 1440×900 and 390×844.
 
 Rules:
 
