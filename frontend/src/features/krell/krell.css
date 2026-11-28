@@ -293,6 +293,64 @@
   color: var(--caution-text);
 }
 
+/* Activity in plain words (M39.6): a reply's ordinary steps behind "N steps". */
+.kbot-krell__card-line {
+  font-weight: 600;
+}
+
+.kbot-krell__card--refused {
+  background: var(--caution-bg);
+  border-color: var(--caution-border);
+}
+
+.kbot-krell__steps {
+  gap: 4px;
+}
+
+.kbot-krell__steps-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+
+.kbot-krell .kbot-krell__steps-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 2px 6px;
+  margin-left: -6px;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.kbot-krell .kbot-krell__steps-toggle:hover {
+  border-color: var(--seafoam);
+}
+
+.kbot-krell__steps-chevron {
+  color: var(--muted);
+}
+
+.kbot-krell__step-list {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--muted);
+}
+
+.kbot-krell__step-list[hidden] {
+  display: none;
+}
+
 .kbot-krell__card-sub {
   margin: 0;
   color: var(--muted);
