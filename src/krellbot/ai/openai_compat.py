@@ -37,6 +37,7 @@ from krellbot.ai.types import (
     TextDelta,
     ToolCall,
     ToolCallDone,
+    ToolChoice,
     ToolDef,
     Usage,
 )
@@ -153,14 +154,16 @@ class OpenAICompatAdapter:
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolDef],
         max_tokens: int,
+        tool_choice: ToolChoice = "auto",
     ) -> Iterator[StreamEvent]:
         usage_box: list[Usage | None] = [None]
         try:
             if self._api == "responses":
-                # No token limit: max_output_tokens is not supported for ChatGPT plan usage.
+                # No token limit: max_output_tokens is not supported for ChatGPT plan usage. No tool_choice
+                # either: the M38.22 record does not list it, so the allow-listed body never carries it.
                 yield from self._responses_stream(model, system, messages, tools, usage_box)
             else:
-                yield from self._stream(model, system, messages, tools, max_tokens, usage_box)
+                yield from self._stream(model, system, messages, tools, max_tokens, tool_choice, usage_box)
         except TransportError as exc:
             if usage_box[0] is not None:
                 yield usage_box[0]
@@ -178,6 +181,7 @@ class OpenAICompatAdapter:
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolDef],
         max_tokens: int,
+        tool_choice: ToolChoice,
         usage_box: list[Usage | None],
     ) -> Iterator[StreamEvent]:
         body: dict[str, Any] = {
@@ -195,6 +199,9 @@ class OpenAICompatAdapter:
                 }
                 for t in tools
             ]
+            if tool_choice == "none":
+                # The tools stay defined, so a history with tool calls stays valid; the model may not call one.
+                body["tool_choice"] = "none"
         headers = {"accept": "text/event-stream", **self._extra}
         if self._credential:
             headers["authorization"] = f"Bearer {self._credential}"
