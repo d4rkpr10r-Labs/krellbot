@@ -93,6 +93,40 @@
   flex-wrap: wrap;
 }
 
+/* The welcome (M39.5): flat on the page, no box. */
+.kbot-krell__welcome {
+  display: grid;
+  gap: var(--space-tight);
+  max-width: 640px;
+}
+
+.kbot-krell__welcome-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.kbot-krell__welcome-copy {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.kbot-krell__welcome-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-tight);
+}
+
+/* Where the conversation goes: small and muted, directly under the composer. */
+.kbot-krell__fineprint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
 .kbot-krell__connect {
   display: grid;
   gap: var(--space-stack);

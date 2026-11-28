@@ -16,6 +16,7 @@ import {
   signOutConnection,
   type AiConnection,
 } from "./aiClient";
+import { useGuidedPrompts, writeGuidedPrompts } from "../onboarding/guidedPromptsPersistence";
 import { AiCapabilityStatus, AiConnectForm } from "./AiConnectForm";
 
 export const CHATGPT_USAGE_URL = "https://chatgpt.com/settings/usage";
@@ -80,6 +81,7 @@ export function AiModelSection(): JSX.Element {
     }
   }
 
+  const guidedPrompts = useGuidedPrompts();
   const list = connections ?? [];
   // An empty list always shows the form, even after Cancel then Remove.
   const showForm = list.length === 0 || adding === true;
@@ -266,6 +268,21 @@ export function AiModelSection(): JSX.Element {
           Add another model
         </button>
       )}
+
+      <label className="kbot-settings__toggle-row">
+        <input
+          type="checkbox"
+          data-testid="settings-guided-prompts"
+          checked={guidedPrompts}
+          onChange={(event) => writeGuidedPrompts(event.target.checked)}
+        />
+        <span className="kbot-settings__toggle-copy">
+          <span className="kbot-settings__toggle-title">Show the welcome, tour offers and tips</span>
+          <span className="kbot-settings__toggle-desc">
+            Turned off when you hit Skip on the Krell tab. Krell and your model stay as they are.
+          </span>
+        </span>
+      </label>
     </section>
   );
 }
