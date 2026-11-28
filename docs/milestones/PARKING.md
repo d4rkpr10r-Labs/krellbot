@@ -68,3 +68,4 @@ One line per item. Nothing here is work until the owner moves it into a mileston
 - `krellbot.__version__` on main is 0.9.7 while v0.9.8 shipped from `release/signal-night-0.9.8`, so merge-queue candidates built from main (for example `be24f76`) report 0.9.7.
 - The Windows installed-preview evidence for `be24f76` records `GET /api/v1/catalogue` → 502; the evidence does not say whether the catalogue was unreachable or its signature was rejected.
 - `StrategyDraftService.validate` sets a clean revision to `validated` whatever its state, so calling the `validate` tool (or the REST validate route) on a `deployed` revision turns it back into `validated`; `draft` (M39.1) avoids this by validating only revisions still in `draft`.
+- The `/api/v1/ai/models` draft path duplicates `ConnectionStore._add`'s endpoint and credential checks and calls the private `_clean_credential`; a shared `validate_draft(preset, base_url, credential)` helper would stop them drifting.
