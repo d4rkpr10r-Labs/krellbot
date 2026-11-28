@@ -96,6 +96,7 @@ import {
   markFirstWinCelebrateShown,
 } from "../features/onboarding/firstWinCelebratePersistence";
 import { WorkspaceSetupTour } from "../features/onboarding/WorkspaceSetupTour";
+import { useGuidedPrompts } from "../features/onboarding/guidedPromptsPersistence";
 import {
   clickPaperArmSubmit,
   prepareStarterRevision,
@@ -912,6 +913,7 @@ export function WorkstationShell({
   );
   const setupTourRef = useRef(setupTour);
   setupTourRef.current = setupTour;
+  const guidedPrompts = useGuidedPrompts();
   const [tourLaunchBusy, setTourLaunchBusy] = useState(false);
   const [tourLaunchError, setTourLaunchError] = useState<string | null>(null);
   const revealTourStep = useCallback(
@@ -1324,7 +1326,7 @@ export function WorkstationShell({
         </div>
       </header>
       <main className="kbot-shell__main" inert={krellModal || undefined}>
-        {active === "krell" ? <KrellView /> : null}
+        {active === "krell" ? <KrellView onTakeTour={replaySetupTour} /> : null}
         {active === "home" ? (
           <AppHome
             onNavigate={setActive}
@@ -1337,7 +1339,7 @@ export function WorkstationShell({
             strategyClient={client}
             armedPaperRuns={armedPaperRuns}
             paperClient={paper}
-            onReplaySetupTour={replaySetupTour}
+            onReplaySetupTour={guidedPrompts ? replaySetupTour : undefined}
             onStarterReady={({ revisionId }) => {
               setPreferredArmRevisionId(revisionId);
               setActive("workstation");

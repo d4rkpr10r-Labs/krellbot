@@ -270,6 +270,12 @@ export function KrellConversation(): JSX.Element {
     if (canSend) krell.send(krell.draft);
   };
   const outcomes = confirmOutcomes(krell.messages);
+  // Where the conversation goes (M39.5): the current disclosure sits under the
+  // composer, always. The first one lives only there; a later one (a changed
+  // model) also stays in the log, ahead of the message it applies to.
+  const notices = krell.messages.filter((item) => item.kind === "notice");
+  const disclosure = notices.length > 0 ? notices[notices.length - 1] : null;
+  const firstNotice = notices.length > 0 ? notices[0].key : null;
   const cards: Cards = {
     outcomes,
     primary: primaryCard(krell.messages, outcomes),
@@ -282,7 +288,7 @@ export function KrellConversation(): JSX.Element {
     <div className="kbot-krell__conversation" data-testid="krell-conversation">
       <div className="kbot-krell__log" ref={logRef} role="log" aria-label="Conversation with Krell">
         <ol className="kbot-krell__list">
-          {groupToolRows(withAvatars(krell.messages)).map((unit) =>
+          {groupToolRows(withAvatars(krell.messages).filter((row) => row.item.key !== firstNotice)).map((unit) =>
             unit.kind === "tools" ? (
               <ToolSteps key={unit.key} steps={unit.steps} />
             ) : (
@@ -328,6 +334,11 @@ export function KrellConversation(): JSX.Element {
           Send
         </button>
       </form>
+      {disclosure && disclosure.kind === "notice" ? (
+        <p className="kbot-krell__fineprint" data-testid="krell-disclosure">
+          {disclosure.text}
+        </p>
+      ) : null}
     </div>
   );
 }
