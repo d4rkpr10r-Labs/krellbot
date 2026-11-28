@@ -368,7 +368,8 @@ describe("Result cards", () => {
     renderTab();
     const card = await screen.findByTestId("krell-item-tool");
     // The name is the model's text: it shows quoted as a name, never as a plain-words outcome.
-    expect(card.textContent).toContain('Ran "Armed on paper"');
+    expect(card.textContent).toContain('Couldn\'t run "Armed on paper"');
+    expect(card.textContent).not.toContain("Ran ");
     expect(within(card).queryByText("Armed on paper")).toBeNull();
     // The outcome is the engine's: a refusal, never "Armed".
     expect(card.querySelector(".kbot-krell__card-outcome")?.textContent).toBe("Refused");
@@ -429,6 +430,57 @@ describe("Activity in plain words", () => {
     expect(card.textContent).toContain("no cached candles for this venue, pair and timeframe");
     expect(card.textContent).toContain("market_snapshot_not_found");
     expect(card.querySelector(".kbot-krell__card-outcome")?.textContent).toBe("Refused");
+  });
+
+  const NOT_FOUND = {
+    ok: false,
+    effect: "refused",
+    code: "market_snapshot_not_found",
+    message: "no cached candles for this venue, pair and timeframe",
+    labels: [],
+  };
+
+  it("names the market a refused call asked for, from the call's own arguments", async () => {
+    installFetch(() =>
+      jsonResponse(
+        conversation([
+          ...greeted(),
+          stored("assistant", {
+            text: "",
+            tool_calls: [
+              { id: "call_a", name: "market_snapshot", arguments: { venue: "kraken", pair: "BTC/USD", timeframe: "4h" } },
+              { id: "call_b", name: "market_snapshot", arguments: { venue: "kraken" } },
+            ],
+          }),
+          stored("tool", { tool_call_id: "call_a", name: "market_snapshot", result: { tool: "market_snapshot", ...NOT_FOUND } }),
+          stored("tool", { tool_call_id: "call_b", name: "market_snapshot", result: { tool: "market_snapshot", ...NOT_FOUND } }),
+        ]),
+      ),
+    );
+    renderTab();
+    await screen.findAllByTestId("krell-item-tool");
+    const rows = screen.getAllByTestId("krell-item-tool");
+    expect(rows[0].textContent).toContain("No price data for BTC/USD 4h yet");
+    expect(rows[1].textContent).toContain("No price data for that market yet");
+    expect(rows[1].textContent).not.toContain("BTC/USD");
+  });
+
+  it("names the market of a streamed refusal from the call's start event", async () => {
+    installFetch((call) => {
+      if (call.path === "/api/v1/krell/messages") {
+        return sseResponse([
+          { type: "tool_start", id: "call_s", name: "market_snapshot", arguments: { pair: "ETH/USD", timeframe: "1h" } },
+          { type: "tool_result", id: "call_s", name: "market_snapshot", result: { tool: "market_snapshot", ...NOT_FOUND } },
+          { type: "message_done", text: "No data." },
+          { type: "done" },
+        ]);
+      }
+      return jsonResponse(conversation(greeted()));
+    });
+    renderTab();
+    await send("Show ETH");
+    await screen.findByText("No data.");
+    expect(screen.getByTestId("krell-item-tool").textContent).toContain("No price data for ETH/USD 1h yet");
   });
 
   it("collapses a reply's steps into 'N steps' that expands to one plain line each", async () => {

@@ -11,6 +11,9 @@
  */
 import type { KrellToolResult } from "./client";
 
+/** The pair and timeframe a call itself sent; only these are ever read from its arguments. */
+export type AskedMarket = { pair?: string; timeframe?: string };
+
 type Phrase = {
   /** What the call is doing, lower case: "saving your profile". */
   doing: string;
@@ -230,14 +233,20 @@ const PHRASES = new Map<string, Phrase>([
 ]);
 
 /** Refusal codes with a plainer headline than their tool's. */
-const REFUSAL_LINES = new Map([
-  ["market_snapshot_not_found", "No price data for that market yet"],
-  ["explain_bar_not_found", "No decision stored for that bar"],
-  ["tour_step_not_found", "No such tour step"],
-  ["agent_live_read_refused", "Live markets stay out of Krell's sight"],
-  ["agent_live_change_refused", "Krell only changes paper strategies"],
-  ["mcp_live_arm_refused", "Krell can't arm anything live"],
-  ["user_policy_denied", "Your Agents & limits settings don't allow that"],
+const REFUSAL_LINES = new Map<string, (asked?: AskedMarket) => string>([
+  [
+    "market_snapshot_not_found",
+    (asked) => {
+      const market = [asked?.pair, asked?.timeframe].filter(Boolean).join(" ");
+      return market ? `No price data for ${market} yet` : "No price data for that market yet";
+    },
+  ],
+  ["explain_bar_not_found", () => "No decision stored for that bar"],
+  ["tour_step_not_found", () => "No such tour step"],
+  ["agent_live_read_refused", () => "Live markets stay out of Krell's sight"],
+  ["agent_live_change_refused", () => "Krell only changes paper strategies"],
+  ["mcp_live_arm_refused", () => "Krell can't arm anything live"],
+  ["user_policy_denied", () => "Your Agents & limits settings don't allow that"],
 ]);
 
 /** The engine's own tool name from a result, else the name Krell's call showed. */
@@ -261,11 +270,11 @@ export function doneLine(name: string, result: KrellToolResult): string {
   return phrase ? phrase.done(result) : `Ran ${quoted(name)}`;
 }
 
-/** The headline of a refused or failed call. The engine's message and code follow it. */
-export function refusalLine(name: string, result: KrellToolResult): string {
+/** The headline of a refused or failed call, naming the market the call asked for when it sent one. The engine's message and code follow it. */
+export function refusalLine(name: string, result: KrellToolResult, asked?: AskedMarket): string {
   const phrase = phraseOf(name, result);
-  if (!phrase) return `Ran ${quoted(name)}`;
-  return REFUSAL_LINES.get(str(result.code)) ?? phrase.refused;
+  if (!phrase) return `Couldn't run ${quoted(name)}`;
+  return REFUSAL_LINES.get(str(result.code))?.(asked) ?? phrase.refused;
 }
 
 /** The line for a call that needs the person's confirm before it runs. */

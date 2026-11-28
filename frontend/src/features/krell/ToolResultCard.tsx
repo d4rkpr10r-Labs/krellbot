@@ -17,7 +17,7 @@ import { useId, useState, type JSX } from "react";
 import type { KrellToolResult } from "./client";
 import { UNCLEAR_OUTCOME } from "./ConfirmCard";
 import type { KrellItem } from "./KrellConversationProvider";
-import { attemptLine, confirmLine, doneLine, refusalLine, runningLine } from "./toolPhrases";
+import { attemptLine, confirmLine, doneLine, refusalLine, runningLine, type AskedMarket } from "./toolPhrases";
 
 const LABELS = new Map([
   ["simulated", "Simulated"],
@@ -38,6 +38,8 @@ export type ToolStep = {
   result: KrellToolResult | null;
   /** The stream that started this call has ended: with no result, it is unclear whether it ran. */
   ended?: boolean;
+  /** The pair and timeframe the call sent, if any. */
+  asked?: AskedMarket;
 };
 
 type Kind = "step" | "armed" | "confirm" | "refused" | "running" | "unclear";
@@ -82,10 +84,12 @@ export type ToolResultCardProps = {
   result: KrellToolResult | null;
   /** The stream that started this call has ended: with no result, it is unclear whether it ran. */
   ended?: boolean;
+  /** The pair and timeframe the call sent, if any. */
+  asked?: AskedMarket;
 };
 
 /** One call as a card of its own. */
-export function ToolResultCard({ name, result, ended = false }: ToolResultCardProps): JSX.Element {
+export function ToolResultCard({ name, result, ended = false, asked }: ToolResultCardProps): JSX.Element {
   const kind = kindOf({ key: "", name, result, ended });
   const labels = labelsOf([result]);
   if (kind === "armed") {
@@ -134,7 +138,7 @@ export function ToolResultCard({ name, result, ended = false }: ToolResultCardPr
     return (
       <div className="kbot-krell__card kbot-krell__card--refused">
         <p className="kbot-krell__card-head">
-          <span className="kbot-krell__card-line">{refusalLine(name, result)}</span>
+          <span className="kbot-krell__card-line">{refusalLine(name, result, asked)}</span>
           <span className="kbot-krell__sr">, outcome: </span>
           <span className="kbot-krell__card-outcome">{result.effect === "refused" ? "Refused" : "Did not complete"}</span>
         </p>
@@ -214,7 +218,7 @@ export function ToolSteps({ steps }: { steps: ToolStep[] }): JSX.Element {
     flush();
     rows.push(
       <li key={step.key} className="kbot-krell__card-row" data-testid="krell-item-tool">
-        <ToolResultCard name={step.name} result={step.result} ended={step.ended} />
+        <ToolResultCard name={step.name} result={step.result} ended={step.ended} asked={step.asked} />
       </li>,
     );
   }
@@ -223,7 +227,8 @@ export function ToolSteps({ steps }: { steps: ToolStep[] }): JSX.Element {
 }
 
 /** The log's rows with each run of consecutive tool calls folded into one unit. */
-export type LogUnit<T> = { kind: "row"; row: T } | { kind: "tools"; key: string; steps: ToolStep[] };
+export type NonToolItem = Exclude<KrellItem, { kind: "tool" }>;
+export type LogUnit<T> = { kind: "row"; row: T & { item: NonToolItem } } | { kind: "tools"; key: string; steps: ToolStep[] };
 
 /** A reply's consecutive tool calls become one unit; any other item (Krell's text, a card) ends the run. */
 export function groupToolRows<T extends { item: KrellItem }>(rows: T[]): Array<LogUnit<T>> {
@@ -231,10 +236,10 @@ export function groupToolRows<T extends { item: KrellItem }>(rows: T[]): Array<L
   for (const row of rows) {
     const { item } = row;
     if (item.kind !== "tool") {
-      units.push({ kind: "row", row });
+      units.push({ kind: "row", row: { ...row, item } });
       continue;
     }
-    const step: ToolStep = { key: item.key, name: item.name, result: item.result, ended: item.ended };
+    const step: ToolStep = { key: item.key, name: item.name, result: item.result, ended: item.ended, asked: item.asked };
     const last = units[units.length - 1];
     if (last?.kind === "tools") last.steps.push(step);
     else units.push({ kind: "tools", key: item.key, steps: [step] });

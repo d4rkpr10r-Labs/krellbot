@@ -29,7 +29,7 @@ import { BudgetMeter } from "./BudgetMeter";
 import { MODE_REPLIES, type KrellDecision, type KrellMode } from "./client";
 import { ConfirmCard, confirmOutcomes, isPressable, type ConfirmOutcome } from "./ConfirmCard";
 import { useKrell, type KrellItem } from "./KrellConversationProvider";
-import { groupToolRows, ToolSteps } from "./ToolResultCard";
+import { groupToolRows, ToolSteps, type NonToolItem } from "./ToolResultCard";
 import "./krell.css";
 
 /** The engine's limit on one message (`MAX_MESSAGE_CHARS`). */
@@ -151,7 +151,7 @@ function withAvatars(items: KrellItem[]): Row[] {
   });
 }
 
-function KrellRow({ item, avatar, cards }: Row & { cards: Cards }): JSX.Element {
+function KrellRow({ item, avatar, cards }: { item: NonToolItem; avatar: boolean; cards: Cards }): JSX.Element {
   switch (item.kind) {
     case "user":
       return (
@@ -204,8 +204,6 @@ function KrellRow({ item, avatar, cards }: Row & { cards: Cards }): JSX.Element 
           ) : null}
         </li>
       );
-    case "tool":
-      return <ToolSteps steps={[item]} />;
     case "confirm":
       return (
         <li className="kbot-krell__card-row" data-testid="krell-item-confirm">
