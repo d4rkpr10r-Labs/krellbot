@@ -5115,6 +5115,7 @@ def create_app(
 
         from krellbot.ai.connections import ConnectionRefused, is_chatgpt, is_connection_id
         from krellbot.ai.http import UrllibTransport
+        from krellbot.ai.models import forget_connection
 
         s = _state(request.app)
         denied = _gate_state_change(request, s)
@@ -5131,6 +5132,7 @@ def create_app(
                 result = await asyncio.to_thread(
                     remove_chatgpt_connection, store, conn, transport=s.ai_transport or UrllibTransport()
                 )
+                forget_connection(s.home, conn_id)
                 body = {"ok": True, "effect": "changed", "removed": conn_id, "revocation": result.revocation}
                 if result.message:
                     body["detail"] = result.message
@@ -5138,6 +5140,7 @@ def create_app(
             await asyncio.to_thread(store.remove, conn_id)
         except ConnectionRefused as exc:
             return _ai_refused(exc)
+        forget_connection(s.home, conn_id)
         return _ai_json({"ok": True, "effect": "changed", "removed": conn_id})
 
     @app.post("/api/v1/ai/connections/{conn_id}/signout")

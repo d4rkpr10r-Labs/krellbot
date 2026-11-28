@@ -359,13 +359,18 @@ def test_the_listing_route_fills_the_cache_for_its_connection(home, fresh_keyrin
     assert len(transport.get_requests) == 1
 
 
-def test_context_window_is_none_when_the_listing_fails_and_is_retried_next_time(home, fresh_keyring):
+def test_context_window_is_none_when_the_listing_fails_and_is_retried_after_the_backoff(
+    home, fresh_keyring, monkeypatch
+):
+    now = [0.0]
+    monkeypatch.setattr(ai_models, "_monotonic", lambda: now[0])
     store = _store(home)
     conn = store.add("openrouter", model="x/y", credential=STORED_KEY)
     transport = FakeAiTransport(
         json_responses=[TransportError(None, "down"), {"data": [{"id": "vendor/big", "context_length": 4096}]}]
     )
     assert context_window(home, conn.id, "vendor/big", store=store, transport=transport) is None
+    now[0] += ai_models._RETRY_AFTER + 1
     assert context_window(home, conn.id, "vendor/big", store=store, transport=transport) == 4096
     assert context_window(home, "0123456789abcdef", "m", store=store, transport=FakeAiTransport()) is None
 
@@ -377,3 +382,70 @@ def test_context_window_remembers_that_an_endpoint_has_no_list(home, fresh_keyri
     assert context_window(home, conn.id, "m", store=store, transport=transport) is None
     assert context_window(home, conn.id, "m", store=store, transport=transport) is None
     assert len(transport.get_requests) == 1
+
+
+# ---- fix round 1 -----------------------------------------------------------------------------------
+
+
+def test_a_stored_connection_whose_preset_never_lists_makes_no_request_or_keychain_read(home, fresh_keyring):
+    store = _store(home)
+    conn = store.add("custom_anthropic", model="m", credential=STORED_KEY, base_url="https://gateway.example.com")
+    transport = FakeAiTransport()
+    body = Client(home, transport).json("POST", "/api/v1/ai/models", {"connection_id": conn.id})
+    assert body["models"] == [] and body["listed"] is False and body["reason"] == "no_model_list"
+    assert transport.get_requests == []
+
+
+@pytest.mark.parametrize("status", [401, 403, 400])
+def test_context_window_fetches_a_refused_listing_once(home, fresh_keyring, status):
+    store = _store(home)
+    conn = store.add("openrouter", model="x/y", credential=STORED_KEY)
+    transport = FakeAiTransport(json_responses=[TransportError(status, "no")])
+    for _ in range(3):
+        assert context_window(home, conn.id, "m", store=store, transport=transport) is None
+    assert len(transport.get_requests) == 1
+
+
+@pytest.mark.parametrize("failure", [TransportError(503, ""), TransportError(None, "down"), TransportError(429, "")])
+def test_context_window_retries_transient_failures_only_after_the_backoff(home, fresh_keyring, monkeypatch, failure):
+    now = [1000.0]
+    monkeypatch.setattr(ai_models, "_monotonic", lambda: now[0])
+    store = _store(home)
+    conn = store.add("openrouter", model="x/y", credential=STORED_KEY)
+    transport = FakeAiTransport(json_responses=[failure, {"data": [{"id": "m", "context_length": 9000}]}])
+    assert context_window(home, conn.id, "m", store=store, transport=transport) is None
+    now[0] += 299
+    assert context_window(home, conn.id, "m", store=store, transport=transport) is None
+    assert len(transport.get_requests) == 1
+    now[0] += 2
+    assert context_window(home, conn.id, "m", store=store, transport=transport) == 9000
+    assert len(transport.get_requests) == 2
+
+
+def test_models_shaped_body_is_a_model_list_only_for_chatgpt(home, fresh_keyring):
+    plan_shape = {"models": [{"slug": "gpt-plan-a", "visibility": "list"}]}
+    transport = FakeAiTransport(json_responses=[plan_shape])
+    body = Client(home, transport).json(
+        "POST", "/api/v1/ai/models", {"preset": "custom_openai", "base_url": "https://llm.example.com/v1"}
+    )
+    assert body["models"] == [] and body["listed"] is False and body["reason"] == "no_model_list"
+
+
+def test_anthropic_pagination_stops_at_the_model_cap(home, fresh_keyring, monkeypatch):
+    monkeypatch.setattr(ai_models, "_MAX_MODELS", 3)
+    pages = [{"data": [{"id": f"m{n}a"}, {"id": f"m{n}b"}], "has_more": True, "last_id": f"m{n}b"} for n in range(5)]
+    transport = FakeAiTransport(json_responses=pages)
+    body = Client(home, transport).json("POST", "/api/v1/ai/models", {"preset": "anthropic", "api_key": DRAFT_KEY})
+    assert len(transport.get_requests) == 2
+    assert len(body["models"]) == 3
+
+
+def test_removing_a_connection_evicts_its_cached_context_windows(home, fresh_keyring):
+    store = _store(home)
+    conn = store.add("openrouter", model="x/y", credential=STORED_KEY)
+    transport = FakeAiTransport(json_responses=[{"data": [{"id": "m", "context_length": 5}]}])
+    client = Client(home, transport)
+    client.json("POST", "/api/v1/ai/models", {"connection_id": conn.id})
+    assert ai_models._cache[(str(home), conn.id)] == {"m": 5}
+    client.json("DELETE", f"/api/v1/ai/connections/{conn.id}")
+    assert (str(home), conn.id) not in ai_models._cache
