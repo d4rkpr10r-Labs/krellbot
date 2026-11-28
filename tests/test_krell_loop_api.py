@@ -7,8 +7,9 @@ confirm ticket id and can never pass a confirm token. What the workstation
 shows as fact comes from tool results and from the engine, never from the
 model's prose: the egress disclosure and the opening line are emitted
 deterministically, without a provider call. Tool results go back to the
-model wrapped as data. A turn stops at 8 tool calls, an exhausted token
-budget stops before any provider call, and provider errors are typed.
+model wrapped as data. A turn allows 24 tool calls and then ends with
+Krell's own summary, an exhausted token budget stops before any provider
+call, and provider errors are typed.
 
 Fakes only: ``FakeKeyring`` and a scripted ``FakeAiTransport`` model (no
 socket). Every candle is synthetic and every paper arm is simulated.
@@ -722,38 +723,61 @@ def test_a_live_strategy_pause_is_refused_without_a_confirm_card(home, live_capa
 # ---- hard stops ------------------------------------------------------------------------
 
 
-def test_tool_calls_stop_at_eight_per_turn(home):
+def test_a_turn_runs_24_tool_calls_then_krell_sums_up_and_offers_keep_going(home):
     _connect(home)
-    model = ScriptedModel([reply_tools(("tour_step", {})) for _ in range(9)])
+    cap = krell_loop.MAX_TOOL_CALLS_PER_TURN
+    assert cap == 24
+    summary = "I walked you through the tour steps. Nothing is left but the questions. Keep going?"
+    model = ScriptedModel([reply_tools(("tour_step", {})) for _ in range(cap + 1)] + [reply_text(summary)])
     client = Client(home, model)
 
     events = client.stream("/api/v1/krell/messages", {"text": "Show me every step, one by one."})
 
-    assert len(_of(events, "tool_start")) == 8
-    assert len(_of(events, "tool_result")) == 8
-    error = _error(events)
-    assert error["code"] == krell_loop.CODE_TOOL_CAP == "agent_tool_cap_reached"
-    assert _types(events)[-2:] == ["error", "done"]
-    assert model.calls == 9
-    # Eight ran through the core; the ninth, refused by the loop, is journaled too, with no params.
+    # 24 ran; the 25th is refused by the loop, and the person sees that card too.
+    results = [e["result"] for e in _of(events, "tool_result")]
+    assert len(_of(events, "tool_start")) == len(results) == cap + 1
+    assert [r["ok"] for r in results[:cap]] == [True] * cap
+    assert results[cap]["effect"] == "refused"
+    assert results[cap]["code"] == krell_loop.CODE_TOOL_CAP == "agent_tool_cap_reached"
+    # One last provider call, with no tools, writes Krell's own summary, and it streams like any reply.
+    assert model.calls == cap + 2
+    assert "tools" in model.bodies[cap]
+    last = model.bodies[cap + 1]
+    assert "tools" not in last
+    assert krell_loop.NOTE_TOOL_BUDGET_USED in _system(last)
+    assert _text(events) == summary
+    assert _of(events, "error") == []
+    # Then a Keep going quick reply, and the stream ends.
+    assert _of(events, "quick_replies") == [{"type": "quick_replies", "quick_replies": ["Keep going"]}]
+    assert _types(events)[-3:] == ["message_done", "quick_replies", "done"]
+    # 24 ran through the core; the 25th, refused by the loop, is journaled too, with no params.
     rows = _agent_rows(home)
-    assert [(r["tool"], r["outcome"]) for r in rows[:8]] == [("tour_step", "ok")] * 8
-    assert (rows[8]["tool"], rows[8]["outcome"], rows[8]["code"], rows[8]["params"]) == (
+    assert [(r["tool"], r["outcome"]) for r in rows[:cap]] == [("tour_step", "ok")] * cap
+    assert (rows[cap]["tool"], rows[cap]["outcome"], rows[cap]["code"], rows[cap]["params"]) == (
         "tour_step",
         "refused",
         krell_loop.CODE_TOOL_CAP,
         {},
     )
-    assert len(rows) == 9
+    assert len(rows) == cap + 1
+    stored = client.json("GET", "/api/v1/krell/conversation")["messages"]
+    assert (stored[-1]["role"], stored[-1]["payload"]["text"]) == ("assistant", summary)
 
-    # The refused ninth call is answered in history, so the next request stays well formed.
-    model.then(reply_text("Stopping there."))
-    client.stream("/api/v1/krell/messages", {"text": "OK."})
-    messages = model.bodies[9]["messages"]
+    # Keep going is an ordinary message. Every call, the refused 25th too, is answered in history,
+    # so the next request stays well formed; the summary's note was for that call only.
+    model.then(reply_text("Carrying on."))
+    events = client.stream("/api/v1/krell/messages", {"text": "Keep going"})
+    assert _text(events) == "Carrying on."
+    body = model.bodies[cap + 2]
+    messages = body["messages"]
+    assert messages[-1] == {"role": "user", "content": "Keep going"}
     called = [c["id"] for m in messages if m["role"] == "assistant" for c in m.get("tool_calls") or []]
     answered = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
-    assert called == answered and len(called) == 9
+    assert called == answered and len(called) == cap + 1
     assert krell_loop.CODE_TOOL_CAP in [m for m in messages if m["role"] == "tool"][-1]["content"]
+    assert {"role": "assistant", "content": summary} in messages
+    assert "tools" in body
+    assert krell_loop.NOTE_TOOL_BUDGET_USED not in _system(body)
 
 
 def test_exhausted_budget_stops_before_any_provider_call(home):

@@ -14,6 +14,13 @@
  * The opening's Standard and Advanced quick replies (M38.18) show only while
  * no mode is set.
  *
+ * When a turn uses up its tool budget (M39.3), the engine refuses the calls
+ * over it (`agent_tool_cap_reached`, shown as their cards), Krell sums up in
+ * her own words and the engine offers Keep going. The quick reply shows while
+ * that summary is the latest thing in the log, live or after a reload, and
+ * sends "Keep going" as an ordinary message; the composer keeps its draft.
+ * When the turn ends on the cap error instead, there is no Keep going.
+ *
  * On a Sign in with ChatGPT connection (M38.23) "Using ChatGPT plan" sits
  * near the composer with a Manage usage link to ChatGPT settings. When the
  * latest turn on that connection ended on a ChatGPT usage limit, Krell is
@@ -96,21 +103,55 @@ function ChatgptPlan({ paused, resume }: { paused: boolean; resume(): void }): J
 
 const MODES: readonly KrellMode[] = ["standard", "advanced"];
 
+/** The quick reply after Krell's summary at the tool budget (the engine's `KEEP_GOING`). */
+const KEEP_GOING = "Keep going";
+/** The engine's code for a call refused over the turn's tool budget. */
+const CODE_TOOL_CAP = "agent_tool_cap_reached";
+
 /** The opening, with its mode question, is in the log. */
 function modeAsked(items: KrellItem[]): boolean {
   return items.some((item) => item.kind === "krell" && Boolean(item.question));
 }
 
 /**
- * Standard and Advanced, answering the mode question. Secondary buttons, so
- * an open confirm card's Confirm stays the conversation's one sage primary.
+ * The latest turn used up its tool budget and ended with Krell's summary: her
+ * message is the last item, and the item before her run of messages is a call
+ * refused over the budget. A cap error after it, or the person's next message,
+ * means there is nothing to keep going from.
  */
-function ModeQuickReplies({ busy, choose }: { busy: boolean; choose(mode: KrellMode): void }): JSX.Element {
+function keepGoingOffered(items: KrellItem[]): boolean {
+  const last = items[items.length - 1];
+  if (last?.kind !== "krell" || last.streaming) return false;
+  for (let i = items.length - 2; i >= 0; i -= 1) {
+    const item = items[i];
+    if (item.kind === "krell") continue;
+    return item.kind === "tool" && item.result?.code === CODE_TOOL_CAP;
+  }
+  return false;
+}
+
+type QuickReply = { label: string; choose(): void };
+
+/**
+ * Quick replies above the composer. Secondary buttons, so an open confirm
+ * card's Confirm stays the conversation's one sage primary.
+ */
+function QuickReplies({
+  name,
+  testId,
+  replies,
+  busy,
+}: {
+  name: string;
+  testId: string;
+  replies: readonly QuickReply[];
+  busy: boolean;
+}): JSX.Element {
   return (
-    <div className="kbot-krell__replies" role="group" aria-label="Choose a mode" data-testid="krell-quick-replies">
-      {MODES.map((mode) => (
-        <button key={mode} type="button" className="kbot-krell__btn" disabled={busy} onClick={() => choose(mode)}>
-          {MODE_REPLIES[mode]}
+    <div className="kbot-krell__replies" role="group" aria-label={name} data-testid={testId}>
+      {replies.map((reply) => (
+        <button key={reply.label} type="button" className="kbot-krell__btn" disabled={busy} onClick={reply.choose}>
+          {reply.label}
         </button>
       ))}
     </div>
@@ -275,6 +316,12 @@ export function KrellConversation(): JSX.Element {
     event?.preventDefault();
     if (canSend) krell.send(krell.draft);
   };
+  // Keep going is an ordinary message. Sending clears the composer, so what the person was typing goes back.
+  const keepGoing = (): void => {
+    const draft = krell.draft;
+    krell.send(KEEP_GOING);
+    if (draft) krell.setDraft(draft);
+  };
   const outcomes = confirmOutcomes(krell.messages);
   const cards: Cards = {
     outcomes,
@@ -300,7 +347,20 @@ export function KrellConversation(): JSX.Element {
         </p>
       ) : null}
       {krell.mode === null && modeAsked(krell.messages) ? (
-        <ModeQuickReplies busy={krell.pending || paused} choose={krell.setMode} />
+        <QuickReplies
+          name="Choose a mode"
+          testId="krell-quick-replies"
+          busy={krell.pending || paused}
+          replies={MODES.map((mode) => ({ label: MODE_REPLIES[mode], choose: () => krell.setMode(mode) }))}
+        />
+      ) : null}
+      {keepGoingOffered(krell.messages) ? (
+        <QuickReplies
+          name="Carry on"
+          testId="krell-keep-going"
+          busy={krell.pending || paused}
+          replies={[{ label: KEEP_GOING, choose: keepGoing }]}
+        />
       ) : null}
       {krell.connection?.plan === "chatgpt" ? (
         <ChatgptPlan paused={paused} resume={() => limit !== null && krell.resumeAfterLimit(limit)} />
