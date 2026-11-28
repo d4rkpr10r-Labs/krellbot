@@ -739,11 +739,12 @@ def test_a_turn_runs_24_tool_calls_then_krell_sums_up_and_offers_keep_going(home
     assert [r["ok"] for r in results[:cap]] == [True] * cap
     assert results[cap]["effect"] == "refused"
     assert results[cap]["code"] == krell_loop.CODE_TOOL_CAP == "agent_tool_cap_reached"
-    # One last provider call, with no tools, writes Krell's own summary, and it streams like any reply.
+    # One last provider call, which forbids tool calls, writes Krell's own summary; it streams like any reply.
     assert model.calls == cap + 2
-    assert "tools" in model.bodies[cap]
+    assert "tools" in model.bodies[cap] and "tool_choice" not in model.bodies[cap]
     last = model.bodies[cap + 1]
-    assert "tools" not in last
+    assert last["tools"] == model.bodies[cap]["tools"]
+    assert last["tool_choice"] == "none"
     assert krell_loop.NOTE_TOOL_BUDGET_USED in _system(last)
     assert _text(events) == summary
     assert _of(events, "error") == []
@@ -776,7 +777,7 @@ def test_a_turn_runs_24_tool_calls_then_krell_sums_up_and_offers_keep_going(home
     assert called == answered and len(called) == cap + 1
     assert krell_loop.CODE_TOOL_CAP in [m for m in messages if m["role"] == "tool"][-1]["content"]
     assert {"role": "assistant", "content": summary} in messages
-    assert "tools" in body
+    assert "tools" in body and "tool_choice" not in body
     assert krell_loop.NOTE_TOOL_BUDGET_USED not in _system(body)
 
 

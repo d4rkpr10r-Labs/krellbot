@@ -41,11 +41,14 @@ tool calls. A call whose tool and arguments match one refused earlier in the
 same turn is not sent again (``agent_repeat_refused``, quoting the first
 refusal), and it counts toward the budget. Calls over the budget are refused
 (``agent_tool_cap_reached``) and answered in history; then one last provider
-call with no tools lets Krell sum up in her own words, followed by a
-``quick_replies`` event offering :data:`KEEP_GOING`, which the person sends
-as an ordinary message. If the token budget is spent, or that call fails,
-answers with no text, or still asks for tools (none run), the turn ends with
-the ``agent_tool_cap_reached`` error instead.
+call that forbids tool calls (``tool_choice`` none, with the tools still
+defined so the history's tool calls stay a valid request) lets Krell sum up
+in her own words, followed by a ``quick_replies`` event offering
+:data:`KEEP_GOING`, which the person sends as an ordinary message. If the
+token budget is spent, or that call fails, answers with no text, or still
+asks for tools (none run), the turn ends with the ``agent_tool_cap_reached``
+error instead, keeping a failed call's provider diagnostics; a ChatGPT usage
+limit ends it as ``provider_usage_limit``, so Krell pauses as on any call.
 
 Hard stops: the token budget
 (:func:`krellbot.agent.budget.check` against the operator's agent limits) is
@@ -83,7 +86,17 @@ from krellbot.ai.connections import Connection, ConnectionRefused, ConnectionSto
 from krellbot.ai.disclosure import egress_disclosure
 from krellbot.ai.http import HttpTransport
 from krellbot.ai.oauth import chatgpt_plan_in_use
-from krellbot.ai.types import ChatAdapter, ChatMessage, ProviderError, TextDelta, ToolCall, ToolCallDone, ToolDef, Usage
+from krellbot.ai.types import (
+    ChatAdapter,
+    ChatMessage,
+    ProviderError,
+    TextDelta,
+    ToolCall,
+    ToolCallDone,
+    ToolChoice,
+    ToolDef,
+    Usage,
+)
 from krellbot.application import user_policy
 
 _LOG = logging.getLogger(__name__)
@@ -153,6 +166,9 @@ MESSAGES: dict[str, str] = {
     CODE_CONFIRM_UNKNOWN: MESSAGE_CONFIRM_UNKNOWN,
 }
 
+# A ChatGPT plan usage limit (M38.23): the workstation pauses Krell on this code.
+CODE_USAGE_LIMIT = "provider_usage_limit"
+
 PROVIDER_MESSAGES: dict[str, str] = {
     "provider_auth_failed": (
         "The provider rejected this model's credential. Reconnect the model in Settings; the conversation is kept."
@@ -161,7 +177,7 @@ PROVIDER_MESSAGES: dict[str, str] = {
     "provider_unavailable": "The provider could not be reached. Send the message again later.",
     "provider_bad_response": "The provider sent a reply Krellbot could not use, so nothing ran. Send the message again.",
     # ChatGPT plan usage (M38.23): these stop the turn; nothing is retried or billed another way.
-    "provider_usage_limit": (
+    CODE_USAGE_LIMIT: (
         "You reached a ChatGPT usage limit, for your plan or for Krellbot, so Krell paused. "
         "Use Manage usage to review the limit in ChatGPT settings."
     ),
@@ -192,7 +208,7 @@ NOTE_AWAITING_HUMAN = (
     "workstation, which shows them the exact action. Do not call it again; Krellbot will tell you what they chose."
 )
 NOTE_TOOL_BUDGET_USED = (
-    "This turn's tool budget is used up, so no tools are offered for this reply. "
+    "This turn's tool budget is used up, so do not call any tool in this reply. "
     "Briefly sum up what you did and what is left, then ask whether to keep going."
 )
 
@@ -850,6 +866,7 @@ class KrellLoop:
         *,
         system: str,
         tools: tuple[ToolDef, ...],
+        tool_choice: ToolChoice = "auto",
     ) -> Generator[dict, None, tuple[str, list[ToolCall], ProviderError | None]]:
         """One provider call: text and usage stream out as they arrive; returns the text, tool calls and failure."""
         texts: list[str] = []
@@ -861,6 +878,7 @@ class KrellLoop:
             messages=_provider_messages(history, ids),
             tools=tools,
             max_tokens=MAX_TOKENS,
+            tool_choice=tool_choice,
         )
         for event in stream:
             if isinstance(event, TextDelta):
@@ -876,15 +894,22 @@ class KrellLoop:
         return "".join(texts), calls, failure
 
     def _sum_up(self, model: _Model) -> Iterator[dict]:
-        """At the tool budget: one last provider call, with no tools, so Krell sums up in her own words.
+        """At the tool budget: one last provider call that forbids tool calls, so Krell sums up in her own words.
 
-        The token budget gates it like any provider call, and the budget note
-        is added to this call's system prompt only, never stored. The summary
+        The tools stay defined, with ``tool_choice`` none: a provider may refuse
+        a history of tool calls and results when no tools are defined. The
+        token budget gates the call like any other, and the budget note is
+        added to this call's system prompt only, never stored. The summary
         streams like any reply, then the ``quick_replies`` event offers
-        :data:`KEEP_GOING`. If the budget is spent, or the call fails,
-        answers with no text, or still asks for tools, the turn ends with the
-        ``agent_tool_cap_reached`` error, as it did before: the tool calls
-        run nothing and are answered like calls over the budget.
+        :data:`KEEP_GOING`.
+
+        Otherwise the turn ends with the ``agent_tool_cap_reached`` error, as
+        it did before: when the budget is spent, the call fails, it answers
+        with no text, or it still asks for tools (they run nothing and are
+        answered like calls over the budget). A failed call is logged by its
+        code and keeps its provider diagnostics in the stored notice; a
+        ChatGPT usage limit ends the turn as ``provider_usage_limit``, so the
+        workstation pauses Krell as it does after any call.
         """
         if self._budget_state().exhausted:
             yield from self._fail(CODE_TOOL_CAP, MESSAGES[CODE_TOOL_CAP])
@@ -893,21 +918,34 @@ class KrellLoop:
         ids = _ticket_ids(history)
         system = self._system(self._store.profile(), history, tools_enabled=model.tools_enabled)
         text, calls, failure = yield from self._ask(
-            model, history, ids, system=f"{system}\n\n{NOTE_TOOL_BUDGET_USED}", tools=()
+            model, history, ids, system=f"{system}\n\n{NOTE_TOOL_BUDGET_USED}", tools=model.tools, tool_choice="none"
         )
-        if failure is None and text.strip() and not calls:
-            self._store.append("assistant", {"text": text, "tool_calls": []})
-            yield {"type": "message_done", "text": text}
-            yield {"type": "quick_replies", "quick_replies": [KEEP_GOING]}
+        if failure is not None:
+            # The code only: a provider's text could carry its body or a credential.
+            _LOG.warning("Krell summary call failed: %s", failure.code)
+            if text:
+                self._store.append("assistant", {"text": text})
+            diagnostics = _provider_diagnostics(failure)
+            if failure.code == CODE_USAGE_LIMIT:
+                yield from self._fail(CODE_USAGE_LIMIT, PROVIDER_MESSAGES[CODE_USAGE_LIMIT], **diagnostics)
+            else:
+                yield from self._fail(CODE_TOOL_CAP, MESSAGES[CODE_TOOL_CAP], **diagnostics)
             return
         if calls:
             self._store.append("assistant", {"text": text, "tool_calls": [_call_record(c) for c in calls]})
             yield {"type": "message_done", "text": text}
             for call in calls:
                 yield from self._refuse_over_budget(call, ids)
-        elif text:
-            self._store.append("assistant", {"text": text})
-        yield from self._fail(CODE_TOOL_CAP, MESSAGES[CODE_TOOL_CAP])
+            yield from self._fail(CODE_TOOL_CAP, MESSAGES[CODE_TOOL_CAP])
+            return
+        if not text.strip():
+            if text:
+                self._store.append("assistant", {"text": text})
+            yield from self._fail(CODE_TOOL_CAP, MESSAGES[CODE_TOOL_CAP])
+            return
+        self._store.append("assistant", {"text": text, "tool_calls": []})
+        yield {"type": "message_done", "text": text}
+        yield {"type": "quick_replies", "quick_replies": [KEEP_GOING]}
 
     def _refuse_over_budget(self, call: ToolCall, ids: set[str]) -> Iterator[dict]:
         """A call over the turn's tool budget: never run, journaled with no params, answered in history, shown."""
@@ -1219,6 +1257,7 @@ __all__ = [
     "CODE_STORE_UNAVAILABLE",
     "CODE_TOOLS_UNAVAILABLE",
     "CODE_TOOL_CAP",
+    "CODE_USAGE_LIMIT",
     "DECISIONS",
     "HIGHLIGHT_TOOL",
     "KEEP_GOING",

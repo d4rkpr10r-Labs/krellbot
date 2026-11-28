@@ -22,6 +22,7 @@ from krellbot.ai.types import (
     TextDelta,
     ToolCall,
     ToolCallDone,
+    ToolChoice,
     ToolDef,
     Usage,
 )
@@ -78,10 +79,11 @@ class AnthropicMessagesAdapter:
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolDef],
         max_tokens: int,
+        tool_choice: ToolChoice = "auto",
     ) -> Iterator[StreamEvent]:
         usage_box: list[Usage | None] = [None]
         try:
-            yield from self._stream(model, system, messages, tools, max_tokens, usage_box)
+            yield from self._stream(model, system, messages, tools, max_tokens, tool_choice, usage_box)
         except Exception as exc:  # noqa: BLE001 — adapters never raise; coerced to ProviderError
             # Tokens already spent still count toward budgets: Usage precedes the error.
             if usage_box[0] is not None:
@@ -95,6 +97,7 @@ class AnthropicMessagesAdapter:
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolDef],
         max_tokens: int,
+        tool_choice: ToolChoice,
         usage_box: list[Usage | None],
     ) -> Iterator[StreamEvent]:
         body: dict[str, Any] = {
@@ -109,6 +112,9 @@ class AnthropicMessagesAdapter:
             body["tools"] = [
                 {"name": t.name, "description": t.description, "input_schema": t.input_schema} for t in tools
             ]
+            if tool_choice == "none":
+                # The tools stay defined (a history with tool_use blocks needs them); the model may not call one.
+                body["tool_choice"] = {"type": "none"}
         headers = {"accept": "text/event-stream", "anthropic-version": _VERSION}
         if self._credential:
             headers["x-api-key"] = self._credential

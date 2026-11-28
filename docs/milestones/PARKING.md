@@ -67,3 +67,4 @@ One line per item. Nothing here is work until the owner moves it into a mileston
 - `docs/cli.md` "Build from source" clones `github.com/d4rk-pri0r/krellbot`; the repository is `d4rkpr10r-Labs/krellbot`, and the docs use both names (13 and 6 references).
 - `krellbot.__version__` on main is 0.9.7 while v0.9.8 shipped from `release/signal-night-0.9.8`, so merge-queue candidates built from main (for example `be24f76`) report 0.9.7.
 - The Windows installed-preview evidence for `be24f76` records `GET /api/v1/catalogue` → 502; the evidence does not say whether the catalogue was unreachable or its signature was rejected.
+- "Keep going" (M39.3) is inferred in `KrellConversation.tsx` from a cap refusal followed by Krell's text; a stored `quick_replies` notice rendered by the provider, live and from history, would let the engine drive it.

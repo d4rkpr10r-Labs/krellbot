@@ -3,18 +3,21 @@
 A turn allows up to 24 tool calls. A call whose tool and arguments match one
 already refused in the same turn is not sent again: Krell gets a refusal
 saying it already failed, and the call is journaled with no params. When the
-budget runs out, one last provider call with no tools lets Krell write her
-own summary, and a "Keep going" quick reply continues. If the token budget
-is spent, or that summary call fails or still asks for tools, the turn ends
-with the ``agent_tool_cap_reached`` error, as before.
+budget runs out, one last provider call that forbids tool calls (the tools
+stay defined, with ``tool_choice`` none) lets Krell write her own summary,
+and a "Keep going" quick reply continues. If the token budget is spent, or
+that summary call fails or still asks for tools, the turn ends with the
+``agent_tool_cap_reached`` error, as before; a failed call keeps its provider
+diagnostics, and a ChatGPT usage limit pauses Krell as on any call.
 
-Fakes only: ``FakeKeyring`` and a scripted ``FakeAiTransport`` model (no
-socket).
+Fakes only: ``FakeKeyring``, a scripted ``FakeAiTransport`` model and the
+fake OpenAI of the ChatGPT sign-in tests (no socket).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -26,6 +29,8 @@ from krellbot.agent.conversation_store import ConversationStore
 from krellbot.agent.tools_read import CODE_TOUR_STEP_NOT_FOUND
 from krellbot.ai.connections import ConnectionStore
 from krellbot.ai.http import TransportError
+from tests.fakes.fake_ai_transport import sse
+from tests.test_ai_chatgpt_signin import Env, _error_body, completed
 from tests.test_krell_loop_api import (
     Client,
     ScriptedModel,
@@ -212,7 +217,7 @@ def test_a_repeat_counts_toward_the_turn_budget(home):
 # ---- the summary at the cap ------------------------------------------------------------
 
 
-def test_the_summary_request_carries_no_tools_and_its_note_is_for_that_call_only(home):
+def test_the_summary_request_keeps_the_tools_forbids_calling_them_and_its_note_is_for_that_call_only(home):
     _connect(home)
     summary = "I read the tour and stopped before the highlight. Keep going?"
     model = ScriptedModel(
@@ -237,8 +242,10 @@ def test_the_summary_request_carries_no_tools_and_its_note_is_for_that_call_only
     assert all(r["params"] == {} for r in _agent_rows(home)[1:])
     assert model.calls == 3
     asked = model.bodies[2]
-    assert "tools" not in asked and "tool_choice" not in asked
-    assert "tools" in model.bodies[0] and "tools" in model.bodies[1]
+    # The tools stay defined, so the history's tool calls are a valid request; calling one is forbidden.
+    assert asked["tools"] == model.bodies[0]["tools"] == model.bodies[1]["tools"]
+    assert asked["tool_choice"] == "none"
+    assert "tool_choice" not in model.bodies[0] and "tool_choice" not in model.bodies[1]
     assert krell_loop.NOTE_TOOL_BUDGET_USED in _system(asked)
     assert krell_loop.NOTE_TOOL_BUDGET_USED not in _system(model.bodies[1])
     assert _answered_in_order(asked)
@@ -251,7 +258,7 @@ def test_the_summary_request_carries_no_tools_and_its_note_is_for_that_call_only
     _send(home, model, "Keep going", cap=1)
     nxt = model.bodies[3]
     assert krell_loop.NOTE_TOOL_BUDGET_USED not in json.dumps(nxt)
-    assert "tools" in nxt
+    assert "tools" in nxt and "tool_choice" not in nxt
     assert nxt["messages"][-1] == {"role": "user", "content": "Keep going"}
     assert {"role": "assistant", "content": summary} in nxt["messages"]
 
@@ -353,3 +360,111 @@ def test_an_empty_summary_ends_with_the_cap_error(home):
 
     assert model.calls == 3
     _ends_with_the_cap_error(events)
+
+
+def test_the_summary_calls_own_usage_is_recorded(home):
+    _connect(home)
+    model = ScriptedModel(
+        [
+            reply_tools(("tour_step", {}), usage=(10, 5)),
+            reply_tools(("tour_step", {}), usage=(10, 5)),
+            reply_text("I read the tour. Keep going?", usage=(30, 12)),
+        ]
+    )
+
+    events = _send(home, model, "Tour me.", cap=1)
+
+    assert [(u["input_tokens"], u["output_tokens"]) for u in _of(events, "usage")] == [(10, 5), (10, 5), (30, 12)]
+    assert ConversationStore(home).conversation_tokens() == 15 + 15 + 42
+    assert _of(events, "quick_replies") == [KEEP_GOING]
+
+
+# ---- the summary on the ChatGPT plan's Responses path ------------------------------------
+
+
+def _plan_call(call_id: str) -> list[str]:
+    """A Responses stream asking for one tour_step call in the krellbot namespace."""
+    item = {
+        "type": "function_call",
+        "id": f"fc_{call_id}",
+        "call_id": call_id,
+        "name": "tour_step",
+        "arguments": "{}",
+        "namespace": "krellbot",
+    }
+    return sse(
+        {"type": "response.output_item.added", "output_index": 0, "item": item},
+        {"type": "response.output_item.done", "output_index": 0, "item": {**item, "status": "completed"}},
+        completed(item),
+        named=True,
+    )
+
+
+def _plan_env(home: Path) -> Env:
+    """A signed-in ChatGPT plan connection with tools, active for Krell."""
+    env = Env(home)
+    env.clock.now = time.time()  # Krell's adapter reads the wall clock for token expiry
+    conn_id = env.sign_in()
+    store = env.store()
+    store.set_capability(conn_id, "tools")
+    store.activate(conn_id)
+    return env
+
+
+def _stored_error(home: Path) -> dict:
+    [notice] = [m.payload for m in ConversationStore(home).history() if m.payload.get("kind") == "error"]
+    return notice
+
+
+def test_a_failed_summary_call_keeps_its_diagnostics_and_is_logged_by_code_only(home, caplog):
+    env = _plan_env(home)
+    body = _error_body("subscription_sharing_usage_unavailable", message="upstream said something private")
+    failure = TransportError(503, body)
+    failure.request_id = "req_SUMMARY"
+    env.openai.stream_replies.extend([_plan_call("call_1"), _plan_call("call_2"), failure])
+
+    with caplog.at_level(logging.WARNING, logger=krell_loop.__name__):
+        events = _send(home, env.openai, "Tour me.", cap=1)
+
+    # Ruling 4's code and message, with the provider's diagnostics on the event and in the stored notice.
+    assert len(env.openai.requests) == 3
+    [error] = _of(events, "error")
+    assert (error["code"], error["message"]) == (CODE_CAP, krell_loop.MESSAGES[CODE_CAP])
+    facts = {"status": 503, "code": "subscription_sharing_usage_unavailable", "request_id": "req_SUMMARY"}
+    assert error["provider"] == facts
+    notice = _stored_error(home)
+    assert notice["code"] == CODE_CAP
+    assert notice["provider"] == {**facts, "detail": body[:300]}
+    # Logged by its code only, never the body.
+    assert "Krell summary call failed: provider_unavailable" in caplog.text
+    assert "private" not in caplog.text
+    # The Responses body is built from the M38.22 allow-list: the tools stay, and no tool_choice is sent.
+    summary = env.openai.requests[2]["body"]
+    assert set(summary) == {"model", "instructions", "input", "store", "stream", "tools"}
+    assert summary["tools"] == env.openai.requests[0]["body"]["tools"]
+    assert krell_loop.NOTE_TOOL_BUDGET_USED in summary["instructions"]
+
+
+def test_a_usage_limit_on_the_summary_call_pauses_krell_as_on_any_call(home):
+    env = _plan_env(home)
+    limit = TransportError(429, _error_body("subscription_sharing_usage_limit_exceeded"))
+    limit.request_id = "req_LIMIT"
+    env.openai.stream_replies.extend([_plan_call("call_1"), _plan_call("call_2"), limit])
+
+    events = _send(home, env.openai, "Tour me.", cap=1)
+
+    # The same error the main path ends a turn with, which is what pauses Krell in the workstation.
+    [error] = _of(events, "error")
+    assert error["code"] == krell_loop.CODE_USAGE_LIMIT == "provider_usage_limit"
+    assert error["message"] == krell_loop.PROVIDER_MESSAGES["provider_usage_limit"]
+    assert "Manage usage" in error["message"]
+    assert error["provider"] == {
+        "status": 429,
+        "code": "subscription_sharing_usage_limit_exceeded",
+        "request_id": "req_LIMIT",
+    }
+    assert _types(events)[-2:] == ["error", "done"]
+    assert _of(events, "quick_replies") == []
+    assert _stored_error(home)["code"] == "provider_usage_limit"
+    # Nothing is retried.
+    assert len(env.openai.requests) == 3

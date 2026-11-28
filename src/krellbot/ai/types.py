@@ -17,6 +17,10 @@ ErrorCode = Literal[
     "provider_plan_unsupported",
 ]
 
+# Whether the model may call the offered tools: "auto" lets it choose, "none" forbids calls while the
+# tools stay defined, so a history holding tool calls and results is still a well-formed request.
+ToolChoice = Literal["auto", "none"]
+
 
 @dataclass(frozen=True)
 class ToolDef:
@@ -89,4 +93,5 @@ class ChatAdapter(Protocol):
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolDef],
         max_tokens: int,
+        tool_choice: ToolChoice = "auto",
     ) -> Iterator[StreamEvent]: ...

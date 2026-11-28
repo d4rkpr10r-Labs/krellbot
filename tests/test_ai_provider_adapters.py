@@ -679,3 +679,78 @@ def test_anthropic_uses_nonempty_start_input_when_no_json_deltas_arrive():
     ev[5]["content_block"]["input"] = "oops"
     out = run(anthropic(FakeAiTransport(responses=[sse(*ev, named=True)])))
     assert not any(isinstance(e, ToolCallDone) for e in out) and out[-1].code == "provider_bad_response"
+
+
+# ---- tool_choice "none": the tools stay defined, and the model may not call one -----------
+
+TOOL_HISTORY = [
+    ChatMessage("user", "price of BTC?"),
+    ChatMessage("assistant", "", tool_calls=(ToolCall("call_1", "get_price", {"symbol": "BTC"}),)),
+    ChatMessage("tool", '<tool_result tool="get_price">{"ok":true}</tool_result>', tool_call_id="call_1"),
+]
+
+
+def _body_of(adapter, transport, *, tools=TOOLS, **kw) -> dict:
+    out = list(adapter.stream(model="m1", system="be brief", messages=TOOL_HISTORY, tools=tools, max_tokens=256, **kw))
+    assert isinstance(out[-1], Done), out
+    return transport.requests[-1]["body"]
+
+
+def test_chat_completions_tool_choice_none_keeps_the_tools_and_sends_none():
+    def body(**kw):
+        transport = FakeAiTransport(responses=[sse(oa_chunk({"content": "Summed up."}, finish="stop"), "[DONE]")])
+        return _body_of(openai(transport), transport, **kw)
+
+    forbidden = body(tool_choice="none")
+    assert forbidden["tool_choice"] == "none"
+    assert [t["function"]["name"] for t in forbidden["tools"]] == ["get_price"]
+    assert forbidden["messages"][2]["tool_calls"][0]["id"] == "call_1"
+    # The default leaves the choice to the model, as before; with no tools there is no choice to send.
+    assert "tool_choice" not in body()
+    assert "tool_choice" not in body(tool_choice="auto")
+    assert {"tools", "tool_choice"}.isdisjoint(body(tools=[], tool_choice="none"))
+
+
+def test_anthropic_tool_choice_none_keeps_the_tools_and_sends_type_none():
+    events = [
+        {"type": "message_start", "message": {"id": "m", "usage": {"input_tokens": 9, "output_tokens": 1}}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Summed up."}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 4}},
+        {"type": "message_stop"},
+    ]
+
+    def body(**kw):
+        transport = FakeAiTransport(responses=[sse(*events, named=True)])
+        return _body_of(anthropic(transport), transport, **kw)
+
+    forbidden = body(tool_choice="none")
+    assert forbidden["tool_choice"] == {"type": "none"}
+    assert [t["name"] for t in forbidden["tools"]] == ["get_price"]
+    # The history's tool_use and tool_result blocks go out with the tools that define them.
+    assert forbidden["messages"][1]["content"][-1]["type"] == "tool_use"
+    assert forbidden["messages"][2]["content"][0]["type"] == "tool_result"
+    assert "tool_choice" not in body()
+    assert "tool_choice" not in body(tool_choice="auto")
+    assert {"tools", "tool_choice"}.isdisjoint(body(tools=[], tool_choice="none"))
+
+
+def test_responses_tool_choice_none_keeps_the_tools_and_sends_no_tool_choice():
+    # The ChatGPT plan body is an allow-list built to the M38.22 record, which does not list tool_choice.
+    def body(**kw):
+        stream = sse(
+            {"type": "response.output_text.delta", "output_index": 0, "delta": "Summed up."},
+            {"type": "response.completed", "response": {"id": "r", "status": "completed", "output": []}},
+            named=True,
+        )
+        transport = FakeAiTransport(responses=[stream])
+        return _body_of(openai(transport, api="responses"), transport, **kw)
+
+    forbidden = body(tool_choice="none")
+    assert set(forbidden) == {"model", "instructions", "input", "store", "stream", "tools"}
+    assert forbidden == body()
+    [namespace] = forbidden["tools"]
+    assert (namespace["type"], namespace["name"]) == ("namespace", "krellbot")
+    assert [t["name"] for t in namespace["tools"]] == ["get_price"]
+    assert forbidden["input"][1]["type"] == "function_call"
