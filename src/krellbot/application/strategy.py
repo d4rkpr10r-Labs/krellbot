@@ -45,6 +45,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 
@@ -132,6 +133,25 @@ class StrategyIdMismatch(ValueError):
         self.parent_revision_id = parent_revision_id
         self.parent_strategy_id = parent_strategy_id
         self.pack_strategy_id = pack_strategy_id
+
+
+# ``pack/schema.json`` ``id`` is ``^[a-z0-9][a-z0-9-]{0,31}$``.
+MAX_STRATEGY_ID_LEN = 32
+FALLBACK_STRATEGY_ID = "strategy"
+
+
+def slug_strategy_id(label: object) -> str:
+    """A pack id made from ``label``: ``a-z``, ``0-9`` and single dashes, at most 32 characters.
+
+    Accents fold to plain letters, every other run of characters becomes one
+    dash, and the result starts and ends with a letter or digit. A label with
+    no letters or digits gives ``strategy``.
+    """
+
+    text = label if isinstance(label, str) else ""
+    folded = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii").lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", folded).strip("-")
+    return slug[:MAX_STRATEGY_ID_LEN].rstrip("-") or FALLBACK_STRATEGY_ID
 
 
 _ORIGIN_RE = re.compile(r"^mcp:[a-z0-9._-]{1,40}$")
@@ -433,6 +453,33 @@ class StrategyDraftService:
         strategy_id = self._strategy_for_revision(revision_id)
         assert strategy_id is not None
         return self._summary(strategy_id, revision_id)
+
+    def has_strategy(self, strategy_id: str) -> bool:
+        """True when the draft store already holds a strategy with this id."""
+
+        return self._strategy_dir(strategy_id).is_dir()
+
+    def strategy_id_of(self, revision_id: str) -> str | None:
+        """The strategy id that stores ``revision_id``, or ``None`` when it is not stored."""
+
+        return self._strategy_for_revision(revision_id)
+
+    def free_strategy_id(self, label: object) -> str:
+        """A new strategy id made from ``label`` that no draft uses yet.
+
+        It is :func:`slug_strategy_id`; when that strategy exists, ``-2``,
+        ``-3``, ... is appended, the base trimmed so the id stays within
+        :data:`MAX_STRATEGY_ID_LEN`.
+        """
+
+        base = slug_strategy_id(label)
+        candidate = base
+        n = 2
+        while self.has_strategy(candidate):
+            suffix = f"-{n}"
+            candidate = base[: MAX_STRATEGY_ID_LEN - len(suffix)].rstrip("-") + suffix
+            n += 1
+        return candidate
 
     def is_runnable(self, revision_id: str) -> bool:
         """True iff the revision can be armed."""

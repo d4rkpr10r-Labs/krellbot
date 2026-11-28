@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import os
 import re
 import stat
@@ -64,6 +65,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
+from importlib import resources
 from pathlib import Path
 from typing import Any, Literal
 
@@ -108,6 +110,7 @@ from krellbot.application.paper import (
     parse_daily_loss_limit_pct,
 )
 from krellbot.application.strategy import (
+    STATE_DRAFT,
     DraftNotRunnable,
     RevisionNotFound,
     StrategyDraftService,
@@ -719,17 +722,261 @@ def _read(ctx: ToolContext, params: dict) -> dict:
     }
 
 
+# ---- the draft tool's pack format ---------------------------------------
+#
+# ``draft``'s ``pack`` input is derived from ``pack/schema.json`` when this
+# module is imported, so the two cannot drift. Tool schemas reach every
+# provider, so the derived schema uses only the keywords they all accept
+# (:data:`PROVIDER_SAFE_KEYWORDS`): refs are inlined, ``oneOf`` becomes
+# ``anyOf``, ``const`` a one-value ``enum`` and a tuple (``prefixItems``) an
+# ``items`` ``anyOf``. A rule that a dropped keyword carried (a pattern, an
+# exclusive choice, no other keys, a tuple's order) is said in that node's
+# description. The validator stays the authority, and ``draft`` returns its
+# verdict in the same call.
+
+PROVIDER_SAFE_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "type",
+        "properties",
+        "required",
+        "items",
+        "enum",
+        "anyOf",
+        "description",
+        "minimum",
+        "maximum",
+        "minItems",
+        "maxItems",
+        "minLength",
+        "maxLength",
+    }
+)
+_COPIED_KEYWORDS = PROVIDER_SAFE_KEYWORDS - {"properties", "items", "anyOf"}
+# Dropped here; their rules become description notes (``_key_notes``).
+_KEY_RULE_KEYWORDS = frozenset({"$schema", "$id", "$defs", "additionalProperties", "minProperties", "maxProperties"})
+
+# How many times a recursive def is inlined on one path before it is cut to a
+# plain object. The pack's only recursion is a condition group (``all_any``):
+# lint allows conditions 3 deep and a comparison is depth 1, so two group
+# levels are as deep as a runnable pack goes.
+_RECURSION_DEPTH = 2
+
+# Plain-words notes for defs whose meaning the keywords alone do not carry.
+_PACK_DEF_NOTES: dict[str, str] = {
+    "leaf": "A comparison, in order [left, op, right].",
+    "operand": "A price field, a number, or the name of an indicator in indicators.",
+}
+_PACK_CUTOFF_NOTES: dict[str, str] = {
+    "all_any": "Groups nest at most two levels deep, so put a comparison [left, op, right] here.",
+}
+_CUTOFF_NOTE = "Nested too deep to describe here; the validator checks it."
+_PACK_NOTE = "A strategy pack, shaped like the example in the tool description."
+
+# Keywords :func:`_brief` can summarise.
+_BRIEF_KEYWORDS = frozenset(
+    {"$ref", "type", "properties", "required", "additionalProperties", "enum", "const", "minimum", "maximum", "oneOf"}
+)
+
+
+def _def_name(ref: str, defs: dict) -> str:
+    name = ref.removeprefix("#/$defs/")
+    if name == ref or name not in defs:
+        raise ValueError(f"pack schema ref {ref!r} is not a local def")
+    return name
+
+
+def _brief(node: dict, defs: dict) -> str:
+    """A one-line summary of a non-recursive schema node, for a description."""
+    unknown = set(node) - _BRIEF_KEYWORDS
+    if unknown:
+        raise ValueError(f"pack schema keywords {sorted(unknown)!r} cannot be summarised")
+    if "$ref" in node:
+        return _brief(defs[_def_name(node["$ref"], defs)], defs)
+    if "oneOf" in node:
+        return "one of " + " or ".join(_brief(sub, defs) for sub in node["oneOf"])
+    if "const" in node:
+        return str(node["const"])
+    if "enum" in node:
+        return "|".join(str(value) for value in node["enum"])
+    kind = node.get("type")
+    if kind == "object":
+        required = set(node.get("required", ()))
+        fields = (
+            f"{name}{'' if name in required else '?'}: {_brief(sub, defs)}"
+            for name, sub in node.get("properties", {}).items()
+        )
+        return "{" + ", ".join(fields) + "}"
+    low, high = node.get("minimum"), node.get("maximum")
+    if low is not None and high is not None:
+        return f"{kind} {low}-{high}"
+    if low is not None or high is not None:
+        raise ValueError("pack schema one-sided bounds cannot be summarised")
+    return str(kind)
+
+
+def _count(n: int) -> str:
+    return "one key" if n == 1 else f"{n} keys"
+
+
+def _key_notes(node: dict) -> list[str]:
+    """Notes for the object rules the provider-safe keywords cannot state."""
+    notes: list[str] = []
+    extra = node.get("additionalProperties")
+    if extra not in (None, True, False):
+        raise ValueError("pack schema additionalProperties schemas have no provider-safe form")
+    if extra is False and "patternProperties" not in node:
+        notes.append("No other keys.")
+    low, high = node.get("minProperties"), node.get("maxProperties")
+    if low is not None and low == high:
+        notes.append(f"Exactly {_count(low)}.")
+    else:
+        if low:
+            notes.append(f"At least {_count(low)}.")
+        if high is not None:
+            notes.append(f"At most {_count(high)}.")
+    return notes
+
+
+def _unique(nodes: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for node in nodes:
+        if node not in out:
+            out.append(node)
+    return out
+
+
+def _safe_node(node: dict, defs: dict, stack: tuple[str, ...]) -> dict:
+    """``node`` in :data:`PROVIDER_SAFE_KEYWORDS` only, its refs inlined (see the section comment)."""
+    if "$ref" in node:
+        return _safe_ref(node["$ref"], defs, stack)
+    out: dict = {}
+    notes: list[str] = []
+    for key, value in node.items():
+        if key in _KEY_RULE_KEYWORDS:
+            continue
+        if key in _COPIED_KEYWORDS:
+            out[key] = copy.deepcopy(value)
+        elif key == "properties":
+            out[key] = {name: _safe_node(sub, defs, stack) for name, sub in value.items()}
+        elif key == "items":
+            # ``items: false`` closes a tuple; its ``maxItems`` already says so.
+            if isinstance(value, dict):
+                out[key] = _safe_node(value, defs, stack)
+        elif key == "prefixItems":
+            out["items"] = {"anyOf": _unique([_safe_node(sub, defs, stack) for sub in value])}
+        elif key in ("oneOf", "anyOf"):
+            out["anyOf"] = [_safe_node(sub, defs, stack) for sub in value]
+            if key == "oneOf":
+                notes.append("Exactly one of these.")
+        elif key == "const":
+            out["enum"] = [copy.deepcopy(value)]
+        elif key == "pattern":
+            notes.append(f"Must match {value}.")
+        elif key == "exclusiveMinimum":
+            notes.append(f"Must be above {value}.")
+        elif key == "not" and set(value) == {"enum"}:
+            notes.append(f"Not one of {', '.join(str(item) for item in value['enum'])}.")
+        elif key == "patternProperties":
+            notes += [
+                f"Keys must match {pattern}; each value is {_brief(sub, defs)}." for pattern, sub in value.items()
+            ]
+        else:
+            raise ValueError(f"pack schema keyword {key!r} has no provider-safe form")
+    notes += _key_notes(node)
+    if notes:
+        out["description"] = " ".join([out["description"], *notes] if "description" in out else notes)
+    return out
+
+
+def _safe_ref(ref: str, defs: dict, stack: tuple[str, ...]) -> dict:
+    """Inline one ref. A recursive object def is cut to a plain object after :data:`_RECURSION_DEPTH` levels."""
+    name = _def_name(ref, defs)
+    target = defs[name]
+    depth = stack.count(name)
+    if depth >= _RECURSION_DEPTH:
+        if target.get("type") == "object":
+            return {"type": "object", "description": _PACK_CUTOFF_NOTES.get(name, _CUTOFF_NOTE)}
+        if depth > _RECURSION_DEPTH:
+            raise ValueError(f"pack schema def {name!r} recurses with no object def to cut at")
+    node = _safe_node(target, defs, (*stack, name))
+    note = _PACK_DEF_NOTES.get(name)
+    if note:
+        node["description"] = f"{note} {node['description']}" if "description" in node else note
+    return node
+
+
+def _pack_tool_schema() -> dict:
+    """The provider-safe ``pack`` schema, derived from ``pack/schema.json``."""
+    source = json.loads(resources.files("krellbot.pack").joinpath("schema.json").read_text(encoding="utf-8"))
+    schema = _safe_node(source, source.get("$defs", {}), ())
+    schema["description"] = " ".join([_PACK_NOTE, schema.get("description", "")]).strip()
+    return schema
+
+
+DRAFT_PACK_SCHEMA: dict = _pack_tool_schema()
+
+# One complete pack the validator passes (``tests/test_krell_draft_tool_format.py``).
+DRAFT_EXAMPLE_PACK: dict = {
+    "schema_version": 1,
+    "id": "ema-cross-momentum",
+    "version": "1.0.0",
+    "label": "EMA cross with momentum",
+    "author": "krell",
+    "timeframe": "1h",
+    "indicators": {
+        "fast": {"fn": "ema", "src": "close", "len": 12},
+        "slow": {"fn": "sma", "src": "close", "len": 50},
+        "mom": {"fn": "roc", "src": "close", "len": 10},
+    },
+    "entry": {"all": [["fast", "crosses_above", "slow"], ["mom", ">", 0]]},
+    "exit": {"any": [["fast", "crosses_below", "slow"], ["close", "<", "slow"]]},
+    "risk": {"max_account_pct": 20, "stop": {"type": "pct", "pct": 4}},
+    "markets": [{"venue": "kraken", "pair": "BTCUSD"}],
+}
+
+DRAFT_DESCRIPTION = (
+    "Save a strategy pack as a draft revision, or edit one with parent_revision_id, and validate it in the "
+    "same call: runnable and errors in the result are the validator's verdict, so you do not need a separate "
+    "validate call. A draft never trades. A pack without an id gets one made from its label. "
+    "Example pack: " + json.dumps(DRAFT_EXAMPLE_PACK)
+)
+
+
+def _draft_strategy_id(service: StrategyDraftService, pack: dict, parent_revision_id: object) -> str | None:
+    """The strategy id for a pack sent without one: the parent's when editing, else a free one from the label."""
+    if parent_revision_id:
+        return service.strategy_id_of(str(parent_revision_id))
+    return service.free_strategy_id(pack.get("label"))
+
+
 def _draft(ctx: ToolContext, params: dict) -> dict:
+    """Save a draft revision and validate it in the same call.
+
+    A pack with no non-empty ``id`` gets one here (the service still refuses
+    an empty id for direct callers): the parent's strategy id when editing,
+    else a free one from the label. Step 3 never saw that id, so it is made to
+    match :data:`PACK_ID_PATTERN` by construction. A revision still in the ``draft`` state
+    is validated, so ``runnable`` and ``errors`` are the validator's verdict;
+    a validated or deployed revision already carries it and keeps its state.
+    """
     pack = params.get("pack")
     parent_revision_id = params.get("parent_revision_id")
     if not isinstance(pack, dict):
         return invalid_request("draft", "draft requires a pack object").to_dict()
     service = StrategyDraftService(ctx.home, clock=ctx.clock)
+    if not pack.get("id"):
+        strategy_id = _draft_strategy_id(service, pack, parent_revision_id)
+        if strategy_id:
+            pack = {**pack, "id": strategy_id}
     try:
         if parent_revision_id:
             summary = service.edit(str(parent_revision_id), pack, origin=ctx.actor.label)
         else:
             summary = service.create(pack, origin=ctx.actor.label)
+        if summary.get("state") == STATE_DRAFT:
+            outcome = summary.get("outcome")
+            summary = service.validate(str(summary["revision_id"]))
+            summary["outcome"] = outcome
     except RevisionNotFound as exc:
         return invalid_request("draft", f"revision not found: {exc}").to_dict()
     except StrategyIdMismatch as exc:
@@ -1133,13 +1380,16 @@ def _builtin_specs() -> tuple[ToolSpec, ...]:
             input_schema={
                 "type": "object",
                 "properties": {
-                    "pack": {"type": "object", "description": "Strategy pack JSON."},
-                    "parent_revision_id": {"type": "string", "description": "Revision to edit."},
+                    "pack": copy.deepcopy(DRAFT_PACK_SCHEMA),
+                    "parent_revision_id": {
+                        "type": "string",
+                        "description": "Revision to edit; the new revision keeps its strategy id.",
+                    },
                 },
                 "required": ["pack"],
             },
             labels=(),
-            description="Save a strategy pack as a draft revision, or edit one. A draft never trades.",
+            description=DRAFT_DESCRIPTION,
             handler=_draft,
         ),
         ToolSpec(
@@ -1210,6 +1460,9 @@ __all__ = [
     "CODE_TOOL_ERROR",
     "CODE_UNKNOWN_TOOL",
     "COSTS",
+    "DRAFT_DESCRIPTION",
+    "DRAFT_EXAMPLE_PACK",
+    "DRAFT_PACK_SCHEMA",
     "EFFECTS",
     "LABELS",
     "LABEL_NOT_ADVICE",
@@ -1226,6 +1479,7 @@ __all__ = [
     "MESSAGE_UNKNOWN_TOOL",
     "PACK_ID_PATTERN",
     "PACK_PARAMS",
+    "PROVIDER_SAFE_KEYWORDS",
     "REVISION_ID_LIST_PARAMS",
     "REVISION_ID_PARAMS",
     "REVISION_ID_PATTERN",
