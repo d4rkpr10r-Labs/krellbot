@@ -29,7 +29,7 @@ import { BudgetMeter } from "./BudgetMeter";
 import { MODE_REPLIES, type KrellDecision, type KrellMode } from "./client";
 import { ConfirmCard, confirmOutcomes, isPressable, type ConfirmOutcome } from "./ConfirmCard";
 import { useKrell, type KrellItem } from "./KrellConversationProvider";
-import { ToolResultCard } from "./ToolResultCard";
+import { groupToolRows, ToolSteps } from "./ToolResultCard";
 import "./krell.css";
 
 /** The engine's limit on one message (`MAX_MESSAGE_CHARS`). */
@@ -205,11 +205,7 @@ function KrellRow({ item, avatar, cards }: Row & { cards: Cards }): JSX.Element 
         </li>
       );
     case "tool":
-      return (
-        <li className="kbot-krell__card-row" data-testid="krell-item-tool">
-          <ToolResultCard name={item.name} result={item.result} ended={item.ended} />
-        </li>
-      );
+      return <ToolSteps steps={[item]} />;
     case "confirm":
       return (
         <li className="kbot-krell__card-row" data-testid="krell-item-confirm">
@@ -288,9 +284,13 @@ export function KrellConversation(): JSX.Element {
     <div className="kbot-krell__conversation" data-testid="krell-conversation">
       <div className="kbot-krell__log" ref={logRef} role="log" aria-label="Conversation with Krell">
         <ol className="kbot-krell__list">
-          {withAvatars(krell.messages).map((row) => (
-            <KrellRow key={row.item.key} item={row.item} avatar={row.avatar} cards={cards} />
-          ))}
+          {groupToolRows(withAvatars(krell.messages)).map((unit) =>
+            unit.kind === "tools" ? (
+              <ToolSteps key={unit.key} steps={unit.steps} />
+            ) : (
+              <KrellRow key={unit.row.item.key} item={unit.row.item} avatar={unit.row.avatar} cards={cards} />
+            ),
+          )}
         </ol>
       </div>
       {krell.budget ? <BudgetMeter budget={krell.budget} /> : null}

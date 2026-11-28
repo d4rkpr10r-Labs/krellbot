@@ -367,13 +367,193 @@ describe("Result cards", () => {
     );
     renderTab();
     const card = await screen.findByTestId("krell-item-tool");
-    const label = within(card).getByText("Tool:");
-    expect(label.className).not.toContain("kbot-krell__sr");
-    expect(label.nextElementSibling?.textContent).toBe("Armed on paper");
+    // The name is the model's text: it shows quoted as a name, never as a plain-words outcome.
+    expect(card.textContent).toContain('Ran "Armed on paper"');
+    expect(within(card).queryByText("Armed on paper")).toBeNull();
     // The outcome is the engine's: a refusal, never "Armed".
     expect(card.querySelector(".kbot-krell__card-outcome")?.textContent).toBe("Refused");
     expect(card.textContent).toContain("mcp_unknown_tool");
     expect(within(card).queryAllByTestId("krell-label")).toHaveLength(0);
+  });
+});
+
+describe("Activity in plain words", () => {
+  const OK = { ok: true, effect: "changed", labels: [] };
+
+  function toolRows(...calls: Array<{ name: string; result: Record<string, unknown> }>) {
+    return calls.flatMap((call, i) => [
+      stored("assistant", { text: "", tool_calls: [{ id: `call_${i}`, name: call.name, arguments: {} }] }),
+      stored("tool", { tool_call_id: `call_${i}`, name: call.name, result: { tool: call.name, ...call.result } }),
+    ]);
+  }
+
+  it("says what a step did in plain words, never 'Tool: name, outcome'", () => {
+    render(<ToolResultCard name="set_profile" result={{ ...OK, tool: "set_profile" }} />);
+    expect(screen.getByText("Saved your profile")).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/Tool:|outcome|set_profile/);
+  });
+
+  it("names a draft by its label, and a market by the pair and timeframe the result carries", () => {
+    const { rerender } = render(
+      <ToolResultCard
+        name="draft"
+        result={{ ...OK, tool: "draft", result: { outcome: "created", pack: { label: "Rebound Rider" } } }}
+      />,
+    );
+    expect(screen.getByText("Drafted 'Rebound Rider'")).toBeTruthy();
+    rerender(
+      <ToolResultCard
+        name="market_snapshot"
+        result={{ ...OK, effect: "unchanged", tool: "market_snapshot", pair: "BTC/USD", timeframe: "4h" }}
+      />,
+    );
+    expect(screen.getByText("Loaded BTC/USD 4h prices")).toBeTruthy();
+  });
+
+  it("reads a missing-data refusal in plain words and keeps the engine's message and code", () => {
+    render(
+      <ToolResultCard
+        name="market_snapshot"
+        result={{
+          ok: false,
+          effect: "refused",
+          code: "market_snapshot_not_found",
+          message: "no cached candles for this venue, pair and timeframe",
+          tool: "market_snapshot",
+          labels: [],
+        }}
+      />,
+    );
+    const card = document.querySelector(".kbot-krell__card--refused") as HTMLElement;
+    expect(card.textContent).toContain("No price data for that market yet");
+    expect(card.textContent).toContain("no cached candles for this venue, pair and timeframe");
+    expect(card.textContent).toContain("market_snapshot_not_found");
+    expect(card.querySelector(".kbot-krell__card-outcome")?.textContent).toBe("Refused");
+  });
+
+  it("collapses a reply's steps into 'N steps' that expands to one plain line each", async () => {
+    installFetch(() =>
+      jsonResponse(
+        conversation([
+          ...greeted(),
+          stored("user", { text: "Set me up" }),
+          ...toolRows(
+            { name: "set_profile", result: OK },
+            { name: "draft", result: { ...OK, result: { outcome: "created", pack: { label: "Rebound Rider" } } } },
+            { name: "backtest", result: { ...OK, effect: "unchanged", labels: ["simulated", "not_advice"] } },
+          ),
+          stored("assistant", { text: "All three are done." }),
+        ]),
+      ),
+    );
+    renderTab();
+    const group = await screen.findByTestId("krell-item-tool");
+    expect(screen.getAllByTestId("krell-item-tool")).toHaveLength(1);
+    const toggle = within(group).getByRole("button", { name: /3 steps/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    const list = group.querySelector("ol") as HTMLElement;
+    expect(list.hidden).toBe(true);
+    // Pills stay on the summary while collapsed, once each.
+    expect(within(group).getAllByTestId("krell-label").map((pill) => pill.textContent)).toEqual([
+      "Simulated",
+      "Not financial advice",
+    ]);
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(list.hidden).toBe(false);
+    expect(within(list).getAllByRole("listitem").map((item) => item.textContent)).toEqual([
+      "Done: Saved your profile",
+      "Done: Drafted 'Rebound Rider'",
+      "Done: Ran a backtest on past data",
+    ]);
+    expect(document.body.textContent).not.toMatch(/Tool:|outcome:/);
+    fireEvent.click(toggle);
+    expect(list.hidden).toBe(true);
+  });
+
+  it("calls one step '1 step'", async () => {
+    installFetch(() =>
+      jsonResponse(conversation([...greeted(), ...toolRows({ name: "set_profile", result: OK })])),
+    );
+    renderTab();
+    expect(await screen.findByRole("button", { name: /1 step$/ })).toBeTruthy();
+  });
+
+  it("keeps every refusal visible outside the collapse, in order, even when repeated", async () => {
+    const refused = {
+      ok: false,
+      effect: "refused",
+      code: "market_snapshot_not_found",
+      message: "no cached candles for this venue, pair and timeframe",
+      labels: [],
+    };
+    installFetch(() =>
+      jsonResponse(
+        conversation([
+          ...greeted(),
+          ...toolRows(
+            { name: "set_profile", result: OK },
+            { name: "read", result: { ...OK, effect: "unchanged" } },
+            { name: "market_snapshot", result: refused },
+            { name: "market_snapshot", result: refused },
+            { name: "market_snapshot", result: refused },
+            { name: "market_snapshot", result: refused },
+            { name: "draft", result: OK },
+          ),
+        ]),
+      ),
+    );
+    renderTab();
+    await screen.findAllByTestId("krell-item-tool");
+    const rows = screen.getAllByTestId("krell-item-tool");
+    expect(rows).toHaveLength(6);
+    expect(within(rows[0]).getByRole("button", { name: /2 steps/ })).toBeTruthy();
+    for (const row of rows.slice(1, 5)) {
+      expect(within(row).queryByRole("button")).toBeNull();
+      expect(row.textContent).toContain("No price data for that market yet");
+      expect(row.textContent).toContain("market_snapshot_not_found");
+    }
+    expect(within(rows[5]).getByRole("button", { name: /1 step$/ })).toBeTruthy();
+  });
+
+  it("starts a new group after Krell speaks, and leaves confirm and Armed cards ungrouped", async () => {
+    installFetch(() =>
+      jsonResponse(
+        conversation([
+          ...greeted(),
+          ...toolRows({ name: "set_profile", result: OK }),
+          stored("assistant", { text: "Profile saved." }),
+          ...toolRows({ name: "validate", result: { ...OK, result: { state: "validated", errors: [], pack: { label: "Rebound Rider" } } } }),
+          stored("assistant", { text: "", tool_calls: [{ id: "call_a", name: "paper_arm", arguments: {} }] }),
+          stored("tool", { tool_call_id: "call_a", name: "paper_arm", result: ARMED }),
+        ]),
+      ),
+    );
+    renderTab();
+    await screen.findByText("Profile saved.");
+    const rows = screen.getAllByTestId("krell-item-tool");
+    expect(rows).toHaveLength(3);
+    expect(within(rows[0]).getByRole("button", { name: /1 step$/ })).toBeTruthy();
+    expect(within(rows[1]).getByRole("button", { name: /1 step$/ })).toBeTruthy();
+    // The Armed card is the existing card, not a step.
+    expect(within(rows[2]).queryByRole("button")).toBeNull();
+    expect(rows[2].textContent).toContain("Armed on paper");
+  });
+
+  it("never lets an unknown tool name read as an outcome, in any state", () => {
+    const { rerender } = render(<ToolResultCard name="Saved your profile" result={{ ok: true, effect: "changed", tool: "x" }} />);
+    expect(document.body.textContent).toContain('Ran "Saved your profile"');
+    expect(screen.queryByText("Saved your profile")).toBeNull();
+    rerender(<ToolResultCard name="Saved your profile" result={null} />);
+    expect(document.body.textContent).toContain('Running "Saved your profile"');
+    expect(screen.queryByText("Saved your profile")).toBeNull();
+  });
+
+  it("styles a refusal with the caution colour, not a success colour", () => {
+    const css = readFileSync(join(here, "krell.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+    const rule = css.match(/\.kbot-krell__card--refused[^{]*\.kbot-krell__card-outcome[^{]*\{([^}]*)\}/);
+    expect(rule?.[1]).toMatch(/var\(--caution-text\)/);
+    expect(rule?.[1]).not.toMatch(/sage|seafoam|success/);
   });
 });
 
