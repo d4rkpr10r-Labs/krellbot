@@ -45,6 +45,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 
@@ -132,6 +133,25 @@ class StrategyIdMismatch(ValueError):
         self.parent_revision_id = parent_revision_id
         self.parent_strategy_id = parent_strategy_id
         self.pack_strategy_id = pack_strategy_id
+
+
+# ``pack/schema.json`` ``id`` is ``^[a-z0-9][a-z0-9-]{0,31}$``.
+MAX_STRATEGY_ID_LEN = 32
+FALLBACK_STRATEGY_ID = "strategy"
+
+
+def slug_strategy_id(label: object) -> str:
+    """A pack id made from ``label``: ``a-z``, ``0-9`` and single dashes, at most 32 characters.
+
+    Accents fold to plain letters, every other run of characters becomes one
+    dash, and the result starts and ends with a letter or digit. A label with
+    no letters or digits gives ``strategy``.
+    """
+
+    text = label if isinstance(label, str) else ""
+    folded = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii").lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", folded).strip("-")
+    return slug[:MAX_STRATEGY_ID_LEN].rstrip("-") or FALLBACK_STRATEGY_ID
 
 
 _ORIGIN_RE = re.compile(r"^mcp:[a-z0-9._-]{1,40}$")
@@ -433,6 +453,47 @@ class StrategyDraftService:
         strategy_id = self._strategy_for_revision(revision_id)
         assert strategy_id is not None
         return self._summary(strategy_id, revision_id)
+
+    def strategy_id_of(self, revision_id: str) -> str | None:
+        """The strategy id that stores ``revision_id``, or ``None`` when it is not stored."""
+
+        return self._strategy_for_revision(revision_id)
+
+    def claim_strategy_id(self, pack: dict) -> str:
+        """The strategy id for ``pack``, which has none, made from its label.
+
+        Candidates are :func:`slug_strategy_id` of the label, then ``-2``,
+        ``-3``, ... (the base trimmed to stay within
+        :data:`MAX_STRATEGY_ID_LEN`). The first candidate whose strategy
+        already holds this exact pack is returned, so sending the same pack
+        again finds its revision instead of a new strategy. Otherwise the
+        first candidate whose directory this call creates is claimed: the
+        directory is made with ``exist_ok=False``, so two writers never get the
+        same new id.
+        """
+
+        base = slug_strategy_id(pack.get("label"))
+        n = 1
+        while True:
+            suffix = "" if n == 1 else f"-{n}"
+            candidate = base[: MAX_STRATEGY_ID_LEN - len(suffix)].rstrip("-") + suffix
+            n += 1
+            if self._rev_path(candidate, _revision_id({**pack, "id": candidate})).exists():
+                return candidate
+            try:
+                self._claim_strategy_dir(candidate)
+            except FileExistsError:
+                continue
+            return candidate
+
+    def _claim_strategy_dir(self, strategy_id: str) -> None:
+        """Create the strategy directory; ``FileExistsError`` when anything is already there."""
+
+        path = self._strategy_dir(strategy_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.mkdir(mode=0o700, exist_ok=False)
+        if not _IS_WINDOWS:
+            os.chmod(path, 0o700)
 
     def is_runnable(self, revision_id: str) -> bool:
         """True iff the revision can be armed."""
